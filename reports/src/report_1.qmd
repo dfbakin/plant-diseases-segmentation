@@ -1,0 +1,31 @@
+---
+title: "Weekly Research Update"
+subtitle: "Transfer Learning for Plant Pathology"
+format: beamer
+---
+
+## adfgdfgsafgsdf
+
+- **Phase:** Phase 1 - Benchmarking
+- **Current Task:** Training U-Net baselines
+- **Key Metrics:**
+  - Train mIoU: 0.00
+  - Val mIoU: 0.00
+<!-- 
+## Recent Experiments
+
+```{python}
+#| echo: false
+#| warning: false
+# Example: Fetching metrics from MLflow
+# import mlflow
+# runs = mlflow.search_runs(...)
+# print(runs.head())
+print("Experiment data placeholder")
+```
+
+## Next Steps
+
+- [ ] Complete U-Net training
+- [ ] Start SegFormer implementation
+ -->

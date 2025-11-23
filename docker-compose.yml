@@ -1,0 +1,19 @@
+services:
+  research:
+    build: .
+    image: plant-diseases-segmentation:latest
+    container_name: plant-pathology-container
+    volumes:
+      - .:/app
+      # Mount data directory from host if it exists outside
+      # - /path/to/host/data:/app/data
+    ports:
+      - "8888:8888" # Jupyter
+      - "5000:5000" # MLflow
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    command: tail -f /dev/null
+    shm_size: '8gb' # Increase shared memory for PyTorch dataloaders
+    restart: unless-stopped

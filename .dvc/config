@@ -1,0 +1,5 @@
+[core]
+    remote = public
+    autostage = true
+['remote "public"']
+    url = https://plant-diseases-bucket.storage.yandexcloud.net/dvc_dir/

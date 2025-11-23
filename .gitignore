@@ -1,0 +1,10 @@
+# Jupyter Notebook checkpoints and metadata
+.ipynb_checkpoints/
+*.ipynb-meta
+
+__pycache__/
+ideas
+
+poetry.lock
+requirements.txt
+
