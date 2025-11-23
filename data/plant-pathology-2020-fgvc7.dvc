@@ -1,0 +1,6 @@
+outs:
+- md5: 1ddfd659e0ca18504ee914a498509ec3.dir
+  size: 823738500
+  nfiles: 3644
+  hash: md5
+  path: plant-pathology-2020-fgvc7

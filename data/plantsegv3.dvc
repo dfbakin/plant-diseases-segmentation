@@ -1,0 +1,6 @@
+outs:
+- md5: 243ff5d2bc2a305c5dd31fe81e05c741.dir
+  size: 1778019134
+  nfiles: 22920
+  hash: md5
+  path: plantsegv3
