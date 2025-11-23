@@ -1,0 +1,190 @@
+---
+title: "Research Update: Data & Methods"
+subtitle: "Plant Disease Segmentation"
+format: beamer
+---
+
+## PlantSeg Dataset: High Quality Labels
+
+The PlantSeg dataset provides pixel-level annotations, essential for training segmentation models.
+
+```{python}
+#| echo: false
+#| fig-cap: "PlantSeg Example: Image and Ground Truth Mask"
+#| layout-ncol: 2
+#| output-location: slide
+
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+
+# Paths relative to reports/ directory
+root = "../../data"
+img_path = os.path.join(root, "plantsegv3/images/train/apple_black_rot_1.jpg")
+mask_path = os.path.join(root, "plantsegv3/annotations/train/apple_black_rot_1.png")
+
+# Load and Display
+if os.path.exists(img_path) and os.path.exists(mask_path):
+    img = Image.open(img_path)
+    mask = Image.open(mask_path)
+
+    plt.figure(figsize=(6,6))
+    plt.imshow(img)
+    plt.xticks([])
+    plt.yticks([])
+    plt.xlabel(f"Original Image\n{img.size}")
+    # Hide spines
+    for spine in plt.gca().spines.values():
+        spine.set_visible(False)
+    plt.show()
+
+    plt.figure(figsize=(6,6))
+    plt.imshow(mask)
+    plt.xticks([])
+    plt.yticks([])
+    plt.xlabel("Segmentation Mask")
+    # Hide spines
+    for spine in plt.gca().spines.values():
+        spine.set_visible(False)
+    plt.show()
+else:
+    print(f"Data not found at {img_path}")
+```
+
+## Proposed Architectures
+
+We will benchmark the following state-of-the-art segmentation models:
+
+1.  **DeepLabv3+**
+    *   Encoder-Decoder with Atrous Separable Convolution for multi-scale context.
+    *   [Chen et al., 2018](https://arxiv.org/abs/1802.02611)
+
+2.  **SegFormer**
+    *   Transformer-based encoder outputting multi-scale features.
+    *   [Xie et al., 2021](https://arxiv.org/abs/2105.15203)
+
+3.  **SegNeXt**
+    *   Convolutional attention design outperforming transformers.
+    *   [Guo et al., 2022](https://arxiv.org/abs/2209.08575)
+
+## The Problem: Low Resolution PlantVillage
+
+Standard PlantVillage images are resized to 256x256, losing critical leaf boundary and lesion details needed for segmentation.
+
+```{python}
+#| echo: false
+#| fig-cap: "PlantVillage (256x256) vs Zoomed Detail"
+#| layout-ncol: 2
+#| output-location: slide
+
+low_res_path = os.path.join(root, "Plant_leaf_diseases_dataset_without_augmentation/Plant_leave_diseases_dataset_without_augmentation/Tomato___Early_blight/image (7).JPG")
+
+if os.path.exists(low_res_path):
+    img_low = Image.open(low_res_path)
+    
+    plt.figure(figsize=(3, 3))
+    plt.imshow(img_low)
+    plt.xticks([])
+    plt.yticks([])
+    plt.xlabel(f"PlantVillage\n{img_low.size}")
+    for spine in plt.gca().spines.values():
+        spine.set_visible(False)
+    plt.show()
+
+    # Show a zoomed crop to emphasize pixelation
+    width, height = img_low.size
+    crop = img_low.crop((width//4, height//4, width//2, height//2))
+    crop = crop.resize((256, 256), Image.NEAREST) # Zoom effect
+    
+    plt.figure(figsize=(3, 3))
+    plt.imshow(crop)
+    plt.xticks([])
+    plt.yticks([])
+    plt.xlabel("Zoomed Crop (Pixelation)")
+    for spine in plt.gca().spines.values():
+        spine.set_visible(False)
+    plt.show()
+else:
+    print(f"Data not found at {low_res_path}")
+```
+
+## The Solution: High Resolution Data (FGVC7)
+
+The Plant Pathology 2020 (FGVC7) dataset offers high-resolution captures (often >4MP), suitable for weak supervision experiments.
+
+```{python}
+#| echo: false
+#| fig-cap: "FGVC7 High Resolution Example"
+#| output-location: slide
+
+high_res_path = os.path.join(root, "plant-pathology-2020-fgvc7/images/Test_4.jpg")
+
+if os.path.exists(high_res_path):
+    img_high = Image.open(high_res_path)
+    
+    # Downsample slightly for display if huge, but keep aspect
+    img_high.thumbnail((1000, 1000))
+    
+    plt.figure(figsize=(4, 3))
+    plt.imshow(img_high)
+    plt.xticks([])
+    plt.yticks([])
+    for spine in plt.gca().spines.values():
+        spine.set_visible(False)
+    plt.show()
+else:
+    print(f"Data not found at {high_res_path}")
+```
+
+## Zoomed Crop of FGVC7 High Resolution Image
+
+```{python}
+#| echo: false
+#| fig-cap: "Zoomed Crop of FGVC7 High Resolution Image"
+#| output-location: slide
+
+crop_size = 512  # choose a reasonable crop size
+if os.path.exists(high_res_path):
+    img_high = Image.open(high_res_path)
+    width, height = img_high.size
+    # Center crop
+    left = (width - crop_size) // 2
+    top = (height - crop_size) // 2
+    right = left + crop_size
+    bottom = top + crop_size
+    crop_high = img_high.crop((left, top, right, bottom))
+    crop_high = crop_high.resize((512, 512), Image.LANCZOS)
+
+    plt.figure(figsize=(3,3))
+    plt.imshow(crop_high)
+    plt.xticks([])
+    plt.yticks([])
+    for spine in plt.gca().spines.values():
+        spine.set_visible(False)
+    plt.show()
+else:
+    print(f"Data not found at {high_res_path}")
+```
+
+
+## Methodology: FixMatch
+
+**FixMatch** enables semi-supervised learning by enforcing consistency between weak and strong augmentations of unlabeled data.
+
+**Core Loop:**
+
+1.  **Weak Augmentation** (Flip/Shift) $\rightarrow$ Model $\rightarrow$ Prediction
+2.  **Pseudo-Labeling**: Keep prediction if confidence > 0.95
+3.  **Strong Augmentation** (RandAugment) $\rightarrow$ Model $\rightarrow$ Strong Prediction
+4.  **Consistency Loss**: Minimize Cross-Entropy between Pseudo-Label and Strong Prediction
+
+## Proposed Pipeline: CAM + SAM + FixMatch
+
+We combine semantic localization (CAM) with geometric precision (SAM) to bootstrap segmentation training.
+
+**Pipeline Steps:**
+
+1.  **Semantic Localization**: Train Classifier $\rightarrow$ Extract Grad-CAM Hotspots.
+2.  **Geometric Refinement**: Convert Hotspots to Prompts $\rightarrow$ Query SAM (Segment Anything) $\rightarrow$ High Quality Binary Masks.
+3.  **Student Training**: Train Segmentation Model on these "Silver" Masks.
+4.  **Self-Improvement**: Apply **FixMatch** (as above) to further refine the model using unlabeled data.

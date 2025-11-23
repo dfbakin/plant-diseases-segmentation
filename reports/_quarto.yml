@@ -9,13 +9,7 @@ format:
     colortheme: dolphin
     fonttheme: professionalfonts
     pdf-engine: xelatex
+    aspectratio: 169
     incremental: false
     slide-level: 2
     include-in-header: header.tex
-  pdf:
-    documentclass: article
-    geometry:
-      - top=25mm
-      - left=25mm
-      - right=25mm
-      - bottom=25mm
