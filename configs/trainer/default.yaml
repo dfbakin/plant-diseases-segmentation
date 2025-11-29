@@ -1,0 +1,39 @@
+# Default trainer configuration
+
+# Training duration
+max_epochs: 100
+min_epochs: 10
+
+# Hardware
+accelerator: "auto"  # auto, gpu, cpu, mps
+devices: 1
+precision: "16-mixed"  # 16-mixed, bf16-mixed, 32
+
+# Checkpointing
+checkpoint:
+  monitor: "val/miou"
+  mode: "max"
+  save_top_k: 3
+  save_last: true
+
+# Early stopping
+early_stopping:
+  monitor: "val/miou"
+  patience: 15
+  mode: "max"
+  min_epochs: 20
+
+# Logging
+log_every_n_steps: 10
+
+# Validation
+val_check_interval: 1.0  # Run validation every epoch
+check_val_every_n_epoch: 1
+
+# Gradient clipping
+gradient_clip_val: 1.0
+gradient_clip_algorithm: "norm"
+
+# Reproducibility
+deterministic: false  # Set true for full reproducibility (slower)
+

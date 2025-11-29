@@ -1,0 +1,16 @@
+# U-Net configuration
+
+name: "unet"
+
+# Encoder settings
+encoder_name: "resnet50"  # Options: resnet50, resnet101, efficientnet-b4, mobilenet_v2
+encoder_weights: "imagenet"
+
+# Model settings
+num_classes: 2
+
+# Training hyperparameters
+learning_rate: 1e-4
+weight_decay: 1e-4
+loss_fn: "dice"  # U-Net often works well with Dice loss
+

@@ -166,6 +166,10 @@ else:
     print(f"Data not found at {high_res_path}")
 ```
 
+## AffinityNet
+
+![](../resources/fig_outline9.pdf)
+
 
 ## Methodology: FixMatch
 
@@ -177,6 +181,10 @@ else:
 2.  **Pseudo-Labeling**: Keep prediction if confidence > 0.95
 3.  **Strong Augmentation** (RandAugment) $\rightarrow$ Model $\rightarrow$ Strong Prediction
 4.  **Consistency Loss**: Minimize Cross-Entropy between Pseudo-Label and Strong Prediction
+
+## SAM
+
+
 
 ## Proposed Pipeline: CAM + SAM + FixMatch
 

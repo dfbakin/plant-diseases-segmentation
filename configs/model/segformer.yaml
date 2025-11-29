@@ -1,0 +1,16 @@
+# SegFormer configuration
+
+name: "segformer"
+
+# Model variant: b0, b1, b2, b3, b4, b5
+variant: "b3"
+pretrained: true
+
+# Model settings
+num_classes: 2
+
+# Training hyperparameters
+learning_rate: 6e-5  # SegFormer typically needs lower LR
+weight_decay: 1e-4
+loss_fn: "cross_entropy"
+

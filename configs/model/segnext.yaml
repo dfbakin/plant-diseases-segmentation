@@ -1,0 +1,17 @@
+# SegNeXt configuration
+
+name: "segnext"
+
+# Model variant: tiny, small, base, large
+variant: "base"
+pretrained: true
+decoder_channels: 256
+
+# Model settings
+num_classes: 2
+
+# Training hyperparameters
+learning_rate: 1e-4
+weight_decay: 1e-4
+loss_fn: "cross_entropy"
+
