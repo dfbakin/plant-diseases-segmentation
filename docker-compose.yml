@@ -1,7 +1,7 @@
 services:
   research:
     build: .
-    image: plant-diseases-segmentation:latest
+    image: bakindf/plant-diseases-segmentation:1.0.0
     container_name: plant-pathology-container
     volumes:
       - .:/app

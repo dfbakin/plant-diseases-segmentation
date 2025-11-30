@@ -125,8 +125,6 @@ class SegmentationModule(L.LightningModule):
         return 1.0 - dice_per_class.mean()
 
 
-    # TODO generalize step to call in training_step, validation_step, test_step
-
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         """Training step.
 
@@ -139,6 +137,7 @@ class SegmentationModule(L.LightningModule):
         """
         images = batch["image"]
         masks = batch["mask"]
+        batch_size = images.size(0)
 
         logits = self(images)
         loss = self.compute_loss(logits, masks)
@@ -146,8 +145,11 @@ class SegmentationModule(L.LightningModule):
         # Update metrics
         self.train_metrics.update(logits, masks)
 
-        # Log loss
-        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        # Log loss with explicit batch_size
+        self.log(
+            "train/loss", loss,
+            prog_bar=True, on_step=True, on_epoch=True, batch_size=batch_size
+        )
 
         return loss
 
@@ -169,6 +171,7 @@ class SegmentationModule(L.LightningModule):
         """
         images = batch["image"]
         masks = batch["mask"]
+        batch_size = images.size(0)
 
         logits = self(images)
         loss = self.compute_loss(logits, masks)
@@ -176,7 +179,7 @@ class SegmentationModule(L.LightningModule):
         # Update metrics
         self.val_metrics.update(logits, masks)
 
-        self.log("val/loss", loss, prog_bar=True, on_epoch=True)
+        self.log("val/loss", loss, prog_bar=True, on_epoch=True, batch_size=batch_size)
 
     def on_validation_epoch_end(self) -> None:
         """Compute and log validation metrics at epoch end."""
@@ -196,6 +199,7 @@ class SegmentationModule(L.LightningModule):
         """
         images = batch["image"]
         masks = batch["mask"]
+        batch_size = images.size(0)
 
         logits = self(images)
         loss = self.compute_loss(logits, masks)
@@ -203,7 +207,7 @@ class SegmentationModule(L.LightningModule):
         # Update metrics
         self.test_metrics.update(logits, masks)
 
-        self.log("test/loss", loss, on_epoch=True)
+        self.log("test/loss", loss, on_epoch=True, batch_size=batch_size)
 
     def on_test_epoch_end(self) -> None:
         """Compute and log test metrics at epoch end."""

@@ -1,36 +1,31 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+# Build on top of Vast.ai's base image (includes SSH, Jupyter, Supervisor, etc.)
+# See: https://hub.docker.com/r/vastai/base-image
+FROM vastai/base-image:cuda-12.8.1-auto
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1
-
-# Install system dependencies
+# Install additional system dependencies
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
-    curl \
-    git \
-    build-essential \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    pipx && \
+    libgl1 \
+    libglx-mesa0 \
+    libglib2.0-0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pipx install dvc[s3]
+# Install PyTorch with system CUDA (no bundled nvidia-* packages)
+RUN . /venv/main/bin/activate && \
+    uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
-# Set working directory
-WORKDIR /app
+# Install remaining dependencies (--no-deps to avoid pulling nvidia-* transitively)
+COPY requirements-docker.txt /tmp/requirements.txt
+RUN . /venv/main/bin/activate && \
+    uv pip install --no-deps -r /tmp/requirements.txt && \
+    rm /tmp/requirements.txt
 
-# Copy requirements file and install dependencies
-COPY requirements.txt ./
-RUN python3 -m pip install --upgrade pip && python3 -m pip install -r requirements.txt
+# Install DVC for data versioning
+RUN . /venv/main/bin/activate && \
+    uv pip install dvc[s3]
 
-# Expose ports for Jupyter/MLflow if needed
-EXPOSE 8888 5000
+# Set PYTHONPATH so 'src' module is importable without pip install -e
+ENV PYTHONPATH="/workspace/plant-diseases-segmentation:${PYTHONPATH}"
 
-# Keep container alive by default
-CMD ["tail", "-f", "/dev/null"]
+WORKDIR /workspace

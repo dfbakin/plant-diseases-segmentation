@@ -166,11 +166,14 @@ class MLflowModelCheckpoint(Callback):
             self.best_value = current.item()
             mlflow.log_metric(f"best_{self.monitor}", self.best_value)
 
-            # Log model
+            # Log model with input example for signature inference
             if mlflow.active_run():
+                # Create example input for model signature
+                input_example = torch.randn(1, 3, 512, 512)
                 mlflow.pytorch.log_model(
                     pl_module.model,
-                    artifact_path="best_model",
+                    name="best_model",
+                    input_example=input_example,
                 )
 
 
