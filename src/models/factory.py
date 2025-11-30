@@ -160,27 +160,28 @@ def _create_segformer(
 def _create_segnext(
     num_classes: int,
     variant: str = "base",
-    pretrained: bool = True,
+    use_stage_0: bool = False,
     **kwargs: Any,
 ) -> nn.Module:
     """Create SegNeXt model.
 
-    Uses timm/mmseg for SegNeXt implementation.
+    Uses custom pure PyTorch implementation with MSCAN encoder
+    and LightHamHead (Hamburger-style) decoder.
 
     Args:
         num_classes: Number of output classes.
         variant: Model variant (tiny, small, base, large).
-        pretrained: Whether to use pretrained weights.
+        use_stage_0: Whether to include stage 0 features in decoder.
 
     Returns:
-        SegNeXt wrapper model.
+        SegNeXt model.
     """
-    from src.models.segnext import SegNeXtWrapper
+    from src.models.segnext import SegNeXt
 
-    return SegNeXtWrapper(
+    return SegNeXt(
         num_classes=num_classes,
         variant=variant,
-        pretrained=pretrained,
+        use_stage_0=use_stage_0,
         **kwargs,
     )
 

@@ -29,6 +29,8 @@ class PlantSegDataModule(L.LightningDataModule):
         batch_size: int = 8,
         num_workers: int = 4,
         pin_memory: bool = True,
+        mean: tuple[float, ...] = (0.485, 0.456, 0.406),
+        std: tuple[float, ...] = (0.229, 0.224, 0.225),
     ) -> None:
         """Initialize DataModule.
 
@@ -45,6 +47,8 @@ class PlantSegDataModule(L.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.mean = mean
+        self.std = std
 
         # Will be set in setup()
         self.train_dataset: PlantSegDataset | None = None
@@ -59,8 +63,8 @@ class PlantSegDataModule(L.LightningDataModule):
         Args:
             stage: Current stage ('fit', 'validate', 'test', 'predict').
         """
-        train_transform = get_train_transforms(image_size=self.image_size)
-        val_transform = get_val_transforms(image_size=self.image_size)
+        train_transform = get_train_transforms(image_size=self.image_size, mean=self.mean, std=self.std)
+        val_transform = get_val_transforms(image_size=self.image_size, mean=self.mean, std=self.std)
 
         if stage == "fit" or stage is None:
             self.train_dataset = PlantSegDataset(

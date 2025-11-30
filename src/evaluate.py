@@ -41,6 +41,8 @@ def evaluate(cfg: DictConfig) -> dict[str, float]:
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
+        mean=cfg.data.normalization.mean,
+        std=cfg.data.normalization.std,
     )
 
     # Load model from checkpoint

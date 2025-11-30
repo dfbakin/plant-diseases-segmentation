@@ -3,8 +3,9 @@
 *.ipynb-meta
 
 __pycache__/
-ideas
+ideas/
+mlruns/
+outputs/
 
 poetry.lock
 requirements.txt
-

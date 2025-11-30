@@ -14,13 +14,17 @@ import numpy as np
 class VisualizationCallback(Callback):
     """Callback for visualizing predictions during training.
 
-    Saves sample predictions to disk at the end of each validation epoch.
+    Saves sample predictions to disk and optionally to MLflow.
+    Logs to MLflow at: first epoch, best epoch, and final epoch.
 
     Attributes:
         output_dir: Directory to save visualizations.
         num_samples: Number of samples to visualize.
         denorm_mean: Normalization mean for denormalization.
         denorm_std: Normalization std for denormalization.
+        log_to_mlflow: Whether to log key visualizations to MLflow.
+        monitor: Metric to monitor for "best" visualization.
+        mode: 'min' or 'max' for best metric.
     """
 
     def __init__(
@@ -29,6 +33,9 @@ class VisualizationCallback(Callback):
         num_samples: int = 4,
         denorm_mean: tuple[float, ...] = (0.485, 0.456, 0.406),
         denorm_std: tuple[float, ...] = (0.229, 0.224, 0.225),
+        log_to_mlflow: bool = True,
+        monitor: str = "val/miou",
+        mode: str = "max",
     ) -> None:
         """Initialize callback.
 
@@ -37,12 +44,53 @@ class VisualizationCallback(Callback):
             num_samples: Number of samples to visualize per epoch.
             denorm_mean: Mean used for normalization.
             denorm_std: Std used for normalization.
+            log_to_mlflow: Whether to log to MLflow artifacts.
+            monitor: Metric to monitor for best visualization.
+            mode: 'min' or 'max'.
         """
         super().__init__()
         self.output_dir = Path(output_dir)
         self.num_samples = num_samples
         self.denorm_mean = torch.tensor(denorm_mean).view(3, 1, 1)
         self.denorm_std = torch.tensor(denorm_std).view(3, 1, 1)
+        self.log_to_mlflow = log_to_mlflow
+        self.monitor = monitor
+        self.mode = mode
+        self.best_value = float("-inf") if mode == "max" else float("inf")
+        self._last_fig_path: Path | None = None
+
+    def _get_mlflow_logger(self, trainer: L.Trainer):
+        """Get MLFlowLogger from trainer if available."""
+        from lightning.pytorch.loggers import MLFlowLogger
+
+        if trainer.logger is None:
+            return None
+        if isinstance(trainer.logger, MLFlowLogger):
+            return trainer.logger
+        if hasattr(trainer.logger, "_loggers"):
+            for logger in trainer.logger._loggers:
+                if isinstance(logger, MLFlowLogger):
+                    return logger
+        return None
+
+    def _log_figure_to_mlflow(
+        self,
+        trainer: L.Trainer,
+        fig_path: Path,
+        artifact_name: str,
+    ) -> None:
+        """Log a figure to MLflow artifacts."""
+        import mlflow
+
+        if not self.log_to_mlflow:
+            return
+
+        mlflow_logger = self._get_mlflow_logger(trainer)
+        if mlflow_logger is None or mlflow_logger.run_id is None:
+            return
+
+        with mlflow.start_run(run_id=mlflow_logger.run_id):
+            mlflow.log_artifact(str(fig_path), artifact_path=artifact_name)
 
     def on_validation_batch_end(
         self,
@@ -110,35 +158,103 @@ class VisualizationCallback(Callback):
             axes[i, 2].axis("off")
 
         plt.tight_layout()
-        plt.savefig(epoch_dir / "predictions.png", dpi=150)
+        fig_path = epoch_dir / "predictions.png"
+        plt.savefig(fig_path, dpi=150)
         plt.close()
+
+        # Store path for MLflow logging in on_validation_epoch_end
+        self._last_fig_path = fig_path
+
+        # Log first epoch to MLflow
+        if trainer.current_epoch == 0:
+            self._log_figure_to_mlflow(trainer, fig_path, "visualizations/epoch_000")
+
+    def on_validation_epoch_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Log best visualization to MLflow when metric improves."""
+        if self._last_fig_path is None:
+            return
+
+        current = trainer.callback_metrics.get(self.monitor)
+        if current is None:
+            return
+
+        is_best = (
+            (self.mode == "max" and current > self.best_value)
+            or (self.mode == "min" and current < self.best_value)
+        )
+
+        if is_best:
+            self.best_value = current.item()
+            # Log as "best" visualization
+            self._log_figure_to_mlflow(
+                trainer, self._last_fig_path, "visualizations/best"
+            )
+
+    def on_train_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Log final visualization to MLflow."""
+        if self._last_fig_path is not None and self._last_fig_path.exists():
+            self._log_figure_to_mlflow(
+                trainer, self._last_fig_path, "visualizations/final"
+            )
 
 
 class MLflowModelCheckpoint(Callback):
     """Callback to log best model to MLflow.
 
     Logs the best model checkpoint as an MLflow artifact.
+    Uses the trainer's MLFlowLogger run context instead of global mlflow.
 
     Attributes:
         monitor: Metric to monitor for best model.
         mode: 'min' or 'max'.
+        log_model: Whether to log full model (can be large).
     """
 
     def __init__(
         self,
         monitor: str = "val/miou",
         mode: str = "max",
+        log_model: bool = True,
+        input_size: tuple[int, int] = (512, 512),
     ) -> None:
         """Initialize callback.
 
         Args:
             monitor: Metric to monitor.
             mode: 'min' or 'max'.
+            log_model: Whether to log the model artifact.
+            input_size: Input image size for signature inference.
         """
         super().__init__()
         self.monitor = monitor
         self.mode = mode
+        self.log_model = log_model
+        self.input_size = input_size
         self.best_value = float("-inf") if mode == "max" else float("inf")
+
+    def _get_mlflow_logger(self, trainer: L.Trainer):
+        """Get MLFlowLogger from trainer if available."""
+        from lightning.pytorch.loggers import MLFlowLogger
+
+        if trainer.logger is None:
+            return None
+        # Handle single logger
+        if isinstance(trainer.logger, MLFlowLogger):
+            return trainer.logger
+        # Handle multiple loggers
+        if hasattr(trainer.logger, "_loggers"):
+            for logger in trainer.logger._loggers:
+                if isinstance(logger, MLFlowLogger):
+                    return logger
+        return None
 
     def on_validation_epoch_end(
         self,
@@ -152,6 +268,7 @@ class MLflowModelCheckpoint(Callback):
             pl_module: Lightning module.
         """
         import mlflow
+        from mlflow import MlflowClient
 
         current = trainer.callback_metrics.get(self.monitor)
         if current is None:
@@ -162,16 +279,81 @@ class MLflowModelCheckpoint(Callback):
             or (self.mode == "min" and current < self.best_value)
         )
 
-        if is_best:
-            self.best_value = current.item()
-            mlflow.log_metric(f"best_{self.monitor}", self.best_value)
+        if not is_best:
+            return
 
-            # Log model
-            if mlflow.active_run():
+        self.best_value = current.item()
+
+        # Get MLflow logger and run_id from trainer
+        mlflow_logger = self._get_mlflow_logger(trainer)
+        if mlflow_logger is None:
+            return
+
+        run_id = mlflow_logger.run_id
+        if run_id is None:
+            return
+
+        # Use MlflowClient to log to the correct run
+        client = MlflowClient(tracking_uri=mlflow_logger._tracking_uri)
+
+        # Log best metrics
+        client.log_metric(run_id, f"best_{self.monitor}", self.best_value)
+        client.log_metric(run_id, "best_epoch", trainer.current_epoch)
+
+        # Log model without input_example to avoid device mismatch issues
+        # MLflow tries to run inference for signature which fails on GPU models
+        if self.log_model:
+            with mlflow.start_run(run_id=run_id):
                 mlflow.pytorch.log_model(
                     pl_module.model,
-                    artifact_path="best_model",
+                    name="best_model",
                 )
+
+    def on_train_end(
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+    ) -> None:
+        """Log final summary metrics, config, and checkpoint paths.
+
+        Args:
+            trainer: Lightning trainer.
+            pl_module: Lightning module.
+        """
+        import mlflow
+        from mlflow import MlflowClient
+
+        mlflow_logger = self._get_mlflow_logger(trainer)
+        if mlflow_logger is None:
+            return
+
+        run_id = mlflow_logger.run_id
+        if run_id is None:
+            return
+
+        client = MlflowClient(tracking_uri=mlflow_logger._tracking_uri)
+
+        # Log final epoch
+        client.log_metric(run_id, "final_epoch", trainer.current_epoch)
+
+        # Log best checkpoint path as parameter
+        ckpt_callback = trainer.checkpoint_callback
+        if ckpt_callback is not None and ckpt_callback.best_model_path:
+            client.log_param(run_id, "best_checkpoint_path", ckpt_callback.best_model_path)
+
+        # Log output directory
+        client.log_param(run_id, "output_dir", str(trainer.default_root_dir))
+
+        with mlflow.start_run(run_id=run_id):
+            # Log Hydra config as artifact
+            hydra_dir = Path(trainer.default_root_dir) / ".hydra"
+            if hydra_dir.exists():
+                mlflow.log_artifacts(str(hydra_dir), artifact_path="hydra_config")
+
+            # Log all visualizations directory
+            vis_dir = Path(trainer.default_root_dir) / "visualizations"
+            if vis_dir.exists():
+                mlflow.log_artifacts(str(vis_dir), artifact_path="visualizations/all_epochs")
 
 
 class EarlyStoppingWithPatience(Callback):
