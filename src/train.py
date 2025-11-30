@@ -129,6 +129,8 @@ def train(cfg: DictConfig) -> float:
         VisualizationCallback(
             output_dir=output_dir / "visualizations",
             num_samples=4,
+            denorm_mean=cfg.data.normalization.mean,
+            denorm_std=cfg.data.normalization.std,
         ),
         # MLflow model logging
         MLflowModelCheckpoint(
