@@ -11,6 +11,6 @@ num_classes: 2
 
 # Training hyperparameters
 learning_rate: 1e-4
-weight_decay: 1e-4
+weight_decay: 5e-4
 loss_fn: "cross_entropy"  # Options: cross_entropy, dice
 
