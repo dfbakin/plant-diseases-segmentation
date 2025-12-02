@@ -6,7 +6,8 @@ min_epochs: 10
 
 # Hardware
 accelerator: "auto"  # auto, gpu, cpu, mps
-devices: 1
+devices: "auto"  # "auto" detects available GPUs, or set to specific number (1, 2, 4)
+strategy: "auto"  # "auto" picks ddp for multi-gpu, or "ddp", "ddp_find_unused_parameters_true"
 precision: "16-mixed"  # 16-mixed, bf16-mixed, 32
 
 # Checkpointing
