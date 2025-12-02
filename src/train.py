@@ -145,6 +145,7 @@ def train(cfg: DictConfig) -> float:
         min_epochs=cfg.trainer.min_epochs,
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
+        strategy=cfg.trainer.strategy,
         precision=cfg.trainer.precision,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         gradient_clip_algorithm=cfg.trainer.gradient_clip_algorithm,

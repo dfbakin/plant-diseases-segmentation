@@ -5,7 +5,6 @@ from typing import Any
 
 import lightning as L
 import torch
-import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 import matplotlib.pyplot as plt
 import numpy as np
@@ -103,6 +102,8 @@ class VisualizationCallback(Callback):
     ) -> None:
         """Save visualizations on first validation batch.
 
+        Only executes on rank 0 to avoid file conflicts in multi-GPU training.
+
         Args:
             trainer: Lightning trainer.
             pl_module: Lightning module.
@@ -111,6 +112,10 @@ class VisualizationCallback(Callback):
             batch_idx: Batch index.
             dataloader_idx: Dataloader index.
         """
+        # Only run on rank 0 (main process) to avoid file conflicts
+        if not trainer.is_global_zero:
+            return
+
         if batch_idx != 0:
             return
 
@@ -175,6 +180,10 @@ class VisualizationCallback(Callback):
         pl_module: L.LightningModule,
     ) -> None:
         """Log best visualization to MLflow when metric improves."""
+        # Only run on rank 0
+        if not trainer.is_global_zero:
+            return
+
         if self._last_fig_path is None:
             return
 
@@ -200,6 +209,10 @@ class VisualizationCallback(Callback):
         pl_module: L.LightningModule,
     ) -> None:
         """Log final visualization to MLflow."""
+        # Only run on rank 0
+        if not trainer.is_global_zero:
+            return
+
         if self._last_fig_path is not None and self._last_fig_path.exists():
             self._log_figure_to_mlflow(
                 trainer, self._last_fig_path, "visualizations/final"
@@ -207,37 +220,32 @@ class VisualizationCallback(Callback):
 
 
 class MLflowModelCheckpoint(Callback):
-    """Callback to log best model to MLflow.
+    """Callback to log checkpoint paths and metrics to MLflow.
 
-    Logs the best model checkpoint as an MLflow artifact.
+    Logs paths to Lightning checkpoints (stored in outputs directory).
+    Heavy checkpoint files are NOT uploaded to MLflow, only paths are logged.
     Uses the trainer's MLFlowLogger run context instead of global mlflow.
+    Only executes on rank 0 for multi-GPU training compatibility.
 
     Attributes:
         monitor: Metric to monitor for best model.
         mode: 'min' or 'max'.
-        log_model: Whether to log full model (can be large).
     """
 
     def __init__(
         self,
         monitor: str = "val/miou",
         mode: str = "max",
-        log_model: bool = True,
-        input_size: tuple[int, int] = (512, 512),
     ) -> None:
         """Initialize callback.
 
         Args:
             monitor: Metric to monitor.
             mode: 'min' or 'max'.
-            log_model: Whether to log the model artifact.
-            input_size: Input image size for signature inference.
         """
         super().__init__()
         self.monitor = monitor
         self.mode = mode
-        self.log_model = log_model
-        self.input_size = input_size
         self.best_value = float("-inf") if mode == "max" else float("inf")
 
     def _get_mlflow_logger(self, trainer: L.Trainer):
@@ -261,13 +269,18 @@ class MLflowModelCheckpoint(Callback):
         trainer: L.Trainer,
         pl_module: L.LightningModule,
     ) -> None:
-        """Check if current model is best and log to MLflow.
+        """Log best metric when it improves.
+
+        Only executes on rank 0 for multi-GPU compatibility.
 
         Args:
             trainer: Lightning trainer.
             pl_module: Lightning module.
         """
-        import mlflow
+        # Only run on rank 0
+        if not trainer.is_global_zero:
+            return
+
         from mlflow import MlflowClient
 
         current = trainer.callback_metrics.get(self.monitor)
@@ -300,26 +313,25 @@ class MLflowModelCheckpoint(Callback):
         client.log_metric(run_id, f"best_{self.monitor}", self.best_value)
         client.log_metric(run_id, "best_epoch", trainer.current_epoch)
 
-        # Log model without input_example to avoid device mismatch issues
-        # MLflow tries to run inference for signature which fails on GPU models
-        if self.log_model:
-            with mlflow.start_run(run_id=run_id):
-                mlflow.pytorch.log_model(
-                    pl_module.model,
-                    name="best_model",
-                )
-
     def on_train_end(
         self,
         trainer: L.Trainer,
         pl_module: L.LightningModule,
     ) -> None:
-        """Log final summary metrics, config, and checkpoint paths.
+        """Log final metrics, checkpoint paths, and config to MLflow.
+
+        Only paths to checkpoints are logged (not the files themselves).
+        Checkpoints are managed by Lightning's ModelCheckpoint in outputs dir.
+        Only executes on rank 0 for multi-GPU compatibility.
 
         Args:
             trainer: Lightning trainer.
             pl_module: Lightning module.
         """
+        # Only run on rank 0
+        if not trainer.is_global_zero:
+            return
+
         import mlflow
         from mlflow import MlflowClient
 
@@ -336,24 +348,26 @@ class MLflowModelCheckpoint(Callback):
         # Log final epoch
         client.log_metric(run_id, "final_epoch", trainer.current_epoch)
 
-        # Log best checkpoint path as parameter
+        # Log checkpoint paths (not the files - they're in outputs dir)
         ckpt_callback = trainer.checkpoint_callback
-        if ckpt_callback is not None and ckpt_callback.best_model_path:
-            client.log_param(run_id, "best_checkpoint_path", ckpt_callback.best_model_path)
+        if ckpt_callback is not None:
+            if ckpt_callback.best_model_path:
+                client.log_param(
+                    run_id, "best_checkpoint_path", ckpt_callback.best_model_path
+                )
+            if ckpt_callback.last_model_path:
+                client.log_param(
+                    run_id, "last_checkpoint_path", ckpt_callback.last_model_path
+                )
 
         # Log output directory
         client.log_param(run_id, "output_dir", str(trainer.default_root_dir))
 
+        # Log Hydra config as artifact (small YAML files, useful for reproducibility)
         with mlflow.start_run(run_id=run_id):
-            # Log Hydra config as artifact
             hydra_dir = Path(trainer.default_root_dir) / ".hydra"
             if hydra_dir.exists():
                 mlflow.log_artifacts(str(hydra_dir), artifact_path="hydra_config")
-
-            # Log all visualizations directory
-            vis_dir = Path(trainer.default_root_dir) / "visualizations"
-            if vis_dir.exists():
-                mlflow.log_artifacts(str(vis_dir), artifact_path="visualizations/all_epochs")
 
 
 class EarlyStoppingWithPatience(Callback):

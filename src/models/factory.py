@@ -161,6 +161,8 @@ def _create_segnext(
     num_classes: int,
     variant: str = "base",
     use_stage_0: bool = False,
+    pretrained_encoder: bool = True,
+    encoder_checkpoint: str | None = None,
     **kwargs: Any,
 ) -> nn.Module:
     """Create SegNeXt model.
@@ -172,18 +174,31 @@ def _create_segnext(
         num_classes: Number of output classes.
         variant: Model variant (tiny, small, base, large).
         use_stage_0: Whether to include stage 0 features in decoder.
+        pretrained_encoder: Whether to load pretrained MSCAN weights
+            from ImageNet-1K. Weights should be in 'pretrained_mscan/' dir.
+        encoder_checkpoint: Optional explicit path to encoder checkpoint.
 
     Returns:
-        SegNeXt model.
+        SegNeXt model with optionally pretrained encoder.
     """
-    from src.models.segnext import SegNeXt
+    from src.models.segnext import SegNeXt, load_pretrained_mscan
 
-    return SegNeXt(
+    model = SegNeXt(
         num_classes=num_classes,
         variant=variant,
         use_stage_0=use_stage_0,
         **kwargs,
     )
+
+    if pretrained_encoder:
+        load_pretrained_mscan(
+            model=model,
+            variant=variant,  # type: ignore[arg-type]
+            checkpoint_path=encoder_checkpoint,
+            strict=False,
+        )
+
+    return model
 
 
 # Model configurations for reference
@@ -203,6 +218,7 @@ MODEL_CONFIGS = {
     "segnext": {
         "variants": ["tiny", "small", "base", "large"],
         "default_variant": "base",
+        "pretrained_encoder": True,  # ImageNet-1K pretrained MSCAN
     },
 }
 
