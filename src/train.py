@@ -80,7 +80,7 @@ def train(cfg: DictConfig) -> float:
         encoder_weights=cfg.model.get("encoder_weights", "imagenet"),
         variant=cfg.model.get("variant"),
         pretrained=cfg.model.get("pretrained", True),
-        decoder_channels=cfg.model.get("decoder_channels", 256),
+        decoder_channels=cfg.model.get("decoder_channels"),
     )
 
     # Wrap in Lightning module

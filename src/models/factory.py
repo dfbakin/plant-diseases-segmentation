@@ -161,7 +161,7 @@ def _create_segnext(
     num_classes: int,
     variant: str = "base",
     use_stage_0: bool = False,
-    pretrained_encoder: bool = True,
+    pretrained: bool = True,
     encoder_checkpoint: str | None = None,
     **kwargs: Any,
 ) -> nn.Module:
@@ -174,7 +174,7 @@ def _create_segnext(
         num_classes: Number of output classes.
         variant: Model variant (tiny, small, base, large).
         use_stage_0: Whether to include stage 0 features in decoder.
-        pretrained_encoder: Whether to load pretrained MSCAN weights
+        pretrained: Whether to load pretrained MSCAN weights
             from ImageNet-1K. Weights should be in 'pretrained_mscan/' dir.
         encoder_checkpoint: Optional explicit path to encoder checkpoint.
 
@@ -190,7 +190,7 @@ def _create_segnext(
         **kwargs,
     )
 
-    if pretrained_encoder:
+    if pretrained:
         load_pretrained_mscan(
             model=model,
             variant=variant,  # type: ignore[arg-type]
