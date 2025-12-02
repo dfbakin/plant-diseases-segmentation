@@ -1,4 +1,7 @@
-"""Model factory for segmentation architectures."""
+"""Model factory for segmentation architectures.
+
+Supports: DeepLabv3+, U-Net (via smp), SegFormer (via HuggingFace), SegNeXt (custom).
+"""
 
 from typing import Any, Literal
 
@@ -6,13 +9,7 @@ import segmentation_models_pytorch as smp
 import torch.nn as nn
 
 
-# Type alias for supported models
-ModelName = Literal[
-    "deeplabv3plus",
-    "unet",
-    "segformer",
-    "segnext",
-]
+ModelName = Literal["deeplabv3plus", "unet", "segformer", "segnext"]
 
 
 def create_model(
@@ -22,62 +19,22 @@ def create_model(
     encoder_weights: str | None = "imagenet",
     **kwargs: Any,
 ) -> nn.Module:
-    """Create a segmentation model.
+    """Create a segmentation model by name.
 
-    Supports:
-    - DeepLabv3+ (via segmentation_models_pytorch)
-    - U-Net (via segmentation_models_pytorch)
-    - SegFormer (via transformers)
-    - SegNeXt (via mmsegmentation/custom)
-
-    Args:
-        name: Model architecture name.
-        num_classes: Number of output classes.
-        encoder_name: Encoder backbone (for smp models).
-        encoder_weights: Pretrained weights for encoder.
-        **kwargs: Additional model-specific arguments.
-
-    Returns:
-        Initialized segmentation model.
-
-    Raises:
-        ValueError: If model name is not supported.
+    Raises ValueError for unknown model names.
     """
     name = name.lower()
 
     if name == "deeplabv3plus":
-        return _create_deeplabv3plus(
-            num_classes=num_classes,
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            **kwargs,
-        )
-
+        return _create_deeplabv3plus(num_classes, encoder_name, encoder_weights, **kwargs)
     elif name == "unet":
-        return _create_unet(
-            num_classes=num_classes,
-            encoder_name=encoder_name,
-            encoder_weights=encoder_weights,
-            **kwargs,
-        )
-
+        return _create_unet(num_classes, encoder_name, encoder_weights, **kwargs)
     elif name == "segformer":
-        return _create_segformer(
-            num_classes=num_classes,
-            **kwargs,
-        )
-
+        return _create_segformer(num_classes, **kwargs)
     elif name == "segnext":
-        return _create_segnext(
-            num_classes=num_classes,
-            **kwargs,
-        )
-
+        return _create_segnext(num_classes, **kwargs)
     else:
-        raise ValueError(
-            f"Unknown model: {name}. "
-            f"Supported: deeplabv3plus, unet, segformer, segnext"
-        )
+        raise ValueError(f"Unknown model: {name}. Supported: deeplabv3plus, unet, segformer, segnext")
 
 
 def _create_deeplabv3plus(
@@ -86,23 +43,11 @@ def _create_deeplabv3plus(
     encoder_weights: str | None = "imagenet",
     **kwargs: Any,
 ) -> nn.Module:
-    """Create DeepLabv3+ model.
-
-    Uses segmentation_models_pytorch for robust implementation.
-
-    Args:
-        num_classes: Number of output classes.
-        encoder_name: Encoder backbone.
-        encoder_weights: Pretrained weights.
-
-    Returns:
-        DeepLabv3+ model.
-    """
     return smp.DeepLabV3Plus(
         encoder_name=encoder_name,
         encoder_weights=encoder_weights,
         classes=num_classes,
-        activation=None,  # Raw logits for loss computation
+        activation=None,
     )
 
 
@@ -112,16 +57,6 @@ def _create_unet(
     encoder_weights: str | None = "imagenet",
     **kwargs: Any,
 ) -> nn.Module:
-    """Create U-Net model.
-
-    Args:
-        num_classes: Number of output classes.
-        encoder_name: Encoder backbone.
-        encoder_weights: Pretrained weights.
-
-    Returns:
-        U-Net model.
-    """
     return smp.Unet(
         encoder_name=encoder_name,
         encoder_weights=encoder_weights,
@@ -136,25 +71,10 @@ def _create_segformer(
     pretrained: bool = True,
     **kwargs: Any,
 ) -> nn.Module:
-    """Create SegFormer model.
-
-    Uses HuggingFace transformers for SegFormer implementation.
-
-    Args:
-        num_classes: Number of output classes.
-        variant: Model variant (b0, b1, b2, b3, b4, b5).
-        pretrained: Whether to use pretrained weights.
-
-    Returns:
-        SegFormer wrapper model.
-    """
+    """SegFormer via HuggingFace transformers. Variants: b0-b5."""
     from src.models.segformer import SegFormerWrapper
 
-    return SegFormerWrapper(
-        num_classes=num_classes,
-        variant=variant,
-        pretrained=pretrained,
-    )
+    return SegFormerWrapper(num_classes=num_classes, variant=variant, pretrained=pretrained)
 
 
 def _create_segnext(
@@ -165,30 +85,14 @@ def _create_segnext(
     encoder_checkpoint: str | None = None,
     **kwargs: Any,
 ) -> nn.Module:
-    """Create SegNeXt model.
+    """SegNeXt with MSCAN encoder + LightHamHead decoder.
 
-    Uses custom pure PyTorch implementation with MSCAN encoder
-    and LightHamHead (Hamburger-style) decoder.
-
-    Args:
-        num_classes: Number of output classes.
-        variant: Model variant (tiny, small, base, large).
-        use_stage_0: Whether to include stage 0 features in decoder.
-        pretrained: Whether to load pretrained MSCAN weights
-            from ImageNet-1K. Weights should be in 'pretrained_mscan/' dir.
-        encoder_checkpoint: Optional explicit path to encoder checkpoint.
-
-    Returns:
-        SegNeXt model with optionally pretrained encoder.
+    Variants: tiny, small, base, large.
+    If pretrained=True, loads ImageNet-1K weights from 'pretrained/mscan/'.
     """
     from src.models.segnext import SegNeXt, load_pretrained_mscan
 
-    model = SegNeXt(
-        num_classes=num_classes,
-        variant=variant,
-        use_stage_0=use_stage_0,
-        **kwargs,
-    )
+    model = SegNeXt(num_classes=num_classes, variant=variant, use_stage_0=use_stage_0, **kwargs)
 
     if pretrained:
         load_pretrained_mscan(
@@ -201,7 +105,7 @@ def _create_segnext(
     return model
 
 
-# Model configurations for reference
+# Reference configs for available options
 MODEL_CONFIGS = {
     "deeplabv3plus": {
         "encoders": ["resnet50", "resnet101", "efficientnet-b4", "mobilenet_v2"],
@@ -218,7 +122,7 @@ MODEL_CONFIGS = {
     "segnext": {
         "variants": ["tiny", "small", "base", "large"],
         "default_variant": "base",
-        "pretrained_encoder": True,  # ImageNet-1K pretrained MSCAN
+        "pretrained_encoder": True,
     },
 }
 
