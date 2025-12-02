@@ -40,6 +40,16 @@ class SegmentationMetrics(Metric):
             dist_reduce_fx="sum",
         )
         self.add_state(
+            "boundary_intersection",
+            default=torch.zeros(num_classes),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "boundary_union",
+            default=torch.zeros(num_classes),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
             "union",
             default=torch.zeros(num_classes),
             dist_reduce_fx="sum",
@@ -90,6 +100,8 @@ class SegmentationMetrics(Metric):
             self.pred_sum[cls] += pred_sum
             self.target_sum[cls] += target_sum
 
+            update_boundary_metrics(pred_mask, target_mask)
+
     def compute(self) -> dict[str, torch.Tensor]:
         """Compute final metrics.
 
@@ -98,11 +110,12 @@ class SegmentationMetrics(Metric):
         """
         # IoU per class
         iou_per_class = self.intersection / (self.union + 1e-8)
+        boundary_iou_per_class = self.boundary_intersection / (self.boundary_union + 1e-8)
 
         # Mean IoU (excluding classes with no samples)
         valid_classes = self.union > 0
         miou = iou_per_class[valid_classes].mean() if valid_classes.any() else torch.tensor(0.0)
-
+        boundary_iou = boundary_iou_per_class[valid_classes].mean() if valid_classes.any() else torch.tensor(0.0)
         # Dice coefficient (F1 score per class, then averaged)
         dice_per_class = (2 * self.intersection) / (self.pred_sum + self.target_sum + 1e-8)
         dice = dice_per_class[valid_classes].mean() if valid_classes.any() else torch.tensor(0.0)
@@ -113,14 +126,18 @@ class SegmentationMetrics(Metric):
             "iou_per_class": iou_per_class,
             "iou_background": iou_per_class[0],
             "iou_disease": iou_per_class[1],
+            "boundary_iou": boundary_iou,
+            "boundary_iou_per_class": boundary_iou_per_class,
+            "boundary_iou_background": boundary_iou_per_class[0],
+            "boundary_iou_disease": boundary_iou_per_class[1],
         }
 
 
-def compute_boundary_iou(
+def update_boundary_metrics(self,
     preds: torch.Tensor,
     target: torch.Tensor,
     dilation: int = 3,
-) -> torch.Tensor:
+) -> None:
     """Compute Boundary IoU.
 
     Measures segmentation quality at object boundaries.
@@ -153,8 +170,5 @@ def compute_boundary_iou(
     target_boundary = get_boundary(target)
 
     # Compute IoU on boundaries
-    intersection = (pred_boundary * target_boundary).sum()
-    union = pred_boundary.sum() + target_boundary.sum() - intersection
-
-    return intersection / (union + 1e-8)
-
+    self.boundary_intersection += (pred_boundary * target_boundary).sum()
+    self.boundary_union += pred_boundary.sum() + target_boundary.sum() - self.boundary_intersection

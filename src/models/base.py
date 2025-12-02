@@ -160,6 +160,10 @@ class SegmentationModule(L.LightningModule):
         self.log("train/dice", metrics["dice"])
         self.log("train/iou_background", metrics["iou_background"])
         self.log("train/iou_disease", metrics["iou_disease"])
+        self.log("train/boundary_iou", metrics["boundary_iou"])
+        self.log("train/boundary_iou_per_class", metrics["boundary_iou_per_class"])
+        self.log("train/boundary_iou_background", metrics["boundary_iou_background"])
+        self.log("train/boundary_iou_disease", metrics["boundary_iou_disease"])
         self.train_metrics.reset()
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
@@ -188,6 +192,10 @@ class SegmentationModule(L.LightningModule):
         self.log("val/dice", metrics["dice"])
         self.log("val/iou_background", metrics["iou_background"])
         self.log("val/iou_disease", metrics["iou_disease"])
+        self.log("val/boundary_iou", metrics["boundary_iou"])
+        self.log("val/boundary_iou_per_class", metrics["boundary_iou_per_class"])
+        self.log("val/boundary_iou_background", metrics["boundary_iou_background"])
+        self.log("val/boundary_iou_disease", metrics["boundary_iou_disease"])
         self.val_metrics.reset()
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
@@ -216,6 +224,10 @@ class SegmentationModule(L.LightningModule):
         self.log("test/dice", metrics["dice"])
         self.log("test/iou_background", metrics["iou_background"])
         self.log("test/iou_disease", metrics["iou_disease"])
+        self.log("test/boundary_iou", metrics["boundary_iou"])
+        self.log("test/boundary_iou_per_class", metrics["boundary_iou_per_class"])
+        self.log("test/boundary_iou_background", metrics["boundary_iou_background"])
+        self.log("test/boundary_iou_disease", metrics["boundary_iou_disease"])
         self.test_metrics.reset()
 
     def configure_optimizers(self) -> dict[str, Any]:

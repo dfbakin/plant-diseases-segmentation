@@ -133,12 +133,11 @@ class NMF2D(nn.Module):
         self.rand_init = rand_init
 
     def _build_bases(
-        self, b: int, s: int, d: int, r: int, device: torch.device
+        self, b: int, s: int, d: int, r: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        """Build random bases for NMF."""
-        bases = torch.rand((b * s, d, r), device=device)
+        bases = torch.rand((b * s, d, r), device=device, dtype=torch.float32)
         bases = F.normalize(bases, dim=1)
-        return bases
+        return bases.to(dtype)
 
     def local_step(
         self,
@@ -228,6 +227,7 @@ class NMF2D(nn.Module):
             Output tensor of shape (B, C, H, W).
         """
         b, c, h, w = x.shape
+        input_dtype = x.dtype
 
         # Reshape: (B, C, H, W) -> (B*S, D, N)
         if self.spatial:
@@ -239,8 +239,8 @@ class NMF2D(nn.Module):
             n = c // self.S
             x = x.view(b * self.S, n, d).transpose(1, 2)
 
-        # Build bases
-        bases = self._build_bases(b, self.S, d, self.R, x.device)
+        # Build bases with matching dtype
+        bases = self._build_bases(b, self.S, d, self.R, x.device, input_dtype)
 
         # Run NMF
         bases, coef = self.local_inference(x, bases)
@@ -283,7 +283,7 @@ class Hamburger(nn.Module):
         """
         super().__init__()
 
-        self.ham_in = nn.Conv2d(ham_channels, ham_channels, 1, bias=False)
+        self.ham_in = nn.Conv2d(ham_channels, ham_channels, 1, bias=True)
 
         self.ham = NMF2D(
             spatial=True,

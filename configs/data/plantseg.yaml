@@ -8,7 +8,7 @@ image_size: 512
 
 # DataLoader settings
 batch_size: 16
-num_workers: 4
+num_workers: 8
 pin_memory: true
 
 normalization:
