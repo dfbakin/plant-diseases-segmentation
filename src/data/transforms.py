@@ -102,7 +102,7 @@ def get_val_transforms(
         ]
     )
 
-
+# TODO refine when using for FixMatch
 def get_strong_augment_transforms(
     image_size: int = 512,
     mean: tuple[float, ...] = (0.485, 0.456, 0.406),
@@ -143,7 +143,6 @@ def get_strong_augment_transforms(
             A.ElasticTransform(alpha=120, sigma=6, p=0.3),
             A.GridDistortion(p=0.3),
             # Strong color
-            # TODO whether heavy color augmentations are applicable for plant diseases
             A.ColorJitter(
                 brightness=0.4,
                 contrast=0.4,
