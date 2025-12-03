@@ -1,5 +1,4 @@
 # Artificial color augmentations: includes color jitter with hue shifts
-# More aggressive than natural_color - may change disease appearance
 
 _target_: albumentations.Compose
 transforms:
@@ -18,7 +17,6 @@ transforms:
     brightness_limit: 0.3
     contrast_limit: 0.3
     p: 0.5
-  # Artificial color changes
   - _target_: albumentations.HueSaturationValue
     hue_shift_limit: 20
     sat_shift_limit: 30
@@ -36,9 +34,9 @@ transforms:
       - 120
     p: 0.3
   - _target_: albumentations.GaussNoise
-    var_limit:
-      - 10.0
-      - 50.0
+    std_range:
+      - 0.1
+      - 0.3
     p: 0.3
   - _target_: albumentations.GaussianBlur
     blur_limit:
@@ -49,4 +47,3 @@ transforms:
     mean: ${data.normalization.mean}
     std: ${data.normalization.std}
   - _target_: albumentations.pytorch.ToTensorV2
-

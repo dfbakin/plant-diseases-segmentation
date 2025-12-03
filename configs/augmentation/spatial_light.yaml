@@ -19,14 +19,23 @@ transforms:
     p: 0.5
   - _target_: albumentations.RandomRotate90
     p: 0.5
-  - _target_: albumentations.ShiftScaleRotate
-    shift_limit: 0.1
-    scale_limit: 0.1
-    rotate_limit: 30
+  - _target_: albumentations.Affine
+    translate_percent:
+      x:
+        - -0.1
+        - 0.1
+      y:
+        - -0.1
+        - 0.1
+    scale:
+      - 0.9
+      - 1.1
+    rotate:
+      - -30
+      - 30
     border_mode: 0
     p: 0.4
   - _target_: albumentations.Normalize
     mean: ${data.normalization.mean}
     std: ${data.normalization.std}
   - _target_: albumentations.pytorch.ToTensorV2
-

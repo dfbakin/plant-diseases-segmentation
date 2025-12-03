@@ -14,9 +14,9 @@ transforms:
     height: ${data.image_size}
     width: ${data.image_size}
   - _target_: albumentations.GaussNoise
-    var_limit:
-      - 10.0
-      - 50.0
+    std_range:
+      - 0.1
+      - 0.35
     p: 0.4
   - _target_: albumentations.GaussianBlur
     blur_limit:
@@ -27,4 +27,3 @@ transforms:
     mean: ${data.normalization.mean}
     std: ${data.normalization.std}
   - _target_: albumentations.pytorch.ToTensorV2
-
