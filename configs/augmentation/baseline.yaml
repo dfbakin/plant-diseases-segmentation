@@ -1,0 +1,20 @@
+# Baseline: minimal augmentations with RandomCrop (control group)
+
+_target_: albumentations.Compose
+transforms:
+  - _target_: albumentations.LongestMaxSize
+    max_size: ${data.image_size}
+  - _target_: albumentations.PadIfNeeded
+    min_height: ${data.image_size}
+    min_width: ${data.image_size}
+    border_mode: 0
+    fill: 0
+    fill_mask: 0
+  - _target_: albumentations.RandomCrop
+    height: ${data.image_size}
+    width: ${data.image_size}
+  - _target_: albumentations.Normalize
+    mean: ${data.normalization.mean}
+    std: ${data.normalization.std}
+  - _target_: albumentations.pytorch.ToTensorV2
+

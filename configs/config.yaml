@@ -4,6 +4,7 @@
 defaults:
   - _self_
   - data: plantseg
+  - augmentation: spatial_color_light  # baseline, natural_color, spatial_light, spatial_heavy, artificial_color, spatial_color_light
   - model: deeplabv3plus
   - trainer: default
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import hydra
 import lightning as L
 import torch
+from hydra.utils import instantiate
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import MLFlowLogger
 from omegaconf import DictConfig, OmegaConf
@@ -32,6 +33,10 @@ def train(cfg: DictConfig) -> float:
     output_dir = Path(cfg.paths.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Instantiate training augmentations from Hydra config
+    train_transform = instantiate(cfg.augmentation)
+    log.info(f"Using augmentation preset: {cfg.augmentation._target_}")
+
     datamodule = PlantSegDataModule(
         root=cfg.data.root,
         image_size=cfg.data.image_size,
@@ -40,6 +45,7 @@ def train(cfg: DictConfig) -> float:
         pin_memory=cfg.data.pin_memory,
         mean=cfg.data.normalization.mean,
         std=cfg.data.normalization.std,
+        train_transform=train_transform,
     )
 
     model_backbone = create_model(
@@ -63,8 +69,8 @@ def train(cfg: DictConfig) -> float:
     mlflow_logger = MLFlowLogger(
         experiment_name=cfg.mlflow.experiment_name,
         tracking_uri=cfg.mlflow.tracking_uri,
-        run_name=f"{cfg.model.name}_{cfg.experiment.seed}",
-        tags={"model": cfg.model.name, "encoder": cfg.model.get("encoder_name", cfg.model.get("variant", "default"))},
+        run_name=f"{cfg.model.name}_{cfg.experiment.seed} {cfg.augmentation._target_}",
+        tags={"model": cfg.model.name, "encoder": cfg.model.get("encoder_name", cfg.model.get("variant", "default")), "augmentation": cfg.augmentation._target_},
     )
 
     callbacks = [

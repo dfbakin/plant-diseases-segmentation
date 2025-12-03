@@ -1,0 +1,56 @@
+# Heavy spatial augmentations: aggressive geometric transforms
+
+_target_: albumentations.Compose
+transforms:
+  - _target_: albumentations.LongestMaxSize
+    max_size: ${data.image_size}
+  - _target_: albumentations.PadIfNeeded
+    min_height: ${data.image_size}
+    min_width: ${data.image_size}
+    border_mode: 0
+    fill: 0
+    fill_mask: 0
+  - _target_: albumentations.RandomCrop
+    height: ${data.image_size}
+    width: ${data.image_size}
+  - _target_: albumentations.HorizontalFlip
+    p: 0.5
+  - _target_: albumentations.VerticalFlip
+    p: 0.5
+  - _target_: albumentations.RandomRotate90
+    p: 0.5
+  - _target_: albumentations.ShiftScaleRotate
+    shift_limit: 0.2
+    scale_limit: 0.3
+    rotate_limit: 45
+    border_mode: 0
+    p: 0.6
+  - _target_: albumentations.OneOf
+    transforms:
+      - _target_: albumentations.ElasticTransform
+        alpha: 120
+        sigma: 6
+        p: 1.0
+      - _target_: albumentations.GridDistortion
+        num_steps: 5
+        distort_limit: 0.3
+        p: 1.0
+      - _target_: albumentations.OpticalDistortion
+        distort_limit: 0.3
+        shift_limit: 0.1
+        p: 1.0
+    p: 0.4
+  - _target_: albumentations.CoarseDropout
+    max_holes: 8
+    max_height: 32
+    max_width: 32
+    min_holes: 4
+    min_height: 16
+    min_width: 16
+    fill_value: 0
+    p: 0.3
+  - _target_: albumentations.Normalize
+    mean: ${data.normalization.mean}
+    std: ${data.normalization.std}
+  - _target_: albumentations.pytorch.ToTensorV2
+

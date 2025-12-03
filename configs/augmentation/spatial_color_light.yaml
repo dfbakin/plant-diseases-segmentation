@@ -1,0 +1,53 @@
+# Combined light spatial + natural color augmentations
+
+_target_: albumentations.Compose
+transforms:
+  - _target_: albumentations.LongestMaxSize
+    max_size: ${data.image_size}
+  - _target_: albumentations.PadIfNeeded
+    min_height: ${data.image_size}
+    min_width: ${data.image_size}
+    border_mode: 0
+    fill: 0
+    fill_mask: 0
+  - _target_: albumentations.RandomCrop
+    height: ${data.image_size}
+    width: ${data.image_size}
+  # Spatial (light)
+  - _target_: albumentations.HorizontalFlip
+    p: 0.5
+  - _target_: albumentations.VerticalFlip
+    p: 0.5
+  - _target_: albumentations.RandomRotate90
+    p: 0.5
+  - _target_: albumentations.ShiftScaleRotate
+    shift_limit: 0.1
+    scale_limit: 0.1
+    rotate_limit: 30
+    border_mode: 0
+    p: 0.4
+  # Color (natural)
+  - _target_: albumentations.RandomBrightnessContrast
+    brightness_limit: 0.2
+    contrast_limit: 0.2
+    p: 0.5
+  - _target_: albumentations.HueSaturationValue
+    hue_shift_limit: 0
+    sat_shift_limit: 20
+    val_shift_limit: 20
+    p: 0.4
+  - _target_: albumentations.GaussNoise
+    var_limit:
+      - 10.0
+      - 50.0
+    p: 0.2
+  - _target_: albumentations.GaussianBlur
+    blur_limit:
+      - 3
+      - 5
+    p: 0.15
+  - _target_: albumentations.Normalize
+    mean: ${data.normalization.mean}
+    std: ${data.normalization.std}
+  - _target_: albumentations.pytorch.ToTensorV2
+
