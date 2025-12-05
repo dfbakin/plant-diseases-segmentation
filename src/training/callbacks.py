@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 
 import lightning as L
+import matplotlib
+matplotlib.use("Agg")  # Headless backend - must be before pyplot import
 import matplotlib.pyplot as plt
 import numpy as np
 import torch

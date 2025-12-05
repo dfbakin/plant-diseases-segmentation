@@ -3,6 +3,9 @@
 # Path to plantsegv3 directory
 root: "data/plantsegv3"
 
+# Segmentation mode: false = binary (2 classes), true = multiclass (116 classes)
+multiclass: false
+
 # Image preprocessing
 image_size: 512
 
@@ -19,4 +22,3 @@ normalization:
   # PlantSegV3 train set normalization
   mean: [0.444959, 0.493009, 0.336009]
   std: [0.244765, 0.230322, 0.242037]
-

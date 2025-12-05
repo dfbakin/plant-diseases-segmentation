@@ -13,7 +13,7 @@ from src.metrics.segmentation import SegmentationMetrics
 class SegmentationModule(L.LightningModule):
     """Lightning module wrapping any segmentation backbone.
 
-    Handles train/val/test loops with mIoU, Dice, and Boundary IoU metrics.
+    Handles train/val/test loops with mIoU, mAcc, Dice, and Boundary IoU metrics.
     Supports cross-entropy or Dice loss with optional class weighting.
     """
 
@@ -79,15 +79,23 @@ class SegmentationModule(L.LightningModule):
         )
         return loss
 
+    def _log_metrics(self, metrics: dict, prefix: str, prog_bar: bool = False) -> None:
+        self.log(f"{prefix}/miou", metrics["miou"], prog_bar=prog_bar)
+        self.log(f"{prefix}/macc", metrics["macc"])
+        self.log(f"{prefix}/dice", metrics["dice"])
+        self.log(f"{prefix}/boundary_iou", metrics["boundary_iou"])
+
+        if self.num_classes == 2:
+            self.log(f"{prefix}/iou_background", metrics["iou_background"])
+            self.log(f"{prefix}/iou_disease", metrics["iou_disease"])
+            self.log(f"{prefix}/acc_background", metrics["acc_background"])
+            self.log(f"{prefix}/acc_disease", metrics["acc_disease"])
+            self.log(f"{prefix}/boundary_iou_background", metrics["boundary_iou_background"])
+            self.log(f"{prefix}/boundary_iou_disease", metrics["boundary_iou_disease"])
+
     def on_train_epoch_end(self) -> None:
         metrics = self.train_metrics.compute()
-        self.log("train/miou", metrics["miou"], prog_bar=True)
-        self.log("train/dice", metrics["dice"])
-        self.log("train/iou_background", metrics["iou_background"])
-        self.log("train/iou_disease", metrics["iou_disease"])
-        self.log("train/boundary_iou", metrics["boundary_iou"])
-        self.log("train/boundary_iou_background", metrics["boundary_iou_background"])
-        self.log("train/boundary_iou_disease", metrics["boundary_iou_disease"])
+        self._log_metrics(metrics, "train", prog_bar=True)
         self.train_metrics.reset()
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
@@ -100,13 +108,7 @@ class SegmentationModule(L.LightningModule):
 
     def on_validation_epoch_end(self) -> None:
         metrics = self.val_metrics.compute()
-        self.log("val/miou", metrics["miou"], prog_bar=True)
-        self.log("val/dice", metrics["dice"])
-        self.log("val/iou_background", metrics["iou_background"])
-        self.log("val/iou_disease", metrics["iou_disease"])
-        self.log("val/boundary_iou", metrics["boundary_iou"])
-        self.log("val/boundary_iou_background", metrics["boundary_iou_background"])
-        self.log("val/boundary_iou_disease", metrics["boundary_iou_disease"])
+        self._log_metrics(metrics, "val", prog_bar=True)
         self.val_metrics.reset()
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
@@ -119,13 +121,7 @@ class SegmentationModule(L.LightningModule):
 
     def on_test_epoch_end(self) -> None:
         metrics = self.test_metrics.compute()
-        self.log("test/miou", metrics["miou"])
-        self.log("test/dice", metrics["dice"])
-        self.log("test/iou_background", metrics["iou_background"])
-        self.log("test/iou_disease", metrics["iou_disease"])
-        self.log("test/boundary_iou", metrics["boundary_iou"])
-        self.log("test/boundary_iou_background", metrics["boundary_iou_background"])
-        self.log("test/boundary_iou_disease", metrics["boundary_iou_disease"])
+        self._log_metrics(metrics, "test")
         self.test_metrics.reset()
 
     def configure_optimizers(self) -> dict[str, Any]:

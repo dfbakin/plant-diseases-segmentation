@@ -1,4 +1,4 @@
-"""Segmentation metrics: mIoU, Dice, Boundary IoU."""
+"""Segmentation metrics: mIoU, mAcc, Dice, Boundary IoU."""
 
 import torch
 from torchmetrics import Metric
@@ -52,26 +52,39 @@ class SegmentationMetrics(Metric):
 
     def compute(self) -> dict[str, torch.Tensor]:
         iou_per_class = self.intersection / (self.union + 1e-8)
+        acc_per_class = self.intersection / (self.target_sum + 1e-8)  # TP / (TP + FN)
         boundary_iou_per_class = self.boundary_intersection / (self.boundary_union + 1e-8)
 
         valid = self.union > 0
         miou = iou_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
+        macc = acc_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
         boundary_iou = boundary_iou_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
 
         dice_per_class = (2 * self.intersection) / (self.pred_sum + self.target_sum + 1e-8)
         dice = dice_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
 
-        return {
+        result = {
             "miou": miou,
+            "macc": macc,
             "dice": dice,
             "iou_per_class": iou_per_class,
-            "iou_background": iou_per_class[0],
-            "iou_disease": iou_per_class[1],
+            "acc_per_class": acc_per_class,
             "boundary_iou": boundary_iou,
             "boundary_iou_per_class": boundary_iou_per_class,
-            "boundary_iou_background": boundary_iou_per_class[0],
-            "boundary_iou_disease": boundary_iou_per_class[1],
         }
+
+        # Add named per-class metrics for binary segmentation
+        if self.num_classes == 2:
+            result.update({
+                "iou_background": iou_per_class[0],
+                "iou_disease": iou_per_class[1],
+                "acc_background": acc_per_class[0],
+                "acc_disease": acc_per_class[1],
+                "boundary_iou_background": boundary_iou_per_class[0],
+                "boundary_iou_disease": boundary_iou_per_class[1],
+            })
+
+        return result
 
 
     def update_boundary_metrics(

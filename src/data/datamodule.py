@@ -1,13 +1,13 @@
 """Lightning DataModule for PlantSeg dataset."""
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import albumentations as A
 import lightning as L
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from src.data.plantseg import PlantSegDataset
+from src.data.plantseg import PlantSegDataset, PlantSegMulticlassDataset
 from src.data.transforms import get_val_transforms
 
 
@@ -24,6 +24,7 @@ class PlantSegDataModule(L.LightningDataModule):
         mean: tuple[float, ...] = (0.485, 0.456, 0.406),
         std: tuple[float, ...] = (0.229, 0.224, 0.225),
         train_transform: A.Compose | None = None,
+        multiclass: bool = False,
     ) -> None:
         super().__init__()
         self.root = Path(root)
@@ -34,10 +35,13 @@ class PlantSegDataModule(L.LightningDataModule):
         self.mean = mean
         self.std = std
         self.train_transform = train_transform
+        self.multiclass = multiclass
 
-        self.train_dataset: PlantSegDataset | None = None
-        self.val_dataset: PlantSegDataset | None = None
-        self.test_dataset: PlantSegDataset | None = None
+        self._dataset_cls = PlantSegMulticlassDataset if multiclass else PlantSegDataset
+
+        self.train_dataset: Dataset | None = None
+        self.val_dataset: Dataset | None = None
+        self.test_dataset: Dataset | None = None
 
         self.save_hyperparameters(ignore=["root", "train_transform"])
 
@@ -52,14 +56,14 @@ class PlantSegDataModule(L.LightningDataModule):
         val_transform = get_val_transforms(self.image_size, self.mean, self.std)
 
         if stage == "fit" or stage is None:
-            self.train_dataset = PlantSegDataset(self.root, "train", train_transform)
-            self.val_dataset = PlantSegDataset(self.root, "val", val_transform)
+            self.train_dataset = self._dataset_cls(self.root, "train", train_transform)
+            self.val_dataset = self._dataset_cls(self.root, "val", val_transform)
 
         if stage == "validate":
-            self.val_dataset = PlantSegDataset(self.root, "val", val_transform)
+            self.val_dataset = self._dataset_cls(self.root, "val", val_transform)
 
         if stage == "test" or stage is None:
-            self.test_dataset = PlantSegDataset(self.root, "test", val_transform)
+            self.test_dataset = self._dataset_cls(self.root, "test", val_transform)
 
     def train_dataloader(self) -> DataLoader:
         assert self.train_dataset is not None
@@ -94,5 +98,5 @@ class PlantSegDataModule(L.LightningDataModule):
 
     @property
     def num_classes(self) -> int:
-        return PlantSegDataset.NUM_CLASSES
+        return self._dataset_cls.NUM_CLASSES
 
