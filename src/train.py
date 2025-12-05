@@ -13,6 +13,7 @@ from pathlib import Path
 import hydra
 import lightning as L
 import torch
+from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import MLFlowLogger
@@ -35,7 +36,8 @@ def train(cfg: DictConfig) -> float:
 
     # Instantiate training augmentations from Hydra config
     train_transform = instantiate(cfg.augmentation)
-    log.info(f"Using augmentation preset: {cfg.augmentation._target_}")
+    augmentation_preset = HydraConfig.get().runtime.choices.get("augmentation", "unknown")
+    log.info(f"Using augmentation preset: {augmentation_preset}")
 
     datamodule = PlantSegDataModule(
         root=cfg.data.root,
@@ -69,9 +71,18 @@ def train(cfg: DictConfig) -> float:
     mlflow_logger = MLFlowLogger(
         experiment_name=cfg.mlflow.experiment_name,
         tracking_uri=cfg.mlflow.tracking_uri,
-        run_name=f"{cfg.model.name}_{cfg.experiment.seed} {cfg.augmentation._target_}",
-        tags={"model": cfg.model.name, "encoder": cfg.model.get("encoder_name", cfg.model.get("variant", "default")), "augmentation": cfg.augmentation._target_},
+        run_name=f"{cfg.model.name}_{augmentation_preset}_{cfg.experiment.seed}",
+        tags={
+            "model": cfg.model.name,
+            "encoder": cfg.model.get("encoder_name", cfg.model.get("variant", "default")),
+            "augmentation": augmentation_preset,
+        },
     )
+
+    # Log full Hydra config as MLflow artifact
+    config_path = output_dir / "config.yaml"
+    OmegaConf.save(cfg, config_path)
+    mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(config_path))
 
     callbacks = [
         ModelCheckpoint(
@@ -133,7 +144,3 @@ def main(cfg: DictConfig) -> float:
 
 if __name__ == "__main__":
     main()
-
-
-
-

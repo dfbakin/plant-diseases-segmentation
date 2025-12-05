@@ -1,7 +1,7 @@
 set -e
 
 # Experiment settings
-EXPERIMENT_NAME="plantseg_augmentation_ablation"
+EXPERIMENT_NAME="plantseg_augmentation_ablation_fp32_final"
 SEED=42
 MAX_EPOCHS=30
 
@@ -15,19 +15,21 @@ python3 src/train.py --multirun \
   experiment.seed=${SEED} \
   trainer.max_epochs=${MAX_EPOCHS} \
   data.batch_size=32 \
-  model.learning_rate=3e-4
+  model.learning_rate=3e-4 \
+  trainer.precision="32"
   
 # Phase 2: Validate on second architecture
 python3 src/train.py --multirun \
-  augmentation=baseline,spatial_light,color_natural,spatial_color_light,full \
-  model=deeplabv3plus \
-  model.encoder_name=resnet50 \
+  augmentation=baseline,artificial_color,spatial_color_light,full \
+  model=segnext \
+  model.variant=base \
   data.image_size=384 \
   experiment.name="${EXPERIMENT_NAME}" \
   experiment.seed=${SEED} \
   trainer.max_epochs=${MAX_EPOCHS} \
   data.batch_size=32 \
-  model.learning_rate=3e-4
+  model.learning_rate=3e-4 \
+  trainer.precision="32"
 
 python3 src/train.py --multirun \
   augmentation=spatial_color_light \
@@ -38,5 +40,6 @@ python3 src/train.py --multirun \
   experiment.name="${EXPERIMENT_NAME}" \
   experiment.seed=${SEED} \
   trainer.max_epochs=${MAX_EPOCHS} \
-  data.batch_size=32
-  model.learning_rate=3e-4
+  data.batch_size=32 \
+  model.learning_rate=3e-4 \
+  trainer.precision="32"

@@ -25,15 +25,21 @@ class SegmentationMetrics(Metric):
         if preds.dim() == 4:
             preds = preds.argmax(dim=1)
 
-        preds, target = preds.flatten(), target.flatten()
+        for cls in range(self.num_classes):
+            pred_mask_spatial = preds == cls  # (N, H, W)
+            target_mask_spatial = target == cls
+            self.update_boundary_metrics(pred_mask_spatial, target_mask_spatial, cls)
+
+        # Flatten for standard IoU/Dice computation
+        preds_flat, target_flat = preds.flatten(), target.flatten()
 
         if self.ignore_index is not None:
-            valid = target != self.ignore_index
-            preds, target = preds[valid], target[valid]
+            valid = target_flat != self.ignore_index
+            preds_flat, target_flat = preds_flat[valid], target_flat[valid]
 
         for cls in range(self.num_classes):
-            pred_mask = preds == cls
-            target_mask = target == cls
+            pred_mask = preds_flat == cls
+            target_mask = target_flat == cls
 
             intersection = (pred_mask & target_mask).sum().float()
             pred_sum = pred_mask.sum().float()
@@ -43,8 +49,6 @@ class SegmentationMetrics(Metric):
             self.union[cls] += pred_sum + target_sum - intersection
             self.pred_sum[cls] += pred_sum
             self.target_sum[cls] += target_sum
-
-            update_boundary_metrics(pred_mask, target_mask)
 
     def compute(self) -> dict[str, torch.Tensor]:
         iou_per_class = self.intersection / (self.union + 1e-8)
@@ -70,23 +74,24 @@ class SegmentationMetrics(Metric):
         }
 
 
-def update_boundary_metrics(
-    self, preds: torch.Tensor, target: torch.Tensor, dilation: int = 3
-) -> None:
-    """Update Boundary IoU stats. Based on: https://arxiv.org/abs/2103.16562"""
-    import torch.nn.functional as F
+    def update_boundary_metrics(
+        self, preds: torch.Tensor, target: torch.Tensor, cls: int, dilation: int = 3
+    ) -> None:
+        """Update Boundary IoU stats. Based on: https://arxiv.org/abs/2103.16562"""
+        import torch.nn.functional as F
 
-    kernel_size = 2 * dilation + 1
-    kernel = torch.ones(1, 1, kernel_size, kernel_size, device=preds.device)
+        kernel_size = 2 * dilation + 1
+        kernel = torch.ones(1, 1, kernel_size, kernel_size, device=preds.device)
 
-    def get_boundary(mask: torch.Tensor) -> torch.Tensor:
-        mask_float = mask.float().unsqueeze(1)
-        dilated = F.conv2d(mask_float, kernel, padding=dilation) > 0
-        eroded = F.conv2d(mask_float, kernel, padding=dilation) == kernel.numel()
-        return (dilated.float() - eroded.float()).squeeze(1)
+        def get_boundary(mask: torch.Tensor) -> torch.Tensor:
+            mask_float = mask.float().unsqueeze(1)
+            dilated = F.conv2d(mask_float, kernel, padding=dilation) > 0
+            eroded = F.conv2d(mask_float, kernel, padding=dilation) == kernel.numel()
+            return (dilated.float() - eroded.float()).squeeze(1)
 
-    pred_boundary = get_boundary(preds)
-    target_boundary = get_boundary(target)
+        pred_boundary = get_boundary(preds)
+        target_boundary = get_boundary(target)
 
-    self.boundary_intersection += (pred_boundary * target_boundary).sum()
-    self.boundary_union += pred_boundary.sum() + target_boundary.sum() - self.boundary_intersection
+        intersection = (pred_boundary * target_boundary).sum()
+        self.boundary_intersection[cls] += intersection
+        self.boundary_union[cls] += pred_boundary.sum() + target_boundary.sum() - intersection
