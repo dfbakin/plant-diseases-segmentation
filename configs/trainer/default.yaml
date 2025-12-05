@@ -10,6 +10,8 @@ devices: "auto"  # "auto" detects available GPUs, or set to specific number (1, 
 strategy: "auto"  # "auto" picks ddp for multi-gpu, or "ddp", "ddp_find_unused_parameters_true"
 precision: "32"  # 16-mixed, bf16-mixed, 32
 
+accumulate_grad_batches: 1
+
 # Checkpointing
 checkpoint:
   monitor: "val/miou"

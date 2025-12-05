@@ -130,6 +130,7 @@ def train(cfg: DictConfig) -> float:
         devices=cfg.trainer.devices,
         strategy=cfg.trainer.strategy,
         precision=cfg.trainer.precision,
+        accumulate_grad_batches=cfg.trainer.get("accumulate_grad_batches", 1),
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         gradient_clip_algorithm=cfg.trainer.gradient_clip_algorithm,
         log_every_n_steps=cfg.trainer.log_every_n_steps,
