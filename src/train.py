@@ -39,6 +39,7 @@ def train(cfg: DictConfig) -> float:
     augmentation_preset = HydraConfig.get().runtime.choices.get("augmentation", "unknown")
     log.info(f"Using augmentation preset: {augmentation_preset}")
 
+    multiclass = cfg.data.get("multiclass", False)
     datamodule = PlantSegDataModule(
         root=cfg.data.root,
         image_size=cfg.data.image_size,
@@ -48,11 +49,21 @@ def train(cfg: DictConfig) -> float:
         mean=cfg.data.normalization.mean,
         std=cfg.data.normalization.std,
         train_transform=train_transform,
+        multiclass=multiclass,
     )
+
+    # Validate num_classes matches data mode
+    expected_classes = 116 if multiclass else 2
+    if cfg.model.num_classes != expected_classes:
+        log.warning(
+            f"Model num_classes={cfg.model.num_classes} doesn't match data mode "
+            f"(multiclass={multiclass} expects {expected_classes}). Using {expected_classes}."
+        )
+    num_classes = expected_classes
 
     model_backbone = create_model(
         name=cfg.model.name,
-        num_classes=cfg.model.num_classes,
+        num_classes=num_classes,
         encoder_name=cfg.model.get("encoder_name", "resnet50"),
         encoder_weights=cfg.model.get("encoder_weights", "imagenet"),
         variant=cfg.model.get("variant"),
@@ -62,7 +73,7 @@ def train(cfg: DictConfig) -> float:
 
     module = SegmentationModule(
         model=model_backbone,
-        num_classes=cfg.model.num_classes,
+        num_classes=num_classes,
         learning_rate=cfg.model.learning_rate,
         weight_decay=cfg.model.weight_decay,
         loss_fn=cfg.model.loss_fn,
@@ -76,6 +87,8 @@ def train(cfg: DictConfig) -> float:
             "model": cfg.model.name,
             "encoder": cfg.model.get("encoder_name", cfg.model.get("variant", "default")),
             "augmentation": augmentation_preset,
+            "multiclass": str(multiclass),
+            "num_classes": str(num_classes),
         },
     )
 
