@@ -10,7 +10,7 @@ defaults:
 
 # Experiment settings
 experiment:
-  name: "plantseg_benchmark"
+  name: "tmp_exp"
   seed: 42
 
 # MLflow tracking
