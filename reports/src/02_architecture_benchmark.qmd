@@ -1,0 +1,308 @@
+---
+title: "Research Update: Provisional Results"
+subtitle: "Plant Disease Segmentation"
+format: beamer  
+---
+
+## Recap
+
+- PlanSeg is the main dataset for supervised segmentation
+- Planned transfer learning to PlantVillage is subject for further research
+- Benchmarking of SOTA segmentation models is the priority
+
+---
+
+## Overall setup
+
+### Architecture
+
+- Lightning framework
+- Wrappers for external models (+ pre-trained encoders)
+- Adaptation to Lightning SegNeXt from [mmseg](https://github.com/visual-attention-network/segnext)
+
+### Training
+- $20$ epochs
+- $384 \times 384$ input size (original is often much larger)
+- AdamW ($\operatorname{lr} = 10^{-4}$, $\operatorname{weight decay} = 5 \times 10^{-4}$)
+- Cross-entropy loss
+- lr scheduler: CosineAnnealingLR ($T_{max} = 20$ epochs)
+- batch size: $16$
+
+---
+
+## Results Summary
+
+```{python}
+#| echo: false
+#| fig-cap: "Architecture Benchmark Results on PlantSeg Test Set"
+#| output-location: slide
+
+import pandas as pd
+
+results = pd.DataFrame({
+    'Model': ['SegFormer', 'DeepLabv3+', 'UNet', 'SegNeXt'],
+    'Encoder': ['MiT-B3', 'ResNet50', 'ResNet50', 'Base (no pretrain)'],
+    'Test mIoU': [0.8093, 0.7968, 0.7941, 0.7063],
+    'Test Dice': [0.8891, 0.8808, 0.8789, 0.8129],
+    'Best Val mIoU': [0.8021, 0.7898, 0.8013, 0.7898]
+})
+results = results.sort_values('Test mIoU', ascending=False)
+
+## Display as styled table
+from IPython.display import Markdown
+display(Markdown(results.to_markdown(index=False)))
+```
+
+---
+
+## Combined Training Dynamics
+
+```{python}
+#| echo: false
+#| fig-cap: "Training Loss and Validation mIoU"
+#| output-location: slide
+
+import matplotlib.pyplot as plt
+import os
+
+## MLflow runs mapping
+runs = {
+    'SegFormer (B3)': '6f3a0540c98c4e6d9a4abf38b4425243',
+    'UNet (ResNet50)': '21b9b27638fa471292333d7e38fb8b0e',
+    'DeepLabv3+ (ResNet50)': 'd19f99c8d92f4d4ba4f622b4d0a6a55e',
+    'SegNeXt (Base)': '8c5c293d58be4bcdbda7ccadc39c60c1',
+}
+
+mlruns_root = "../../mlruns/358457224855191874"
+
+def parse_mlflow_metric(filepath):
+    """Parse MLflow metric file format: timestamp value step"""
+    epochs, values = [], []
+    if not os.path.exists(filepath):
+        return epochs, values
+    with open(filepath, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 3:
+                step = int(parts[2])
+                value = float(parts[1])
+                epochs.append(step)
+                values.append(value)
+    return epochs, values
+
+# plt.figure(figsize=(8, 5))
+colors = ['#2ecc71', '#e74c3c', '#3498db', '#9b59b6']
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+## Left: Training Loss
+ax1 = axes[0]
+for (name, run_id), color in zip(runs.items(), colors):
+    metric_path = os.path.join(mlruns_root, run_id, 'metrics/train/loss_epoch')
+    epochs, values = parse_mlflow_metric(metric_path)
+    if epochs and values:
+        epoch_nums = list(range(len(values)))
+        ax1.plot(epoch_nums, values, label=name, color=color, linewidth=2)
+
+ax1.set_xlabel('Epoch', fontsize=11)
+ax1.set_ylabel('Training Loss', fontsize=11)
+ax1.set_title('Training Loss', fontsize=12)
+ax1.legend(fontsize=8)
+ax1.grid(True, alpha=0.3)
+
+## Right: Validation mIoU
+ax2 = axes[1]
+for (name, run_id), color in zip(runs.items(), colors):
+    metric_path = os.path.join(mlruns_root, run_id, 'metrics/val/miou')
+    epochs, values = parse_mlflow_metric(metric_path)
+    if epochs and values:
+        epoch_nums = list(range(len(values)))
+        ax2.plot(epoch_nums, values, label=name, color=color, linewidth=2, marker='o', markersize=3)
+
+ax2.set_xlabel('Epoch', fontsize=11)
+ax2.set_ylabel('Validation mIoU', fontsize=11)
+ax2.set_title('Validation mIoU', fontsize=12)
+ax2.legend(fontsize=8, loc='lower right')
+ax2.grid(True, alpha=0.3)
+ax2.set_ylim(0.65, 0.85)
+
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+<!-- ## Comparison with Article Results
+
+| Model | Article mIoU | Our mIoU | Delta |
+|-------|-------------|----------|-------|
+| DeepLabv3+ | 0.72* | 0.7968 | +0.077 |
+| SegFormer | 0.78* | 0.8093 | +0.029 |
+| SegNeXt | 0.81* | 0.7063 | -0.104 |
+
+\* Estimated from PlantSeg paper baseline comparisons
+
+**Key Observation**: SegNeXt underperforms significantly due to lack of pre-trained encoder.
+
+--- -->
+## Best Model Predictions: SegFormer
+
+```{python}
+#| echo: false
+#| fig-cap: "SegFormer Best Checkpoint Predictions"
+#| output-location: slide
+
+from PIL import Image
+
+best_pred_path = os.path.join(mlruns_root, '6f3a0540c98c4e6d9a4abf38b4425243', 
+                               'artifacts/visualizations/best/predictions.png')
+
+if os.path.exists(best_pred_path):
+    img = Image.open(best_pred_path)
+    plt.figure(figsize=(8, 4))
+    plt.imshow(img)
+    plt.axis('off')
+    plt.title('SegFormer (B3) - Best Validation Checkpoint', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+else:
+    print(f"Prediction image not found at {best_pred_path}")
+```
+
+---
+
+## UNet Predictions
+
+```{python}
+#| echo: false
+#| fig-cap: "UNet Best Checkpoint Predictions"
+#| output-location: slide
+
+best_pred_path = os.path.join(mlruns_root, '21b9b27638fa471292333d7e38fb8b0e', 
+                               'artifacts/visualizations/best/predictions.png')
+
+if os.path.exists(best_pred_path):
+    img = Image.open(best_pred_path)
+    plt.figure(figsize=(10, 6))
+    plt.imshow(img)
+    plt.axis('off')
+    plt.title('UNet (ResNet50) - Best Validation Checkpoint', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+else:
+    print(f"Prediction image not found at {best_pred_path}")
+```
+
+---
+
+## DeepLabv3+ Predictions
+
+```{python}
+#| echo: false
+#| fig-cap: "DeepLabv3+ Best Checkpoint Predictions"
+#| output-location: slide
+
+best_pred_path = os.path.join(mlruns_root, 'd19f99c8d92f4d4ba4f622b4d0a6a55e', 
+                               'artifacts/visualizations/best/predictions.png')
+
+if os.path.exists(best_pred_path):
+    img = Image.open(best_pred_path)
+    plt.figure(figsize=(10, 6))
+    plt.imshow(img)
+    plt.axis('off')
+    plt.title('DeepLabv3+ (ResNet50) - Best Validation Checkpoint', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+else:
+    print(f"Prediction image not found at {best_pred_path}")
+```
+
+---
+
+## SegNeXt Analysis
+
+```{python}
+#| echo: false
+#| fig-cap: "SegNeXt vs SegFormer Training Dynamics"
+#| output-location: slide
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+## Compare SegNeXt and SegFormer
+compare_runs = {
+    'SegFormer (B3, pretrained)': '6f3a0540c98c4e6d9a4abf38b4425243',
+    'SegNeXt (Base, no pretrain)': '8c5c293d58be4bcdbda7ccadc39c60c1',
+}
+compare_colors = ['#2ecc71', '#9b59b6']
+
+## Left: Training Loss
+ax1 = axes[0]
+for (name, run_id), color in zip(compare_runs.items(), compare_colors):
+    metric_path = os.path.join(mlruns_root, run_id, 'metrics/train/loss_epoch')
+    epochs, values = parse_mlflow_metric(metric_path)
+    if epochs and values:
+        epoch_nums = list(range(len(values)))
+        ax1.plot(epoch_nums, values, label=name, color=color, linewidth=2.5)
+
+ax1.set_xlabel('Epoch', fontsize=11)
+ax1.set_ylabel('Training Loss', fontsize=11)
+ax1.set_title('Training Loss Comparison', fontsize=12)
+ax1.legend(fontsize=9)
+ax1.grid(True, alpha=0.3)
+
+## Right: Validation mIoU
+ax2 = axes[1]
+for (name, run_id), color in zip(compare_runs.items(), compare_colors):
+    metric_path = os.path.join(mlruns_root, run_id, 'metrics/val/miou')
+    epochs, values = parse_mlflow_metric(metric_path)
+    if epochs and values:
+        epoch_nums = list(range(len(values)))
+        ax2.plot(epoch_nums, values, label=name, color=color, linewidth=2.5, marker='o', markersize=4)
+
+ax2.set_xlabel('Epoch', fontsize=11)
+ax2.set_ylabel('Validation mIoU', fontsize=11)
+ax2.set_title('Validation mIoU Comparison', fontsize=12)
+ax2.legend(fontsize=9, loc='lower right')
+ax2.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## SegNeXt Problem
+
+**Issue**: SegNeXt significantly underperforms expectations
+
+- Expected: Best performing model (SOTA on many benchmarks)
+- Actual: Worst test mIoU (0.7063)
+- Cause:
+    - No pre-trained encoder weights
+    - overall the model is far larger
+
+---
+
+## SegNeXt: Proposed Solutions
+
+- **Manual Pre-training**: Pre-train SegNeXt encoder on Cityscapes or ADE20K (unavoidable to saturate the weights?)
+- **Extended Training**: Increase epochs significantly (50-100) to allow convergence
+- **Learning Rate Tuning**: Increase LR since model is not tuning, but training from scratch
+- **Adapt Pre-trained Weights**: Try to adapt pre-trained weights from MMSegmentation
+
+---
+
+## Summary
+
+```{python}
+#| echo: false
+#| fig-cap: "Summary of Current Status"
+#| output-location: slide
+
+display(Markdown(results.to_markdown(index=False)))
+
+```
+
+- no obvious low-performance models
+- SegNeXt needs fixing
+- mIoU needs adapting to/from PlantSeg baseline metrics

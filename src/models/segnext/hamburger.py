@@ -1,6 +1,6 @@
 """Hamburger decoder head for SegNeXt.
 
-Pure PyTorch implementation of LightHamHead using NMF matrix decomposition.
+LightHamHead uses NMF matrix decomposition for global context modeling.
 Reference: https://arxiv.org/abs/2109.04553 (HamNet)
 """
 
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 class ConvBNReLU(nn.Module):
-    """Convolution + BatchNorm + ReLU block."""
+    """Conv2d + BatchNorm + ReLU."""
 
     def __init__(
         self,
@@ -25,15 +25,7 @@ class ConvBNReLU(nn.Module):
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = [
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                groups=groups,
-                bias=not norm,
-            )
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups=groups, bias=not norm)
         ]
         if norm:
             layers.append(nn.BatchNorm2d(out_channels))
@@ -46,7 +38,7 @@ class ConvBNReLU(nn.Module):
 
 
 class ConvGNReLU(nn.Module):
-    """Convolution + GroupNorm + ReLU block."""
+    """Conv2d + GroupNorm + ReLU."""
 
     def __init__(
         self,
@@ -62,15 +54,7 @@ class ConvGNReLU(nn.Module):
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = [
-            nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                groups=groups,
-                bias=not norm,
-            )
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups=groups, bias=not norm)
         ]
         if norm:
             layers.append(nn.GroupNorm(num_groups, out_channels))
@@ -85,15 +69,8 @@ class ConvGNReLU(nn.Module):
 class NMF2D(nn.Module):
     """Non-negative Matrix Factorization for 2D features.
 
-    This module performs NMF-based matrix decomposition for
-    global context modeling in the Hamburger module.
-
-    Attributes:
-        S: Number of spatial splits.
-        D: Feature dimension.
-        R: Rank of decomposition (number of bases).
-        train_steps: Number of NMF iterations during training.
-        eval_steps: Number of NMF iterations during evaluation.
+    Performs NMF-based decomposition for global context modeling.
+    Iteratively refines bases and coefficients to reconstruct input.
     """
 
     def __init__(
@@ -108,19 +85,6 @@ class NMF2D(nn.Module):
         eta: float = 0.9,
         rand_init: bool = True,
     ) -> None:
-        """Initialize NMF2D module.
-
-        Args:
-            spatial: Whether to decompose spatially.
-            s: Number of splits.
-            d: Feature dimension.
-            r: Rank of decomposition.
-            train_steps: NMF iterations during training.
-            eval_steps: NMF iterations during evaluation.
-            inv_t: Inverse temperature for softmax.
-            eta: Momentum for bases update.
-            rand_init: Whether to use random initialization.
-        """
         super().__init__()
         self.spatial = spatial
         self.S = s
@@ -132,60 +96,26 @@ class NMF2D(nn.Module):
         self.eta = eta
         self.rand_init = rand_init
 
-    def _build_bases(
-        self, b: int, s: int, d: int, r: int, device: torch.device
-    ) -> torch.Tensor:
-        """Build random bases for NMF."""
-        bases = torch.rand((b * s, d, r), device=device)
-        bases = F.normalize(bases, dim=1)
-        return bases
+    def _build_bases(self, b: int, s: int, d: int, r: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        bases = torch.rand((b * s, d, r), device=device, dtype=torch.float32)
+        return F.normalize(bases, dim=1).to(dtype)
 
-    def local_step(
-        self,
-        x: torch.Tensor,
-        bases: torch.Tensor,
-        coef: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Perform one NMF update step.
-
-        Args:
-            x: Input features (B*S, D, N).
-            bases: Current bases (B*S, D, R).
-            coef: Current coefficients (B*S, N, R).
-
-        Returns:
-            Updated bases and coefficients.
-        """
-        # Update coefficients
-        # (B*S, D, N)^T @ (B*S, D, R) -> (B*S, N, R)
+    def local_step(self, x: torch.Tensor, bases: torch.Tensor, coef: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """One NMF update: refine coefficients then bases."""
+        # Update coefficients: (B*S, D, N)^T @ (B*S, D, R) -> (B*S, N, R)
         numerator = torch.bmm(x.transpose(1, 2), bases)
-        # (B*S, N, R) @ [(B*S, D, R)^T @ (B*S, D, R)] -> (B*S, N, R)
         denominator = coef.bmm(bases.transpose(1, 2).bmm(bases))
         coef = coef * numerator / (denominator + 1e-6)
 
-        # Update bases
-        # (B*S, D, N) @ (B*S, N, R) -> (B*S, D, R)
+        # Update bases: (B*S, D, N) @ (B*S, N, R) -> (B*S, D, R)
         numerator = torch.bmm(x, coef)
-        # (B*S, D, R) @ [(B*S, N, R)^T @ (B*S, N, R)] -> (B*S, D, R)
         denominator = bases.bmm(coef.transpose(1, 2).bmm(coef))
         bases = bases * numerator / (denominator + 1e-6)
 
         return bases, coef
 
-    def local_inference(
-        self, x: torch.Tensor, bases: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run NMF iterations.
-
-        Args:
-            x: Input features (B*S, D, N).
-            bases: Initial bases (B*S, D, R).
-
-        Returns:
-            Final bases and coefficients.
-        """
-        # Initialize coefficients
-        # (B*S, D, N)^T @ (B*S, D, R) -> (B*S, N, R)
+    def local_inference(self, x: torch.Tensor, bases: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run NMF iterations to convergence."""
         coef = torch.bmm(x.transpose(1, 2), bases)
         coef = F.softmax(self.inv_t * coef, dim=-1)
 
@@ -195,61 +125,33 @@ class NMF2D(nn.Module):
 
         return bases, coef
 
-    def compute_coef(
-        self,
-        x: torch.Tensor,
-        bases: torch.Tensor,
-        coef: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute final coefficients.
-
-        Args:
-            x: Input features (B*S, D, N).
-            bases: Final bases (B*S, D, R).
-            coef: Current coefficients (B*S, N, R).
-
-        Returns:
-            Updated coefficients.
-        """
-        # (B*S, D, N)^T @ (B*S, D, R) -> (B*S, N, R)
+    def compute_coef(self, x: torch.Tensor, bases: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
+        """Final coefficient refinement."""
         numerator = torch.bmm(x.transpose(1, 2), bases)
-        # (B*S, N, R) @ (B*S, D, R)^T @ (B*S, D, R) -> (B*S, N, R)
         denominator = coef.bmm(bases.transpose(1, 2).bmm(bases))
-        coef = coef * numerator / (denominator + 1e-6)
-        return coef
+        return coef * numerator / (denominator + 1e-6)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor of shape (B, C, H, W).
-
-        Returns:
-            Output tensor of shape (B, C, H, W).
-        """
+        """NMF decomposition and reconstruction: (B, C, H, W) -> (B, C, H, W)."""
         b, c, h, w = x.shape
+        input_dtype = x.dtype
 
-        # Reshape: (B, C, H, W) -> (B*S, D, N)
+        # Reshape to (B*S, D, N)
         if self.spatial:
-            d = c // self.S
-            n = h * w
+            d, n = c // self.S, h * w
             x = x.view(b * self.S, d, n)
         else:
-            d = h * w
-            n = c // self.S
+            d, n = h * w, c // self.S
             x = x.view(b * self.S, n, d).transpose(1, 2)
 
-        # Build bases
-        bases = self._build_bases(b, self.S, d, self.R, x.device)
-
-        # Run NMF
+        bases = self._build_bases(b, self.S, d, self.R, x.device, input_dtype)
         bases, coef = self.local_inference(x, bases)
         coef = self.compute_coef(x, bases, coef)
 
         # Reconstruct: (B*S, D, R) @ (B*S, N, R)^T -> (B*S, D, N)
         x = torch.bmm(bases, coef.transpose(1, 2))
 
-        # Reshape back: (B*S, D, N) -> (B, C, H, W)
+        # Reshape back
         if self.spatial:
             x = x.view(b, c, h, w)
         else:
@@ -259,10 +161,7 @@ class NMF2D(nn.Module):
 
 
 class Hamburger(nn.Module):
-    """Hamburger module for global context modeling.
-
-    Uses NMF-based matrix decomposition for efficient global reasoning.
-    """
+    """Global context module using NMF decomposition."""
 
     def __init__(
         self,
@@ -272,63 +171,22 @@ class Hamburger(nn.Module):
         eval_steps: int = 7,
         num_groups: int = 32,
     ) -> None:
-        """Initialize Hamburger module.
-
-        Args:
-            ham_channels: Number of input/output channels.
-            md_r: Rank of NMF decomposition.
-            train_steps: NMF iterations during training.
-            eval_steps: NMF iterations during evaluation.
-            num_groups: Number of groups for GroupNorm.
-        """
         super().__init__()
-
-        self.ham_in = nn.Conv2d(ham_channels, ham_channels, 1, bias=False)
-
-        self.ham = NMF2D(
-            spatial=True,
-            s=1,
-            d=ham_channels,
-            r=md_r,
-            train_steps=train_steps,
-            eval_steps=eval_steps,
-        )
-
+        self.ham_in = nn.Conv2d(ham_channels, ham_channels, 1, bias=True)
+        self.ham = NMF2D(spatial=True, s=1, d=ham_channels, r=md_r, train_steps=train_steps, eval_steps=eval_steps)
         self.ham_out = nn.Sequential(
             nn.Conv2d(ham_channels, ham_channels, 1, bias=False),
             nn.GroupNorm(num_groups, ham_channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor of shape (B, C, H, W).
-
-        Returns:
-            Output tensor of shape (B, C, H, W).
-        """
-        enjoy = self.ham_in(x)
-        enjoy = F.relu(enjoy, inplace=True)
-        enjoy = self.ham(enjoy)
-        enjoy = self.ham_out(enjoy)
-        ham = F.relu(x + enjoy, inplace=True)
-        return ham
+        enjoy = F.relu(self.ham_in(x), inplace=True)
+        enjoy = self.ham_out(self.ham(enjoy))
+        return F.relu(x + enjoy, inplace=True)
 
 
 class LightHamHead(nn.Module):
-    """Lightweight Hamburger Head for semantic segmentation.
-
-    A decoder that fuses multi-scale features and applies Hamburger
-    module for global context modeling.
-
-    Attributes:
-        in_channels: List of input channel dimensions from encoder.
-        in_index: Indices of encoder stages to use.
-        ham_channels: Channel dimension for Hamburger module.
-        channels: Output channels before classification.
-        num_classes: Number of segmentation classes.
-    """
+    """Decoder that fuses multi-scale features with Hamburger global context."""
 
     def __init__(
         self,
@@ -344,21 +202,6 @@ class LightHamHead(nn.Module):
         num_groups: int = 32,
         align_corners: bool = False,
     ) -> None:
-        """Initialize LightHamHead.
-
-        Args:
-            in_channels: Channel dimensions for each input feature map.
-            in_index: Indices of encoder features to use.
-            ham_channels: Channels for Hamburger module.
-            channels: Output channels before classification.
-            num_classes: Number of output classes.
-            dropout_ratio: Dropout ratio before classification.
-            md_r: Rank of NMF decomposition.
-            train_steps: NMF iterations during training.
-            eval_steps: NMF iterations during evaluation.
-            num_groups: Number of groups for GroupNorm.
-            align_corners: align_corners for F.interpolate.
-        """
         super().__init__()
         self.in_channels = in_channels
         self.in_index = in_index
@@ -367,88 +210,32 @@ class LightHamHead(nn.Module):
         self.num_classes = num_classes
         self.align_corners = align_corners
 
-        # Squeeze: concat all features and reduce channels
-        self.squeeze = ConvBNReLU(
-            sum(in_channels),
-            ham_channels,
-            kernel_size=1,
-        )
-
-        # Hamburger module for global context
-        self.hamburger = Hamburger(
-            ham_channels=ham_channels,
-            md_r=md_r,
-            train_steps=train_steps,
-            eval_steps=eval_steps,
-            num_groups=num_groups,
-        )
-
-        # Align: reduce to output channels
-        self.align = ConvBNReLU(
-            ham_channels,
-            channels,
-            kernel_size=1,
-        )
-
-        # Classification head
+        self.squeeze = ConvBNReLU(sum(in_channels), ham_channels, kernel_size=1)
+        self.hamburger = Hamburger(ham_channels, md_r, train_steps, eval_steps, num_groups)
+        self.align = ConvBNReLU(ham_channels, channels, kernel_size=1)
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else None
         self.conv_seg = nn.Conv2d(channels, num_classes, kernel_size=1)
 
-    def _transform_inputs(
-        self, inputs: list[torch.Tensor]
-    ) -> list[torch.Tensor]:
-        """Select and transform encoder features.
-
-        Args:
-            inputs: List of all encoder feature maps.
-
-        Returns:
-            Selected feature maps based on in_index.
-        """
+    def _transform_inputs(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
         return [inputs[i] for i in self.in_index]
 
     def forward(self, inputs: list[torch.Tensor]) -> torch.Tensor:
-        """Forward pass.
-
-        Args:
-            inputs: List of encoder feature maps.
-
-        Returns:
-            Segmentation logits of shape (B, num_classes, H', W').
-        """
-        # Select features
+        """Fuse multi-scale features and produce segmentation logits."""
         inputs = self._transform_inputs(inputs)
 
-        # Resize all to first feature's size and concatenate
+        # Resize all to first feature's spatial size
         target_size = inputs[0].shape[2:]
         resized = [
-            F.interpolate(
-                feat,
-                size=target_size,
-                mode="bilinear",
-                align_corners=self.align_corners,
-            )
-            if feat.shape[2:] != target_size
-            else feat
+            F.interpolate(feat, size=target_size, mode="bilinear", align_corners=self.align_corners)
+            if feat.shape[2:] != target_size else feat
             for feat in inputs
         ]
 
-        x = torch.cat(resized, dim=1)
-
-        # Squeeze
-        x = self.squeeze(x)
-
-        # Hamburger for global context
+        x = self.squeeze(torch.cat(resized, dim=1))
         x = self.hamburger(x)
-
-        # Align
         x = self.align(x)
-
-        # Classification
         if self.dropout is not None:
             x = self.dropout(x)
-        output = self.conv_seg(x)
-
-        return output
+        return self.conv_seg(x)
 
 

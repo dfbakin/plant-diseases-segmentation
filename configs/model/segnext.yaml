@@ -5,7 +5,7 @@ name: "segnext"
 # Model variant: tiny, small, base, large
 variant: "base"
 pretrained: true
-decoder_channels: 256
+# decoder_channels: 256
 
 # Model settings
 num_classes: 2
