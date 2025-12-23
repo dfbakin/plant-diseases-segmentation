@@ -2,16 +2,18 @@
 
 import torch
 from torchmetrics import Metric
+import torch.nn.functional as F
 
 
 class SegmentationMetrics(Metric):
     """Accumulates mIoU, Dice, and Boundary IoU across batches."""
 
-    def __init__(self, num_classes: int = 2, ignore_index: int | None = None) -> None:
+    def __init__(self, num_classes: int = 2, ignore_index: int | None = None, eps: float = 1e-8) -> None:
         super().__init__()
         assert num_classes > 0
         self.num_classes = num_classes
         self.ignore_index = ignore_index
+        self.eps = eps
 
         self.add_state("intersection", default=torch.zeros(num_classes), dist_reduce_fx="sum")
         self.add_state("boundary_intersection", default=torch.zeros(num_classes), dist_reduce_fx="sum")
@@ -51,16 +53,16 @@ class SegmentationMetrics(Metric):
             self.target_sum[cls] += target_sum
 
     def compute(self) -> dict[str, torch.Tensor]:
-        iou_per_class = self.intersection / (self.union + 1e-8)
-        acc_per_class = self.intersection / (self.target_sum + 1e-8)  # TP / (TP + FN)
-        boundary_iou_per_class = self.boundary_intersection / (self.boundary_union + 1e-8)
+        iou_per_class = self.intersection / (self.union + self.eps)
+        acc_per_class = self.intersection / (self.target_sum + self.eps)  # TP / (TP + FN)
+        boundary_iou_per_class = self.boundary_intersection / (self.boundary_union + self.eps)
 
         valid = self.union > 0
         miou = iou_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
         macc = acc_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
         boundary_iou = boundary_iou_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
 
-        dice_per_class = (2 * self.intersection) / (self.pred_sum + self.target_sum + 1e-8)
+        dice_per_class = (2 * self.intersection) / (self.pred_sum + self.target_sum + self.eps)
         dice = dice_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
 
         result = {
@@ -91,8 +93,6 @@ class SegmentationMetrics(Metric):
         self, preds: torch.Tensor, target: torch.Tensor, cls: int, dilation: int = 3
     ) -> None:
         """Update Boundary IoU stats. Based on: https://arxiv.org/abs/2103.16562"""
-        import torch.nn.functional as F
-
         kernel_size = 2 * dilation + 1
         kernel = torch.ones(1, 1, kernel_size, kernel_size, device=preds.device)
 

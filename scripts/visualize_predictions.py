@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Interactive visualization of predictions vs ground truth.
 
 Usage:

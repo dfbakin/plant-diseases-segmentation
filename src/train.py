@@ -14,19 +14,23 @@ import hydra
 import lightning as L
 import torch
 from hydra.core.hydra_config import HydraConfig
-from hydra.utils import instantiate
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
 from lightning.pytorch.loggers import MLFlowLogger
 from omegaconf import DictConfig, OmegaConf
 
+from src.conf.augmentation import get_augmentation_config
+from src.conf.config import Config, register_configs
 from src.data import PlantSegDataModule
 from src.models import SegmentationModule, create_model
 from src.training.callbacks import EarlyStoppingWithPatience, MLflowModelCheckpoint, VisualizationCallback
 
 log = logging.getLogger(__name__)
 
+# Register structured configs before hydra.main
+register_configs()
 
-def train(cfg: DictConfig) -> float:
+
+def train(cfg: Config) -> float:
     """Run training. Returns best val mIoU."""
     L.seed_everything(cfg.experiment.seed, workers=True)
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
@@ -34,20 +38,26 @@ def train(cfg: DictConfig) -> float:
     output_dir = Path(cfg.paths.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Instantiate training augmentations from Hydra config
-    train_transform = instantiate(cfg.augmentation)
-    augmentation_preset = HydraConfig.get().runtime.choices.get("augmentation", "unknown")
+    augmentation_name = cfg.augmentation.name
+    aug_config_class = get_augmentation_config(augmentation_name)
+    aug_config = aug_config_class(**{k: v for k, v in OmegaConf.to_container(cfg.augmentation).items() if k != "name"})
+    train_transform = aug_config.build(
+        image_size=cfg.data.image_size,
+        mean=list(cfg.data.normalization.mean),
+        std=list(cfg.data.normalization.std),
+    )
+    augmentation_preset = HydraConfig.get().runtime.choices.get("augmentation", augmentation_name)
     log.info(f"Using augmentation preset: {augmentation_preset}")
 
-    multiclass = cfg.data.get("multiclass", False)
+    multiclass = cfg.data.multiclass
     datamodule = PlantSegDataModule(
         root=cfg.data.root,
         image_size=cfg.data.image_size,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
-        mean=cfg.data.normalization.mean,
-        std=cfg.data.normalization.std,
+        mean=list(cfg.data.normalization.mean),
+        std=list(cfg.data.normalization.std),
         train_transform=train_transform,
         multiclass=multiclass,
     )
@@ -64,11 +74,11 @@ def train(cfg: DictConfig) -> float:
     model_backbone = create_model(
         name=cfg.model.name,
         num_classes=num_classes,
-        encoder_name=cfg.model.get("encoder_name", "resnet50"),
-        encoder_weights=cfg.model.get("encoder_weights", "imagenet"),
-        variant=cfg.model.get("variant"),
-        pretrained=cfg.model.get("pretrained", True),
-        decoder_channels=cfg.model.get("decoder_channels"),
+        encoder_name=getattr(cfg.model, "encoder_name", "resnet50"),
+        encoder_weights=getattr(cfg.model, "encoder_weights", "imagenet"),
+        variant=getattr(cfg.model, "variant", None),
+        pretrained=getattr(cfg.model, "pretrained", True),
+        decoder_channels=getattr(cfg.model, "decoder_channels", None),
     )
 
     module = SegmentationModule(
@@ -85,7 +95,7 @@ def train(cfg: DictConfig) -> float:
         run_name=f"{cfg.model.name}_{augmentation_preset}_{cfg.experiment.seed}",
         tags={
             "model": cfg.model.name,
-            "encoder": cfg.model.get("encoder_name", cfg.model.get("variant", "default")),
+            "encoder": getattr(cfg.model, "encoder_name", None) or getattr(cfg.model, "variant", "default"),
             "augmentation": augmentation_preset,
             "multiclass": str(multiclass),
             "num_classes": str(num_classes),
@@ -117,8 +127,8 @@ def train(cfg: DictConfig) -> float:
         VisualizationCallback(
             output_dir=output_dir / "visualizations",
             num_samples=4,
-            denorm_mean=cfg.data.normalization.mean,
-            denorm_std=cfg.data.normalization.std,
+            denorm_mean=list(cfg.data.normalization.mean),
+            denorm_std=list(cfg.data.normalization.std),
         ),
         MLflowModelCheckpoint(monitor=cfg.trainer.checkpoint.monitor, mode=cfg.trainer.checkpoint.mode),
     ]
@@ -130,7 +140,7 @@ def train(cfg: DictConfig) -> float:
         devices=cfg.trainer.devices,
         strategy=cfg.trainer.strategy,
         precision=cfg.trainer.precision,
-        accumulate_grad_batches=cfg.trainer.get("accumulate_grad_batches", 1),
+        accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
         gradient_clip_algorithm=cfg.trainer.gradient_clip_algorithm,
         log_every_n_steps=cfg.trainer.log_every_n_steps,
@@ -151,7 +161,7 @@ def train(cfg: DictConfig) -> float:
     return float(trainer.callback_metrics.get("val/miou", torch.tensor(0.0)))
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="config")
+@hydra.main(version_base=None, config_name="config")
 def main(cfg: DictConfig) -> float:
     return train(cfg)
 

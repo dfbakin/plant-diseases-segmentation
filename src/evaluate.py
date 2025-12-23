@@ -2,12 +2,12 @@
 
 Examples:
     # Evaluate on test set
-    python src/evaluate.py checkpoint_path=outputs/.../best.ckpt model=segformer
+    python src/evaluate.py +checkpoint_path=outputs/.../best.ckpt model=segformer
 
     # Generate predictions on validation set
-    python src/evaluate.py checkpoint_path=outputs/.../best.ckpt model=segformer \
-        save_predictions=true predictions_dir=outputs/predictions/segformer_val \
-        data.batch_size=1 split=val
+    python src/evaluate.py +checkpoint_path=outputs/.../best.ckpt model=segformer \
+        +save_predictions=true +predictions_dir=outputs/predictions/segformer_val \
+        data.batch_size=1 +split=val
 """
 
 import json
@@ -22,6 +22,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
+from src.conf.config import Config, register_configs
 from src.data import PlantSegDataModule
 from src.data.plantseg import PlantSegDataset
 from src.data.transforms import get_val_transforms
@@ -29,8 +30,11 @@ from src.models import SegmentationModule, create_model
 
 log = logging.getLogger(__name__)
 
+# Register structured configs before hydra.main
+register_configs()
 
-def evaluate(cfg: DictConfig) -> dict[str, float]:
+
+def evaluate(cfg: Config) -> dict[str, float]:
     """Evaluate checkpoint on test set. Returns test metrics dict."""
     L.seed_everything(cfg.experiment.seed, workers=True)
 
@@ -40,22 +44,22 @@ def evaluate(cfg: DictConfig) -> dict[str, float]:
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
         pin_memory=cfg.data.pin_memory,
-        mean=cfg.data.normalization.mean,
-        std=cfg.data.normalization.std,
+        mean=list(cfg.data.normalization.mean),
+        std=list(cfg.data.normalization.std),
     )
 
-    checkpoint_path = cfg.get("checkpoint_path")
+    checkpoint_path = cfg.checkpoint_path
     if checkpoint_path is None:
-        raise ValueError("checkpoint_path must be provided")
+        raise ValueError("checkpoint_path must be provided via +checkpoint_path=...")
 
     log.info(f"Loading checkpoint: {checkpoint_path}")
 
     model_backbone = create_model(
         name=cfg.model.name,
         num_classes=cfg.model.num_classes,
-        encoder_name=cfg.model.get("encoder_name", "resnet50"),
+        encoder_name=getattr(cfg.model, "encoder_name", "resnet50") or "resnet50",
         encoder_weights=None,
-        variant=cfg.model.get("variant"),
+        variant=getattr(cfg.model, "variant", None),
         pretrained=False,
     )
 
@@ -73,16 +77,16 @@ def evaluate(cfg: DictConfig) -> dict[str, float]:
     return results[0] if results else {}
 
 
-def generate_predictions(cfg: DictConfig) -> None:
+def generate_predictions(cfg: Config) -> None:
     """Generate and save predictions for a dataset split."""
     L.seed_everything(cfg.experiment.seed, workers=True)
 
-    checkpoint_path = cfg.get("checkpoint_path")
-    predictions_dir = Path(cfg.get("predictions_dir", "outputs/predictions"))
-    split = cfg.get("split", "val")
+    checkpoint_path = cfg.checkpoint_path
+    predictions_dir = Path(cfg.predictions_dir)
+    split = cfg.split
 
     if checkpoint_path is None:
-        raise ValueError("checkpoint_path must be provided")
+        raise ValueError("checkpoint_path must be provided via +checkpoint_path=...")
 
     predictions_dir.mkdir(parents=True, exist_ok=True)
     masks_dir = predictions_dir / "masks"
@@ -106,9 +110,9 @@ def generate_predictions(cfg: DictConfig) -> None:
     model_backbone = create_model(
         name=cfg.model.name,
         num_classes=cfg.model.num_classes,
-        encoder_name=cfg.model.get("encoder_name", "resnet50"),
+        encoder_name=getattr(cfg.model, "encoder_name", "resnet50") or "resnet50",
         encoder_weights=None,
-        variant=cfg.model.get("variant"),
+        variant=getattr(cfg.model, "variant", None),
         pretrained=False,
     )
 
@@ -137,13 +141,13 @@ def generate_predictions(cfg: DictConfig) -> None:
     # Use DataLoader with specified batch size (typically 1)
     from torch.utils.data import DataLoader
 
-    batch_size = getattr(cfg.data, "batch_size", 1)
+    batch_size = cfg.data.batch_size
     data_loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=cfg.data.get("num_workers", 0),
-        pin_memory=cfg.data.get("pin_memory", False),
+        num_workers=cfg.data.num_workers,
+        pin_memory=cfg.data.pin_memory,
     )
 
     metadata = {}
@@ -182,14 +186,14 @@ def generate_predictions(cfg: DictConfig) -> None:
     log.info(f"Metadata saved to {metadata_path}")
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="config")
+@hydra.main(version_base=None, config_name="config")
 def main(cfg: DictConfig) -> None:
     save_predictions = cfg.get("save_predictions", False)
 
     if save_predictions:
-        generate_predictions(cfg)
+        generate_predictions(cfg)  # type: ignore[arg-type]
     else:
-        results = evaluate(cfg)
+        results = evaluate(cfg)  # type: ignore[arg-type]
         log.info(f"Test Results:\n{OmegaConf.to_yaml(results)}")
 
 
