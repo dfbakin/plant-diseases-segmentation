@@ -25,7 +25,15 @@ class ConvBNReLU(nn.Module):
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = [
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups=groups, bias=not norm)
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                groups=groups,
+                bias=not norm,
+            )
         ]
         if norm:
             layers.append(nn.BatchNorm2d(out_channels))
@@ -54,7 +62,15 @@ class ConvGNReLU(nn.Module):
     ) -> None:
         super().__init__()
         layers: list[nn.Module] = [
-            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding, groups=groups, bias=not norm)
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding,
+                groups=groups,
+                bias=not norm,
+            )
         ]
         if norm:
             layers.append(nn.GroupNorm(num_groups, out_channels))
@@ -96,11 +112,15 @@ class NMF2D(nn.Module):
         self.eta = eta
         self.rand_init = rand_init
 
-    def _build_bases(self, b: int, s: int, d: int, r: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _build_bases(
+        self, b: int, s: int, d: int, r: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
         bases = torch.rand((b * s, d, r), device=device, dtype=torch.float32)
         return F.normalize(bases, dim=1).to(dtype)
 
-    def local_step(self, x: torch.Tensor, bases: torch.Tensor, coef: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def local_step(
+        self, x: torch.Tensor, bases: torch.Tensor, coef: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """One NMF update: refine coefficients then bases."""
         # Update coefficients: (B*S, D, N)^T @ (B*S, D, R) -> (B*S, N, R)
         numerator = torch.bmm(x.transpose(1, 2), bases)
@@ -114,7 +134,9 @@ class NMF2D(nn.Module):
 
         return bases, coef
 
-    def local_inference(self, x: torch.Tensor, bases: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def local_inference(
+        self, x: torch.Tensor, bases: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run NMF iterations to convergence."""
         coef = torch.bmm(x.transpose(1, 2), bases)
         coef = F.softmax(self.inv_t * coef, dim=-1)
@@ -125,7 +147,9 @@ class NMF2D(nn.Module):
 
         return bases, coef
 
-    def compute_coef(self, x: torch.Tensor, bases: torch.Tensor, coef: torch.Tensor) -> torch.Tensor:
+    def compute_coef(
+        self, x: torch.Tensor, bases: torch.Tensor, coef: torch.Tensor
+    ) -> torch.Tensor:
         """Final coefficient refinement."""
         numerator = torch.bmm(x.transpose(1, 2), bases)
         denominator = coef.bmm(bases.transpose(1, 2).bmm(bases))
@@ -173,7 +197,14 @@ class Hamburger(nn.Module):
     ) -> None:
         super().__init__()
         self.ham_in = nn.Conv2d(ham_channels, ham_channels, 1, bias=True)
-        self.ham = NMF2D(spatial=True, s=1, d=ham_channels, r=md_r, train_steps=train_steps, eval_steps=eval_steps)
+        self.ham = NMF2D(
+            spatial=True,
+            s=1,
+            d=ham_channels,
+            r=md_r,
+            train_steps=train_steps,
+            eval_steps=eval_steps,
+        )
         self.ham_out = nn.Sequential(
             nn.Conv2d(ham_channels, ham_channels, 1, bias=False),
             nn.GroupNorm(num_groups, ham_channels),
@@ -211,7 +242,9 @@ class LightHamHead(nn.Module):
         self.align_corners = align_corners
 
         self.squeeze = ConvBNReLU(sum(in_channels), ham_channels, kernel_size=1)
-        self.hamburger = Hamburger(ham_channels, md_r, train_steps, eval_steps, num_groups)
+        self.hamburger = Hamburger(
+            ham_channels, md_r, train_steps, eval_steps, num_groups
+        )
         self.align = ConvBNReLU(ham_channels, channels, kernel_size=1)
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else None
         self.conv_seg = nn.Conv2d(channels, num_classes, kernel_size=1)
@@ -226,8 +259,14 @@ class LightHamHead(nn.Module):
         # Resize all to first feature's spatial size
         target_size = inputs[0].shape[2:]
         resized = [
-            F.interpolate(feat, size=target_size, mode="bilinear", align_corners=self.align_corners)
-            if feat.shape[2:] != target_size else feat
+            F.interpolate(
+                feat,
+                size=target_size,
+                mode="bilinear",
+                align_corners=self.align_corners,
+            )
+            if feat.shape[2:] != target_size
+            else feat
             for feat in inputs
         ]
 
@@ -237,5 +276,3 @@ class LightHamHead(nn.Module):
         if self.dropout is not None:
             x = self.dropout(x)
         return self.conv_seg(x)
-
-

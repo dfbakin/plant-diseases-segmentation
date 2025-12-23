@@ -45,7 +45,9 @@ class PlantSegDataModule(L.LightningDataModule):
 
         self.save_hyperparameters(ignore=["root", "train_transform"])
 
-    def setup(self, stage: Literal["fit", "validate", "test", "predict"] | None = None) -> None:
+    def setup(
+        self, stage: Literal["fit", "validate", "test", "predict"] | None = None
+    ) -> None:
         if self.train_transform is not None:
             train_transform = self.train_transform
         else:
@@ -99,4 +101,3 @@ class PlantSegDataModule(L.LightningDataModule):
     @property
     def num_classes(self) -> int:
         return self._dataset_cls.NUM_CLASSES
-

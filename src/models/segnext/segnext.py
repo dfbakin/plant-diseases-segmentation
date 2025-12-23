@@ -12,12 +12,16 @@ import torch.nn.functional as F
 from src.models.segnext.hamburger import LightHamHead
 from src.models.segnext.mscan import MSCAN, MSCAN_CONFIGS, MSCANVariant
 
-
 DECODER_CONFIGS: dict[MSCANVariant, dict] = {
     "tiny": {"in_index": [1, 2, 3], "ham_channels": 256, "channels": 256, "md_r": 16},
     "small": {"in_index": [1, 2, 3], "ham_channels": 256, "channels": 256, "md_r": 16},
     "base": {"in_index": [1, 2, 3], "ham_channels": 512, "channels": 512, "md_r": 64},
-    "large": {"in_index": [1, 2, 3], "ham_channels": 1024, "channels": 1024, "md_r": 64},
+    "large": {
+        "in_index": [1, 2, 3],
+        "ham_channels": 1024,
+        "channels": 1024,
+        "md_r": 64,
+    },
 }
 
 
@@ -40,7 +44,9 @@ class SegNeXt(nn.Module):
         super().__init__()
 
         if variant not in MSCAN_CONFIGS:
-            raise ValueError(f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}")
+            raise ValueError(
+                f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}"
+            )
 
         self.num_classes = num_classes
         self.variant = variant
@@ -79,18 +85,20 @@ class SegNeXt(nn.Module):
         features = self.encoder(x)
         selected = [features[i] for i in self.in_index]
         logits = self.decoder(selected)
-        return F.interpolate(logits, size=input_size, mode="bilinear", align_corners=self.align_corners)
+        return F.interpolate(
+            logits, size=input_size, mode="bilinear", align_corners=self.align_corners
+        )
 
     @property
     def encoder_output_channels(self) -> list[int]:
         return self.encoder.embed_dims
 
     @classmethod
-    def from_config(cls, variant: MSCANVariant = "base", num_classes: int = 2, **kwargs) -> "SegNeXt":
+    def from_config(
+        cls, variant: MSCANVariant = "base", num_classes: int = 2, **kwargs
+    ) -> "SegNeXt":
         return cls(num_classes=num_classes, variant=variant, **kwargs)
 
 
 SegNeXtVariant = Literal["tiny", "small", "base", "large"]
 SEGNEXT_VARIANTS = list(MSCAN_CONFIGS.keys())
-
-

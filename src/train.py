@@ -14,7 +14,11 @@ import hydra
 import lightning as L
 import torch
 from hydra.core.hydra_config import HydraConfig
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, RichProgressBar
+from lightning.pytorch.callbacks import (
+    LearningRateMonitor,
+    ModelCheckpoint,
+    RichProgressBar,
+)
 from lightning.pytorch.loggers import MLFlowLogger
 from omegaconf import DictConfig, OmegaConf
 
@@ -22,7 +26,11 @@ from src.conf.augmentation import get_augmentation_config
 from src.conf.config import Config, register_configs
 from src.data import PlantSegDataModule
 from src.models import SegmentationModule, create_model
-from src.training.callbacks import EarlyStoppingWithPatience, MLflowModelCheckpoint, VisualizationCallback
+from src.training.callbacks import (
+    EarlyStoppingWithPatience,
+    MLflowModelCheckpoint,
+    VisualizationCallback,
+)
 
 log = logging.getLogger(__name__)
 
@@ -40,13 +48,21 @@ def train(cfg: Config) -> float:
 
     augmentation_name = cfg.augmentation.name
     aug_config_class = get_augmentation_config(augmentation_name)
-    aug_config = aug_config_class(**{k: v for k, v in OmegaConf.to_container(cfg.augmentation).items() if k != "name"})
+    aug_config = aug_config_class(
+        **{
+            k: v
+            for k, v in OmegaConf.to_container(cfg.augmentation).items()
+            if k != "name"
+        }
+    )
     train_transform = aug_config.build(
         image_size=cfg.data.image_size,
         mean=list(cfg.data.normalization.mean),
         std=list(cfg.data.normalization.std),
     )
-    augmentation_preset = HydraConfig.get().runtime.choices.get("augmentation", augmentation_name)
+    augmentation_preset = HydraConfig.get().runtime.choices.get(
+        "augmentation", augmentation_name
+    )
     log.info(f"Using augmentation preset: {augmentation_preset}")
 
     multiclass = cfg.data.multiclass
@@ -67,7 +83,8 @@ def train(cfg: Config) -> float:
     if cfg.model.num_classes != expected_classes:
         log.warning(
             f"Model num_classes={cfg.model.num_classes} doesn't match data mode "
-            f"(multiclass={multiclass} expects {expected_classes}). Using {expected_classes}."
+            f"(multiclass={multiclass} expects {expected_classes}). "
+            f"Using {expected_classes}."
         )
     num_classes = expected_classes
 
@@ -95,7 +112,8 @@ def train(cfg: Config) -> float:
         run_name=f"{cfg.model.name}_{augmentation_preset}_{cfg.experiment.seed}",
         tags={
             "model": cfg.model.name,
-            "encoder": getattr(cfg.model, "encoder_name", None) or getattr(cfg.model, "variant", "default"),
+            "encoder": getattr(cfg.model, "encoder_name", None)
+            or getattr(cfg.model, "variant", "default"),
             "augmentation": augmentation_preset,
             "multiclass": str(multiclass),
             "num_classes": str(num_classes),
@@ -130,7 +148,9 @@ def train(cfg: Config) -> float:
             denorm_mean=list(cfg.data.normalization.mean),
             denorm_std=list(cfg.data.normalization.std),
         ),
-        MLflowModelCheckpoint(monitor=cfg.trainer.checkpoint.monitor, mode=cfg.trainer.checkpoint.mode),
+        MLflowModelCheckpoint(
+            monitor=cfg.trainer.checkpoint.monitor, mode=cfg.trainer.checkpoint.mode
+        ),
     ]
 
     trainer = L.Trainer(

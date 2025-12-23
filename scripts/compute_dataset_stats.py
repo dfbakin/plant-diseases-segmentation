@@ -2,8 +2,8 @@
 """Compute mean and std of a dataset for normalization.
 
 Usage:
-    poetry run python scripts/compute_dataset_stats.py
-    poetry run python scripts/compute_dataset_stats.py --data-dir data/plantsegv3/images/train
+    python3 scripts/compute_dataset_stats.py
+    python3 scripts/compute_dataset_stats.py --data-dir data/plantsegv3/images/train
 """
 
 import argparse
@@ -25,35 +25,35 @@ def compute_mean_std(image_dir: Path) -> tuple[list[float], list[float]]:
         Tuple of (mean, std) as lists of 3 floats (RGB).
     """
     image_paths = list(image_dir.glob("*.jpg")) + list(image_dir.glob("*.png"))
-    
+
     if not image_paths:
         raise ValueError(f"No images found in {image_dir}")
-    
+
     print(f"Found {len(image_paths)} images in {image_dir}")
-    
+
     to_tensor = transforms.ToTensor()
-    
+
     # Running sums for Welford's online algorithm
     n_pixels = 0
     channel_sum = torch.zeros(3)
     channel_sum_sq = torch.zeros(3)
-    
+
     for img_path in tqdm(image_paths, desc="Computing stats"):
         img = Image.open(img_path).convert("RGB")
         tensor = to_tensor(img)  # (3, H, W), values in [0, 1]
-        
+
         # Count pixels
         pixels = tensor.shape[1] * tensor.shape[2]
         n_pixels += pixels
-        
+
         # Sum per channel
         channel_sum += tensor.sum(dim=(1, 2))
-        channel_sum_sq += (tensor ** 2).sum(dim=(1, 2))
-    
+        channel_sum_sq += (tensor**2).sum(dim=(1, 2))
+
     # Compute mean and std
     mean = channel_sum / n_pixels
-    std = torch.sqrt(channel_sum_sq / n_pixels - mean ** 2)
-    
+    std = torch.sqrt(channel_sum_sq / n_pixels - mean**2)
+
     return mean.tolist(), std.tolist()
 
 
@@ -66,9 +66,9 @@ def main():
         help="Directory containing training images",
     )
     args = parser.parse_args()
-    
+
     mean, std = compute_mean_std(args.data_dir)
-    
+
     print("\n" + "=" * 50)
     print("Dataset Statistics")
     print("=" * 50)
@@ -79,4 +79,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

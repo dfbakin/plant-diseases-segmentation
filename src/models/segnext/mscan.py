@@ -129,15 +129,25 @@ class Block(nn.Module):
     def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
         b, n, c = x.shape
         x = x.permute(0, 2, 1).view(b, c, h, w)
-        x = x + self.drop_path(self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) * self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) * self.mlp(self.norm2(x)))
+        x = x + self.drop_path(
+            self.layer_scale_1.unsqueeze(-1).unsqueeze(-1) * self.attn(self.norm1(x))
+        )
+        x = x + self.drop_path(
+            self.layer_scale_2.unsqueeze(-1).unsqueeze(-1) * self.mlp(self.norm2(x))
+        )
         return x.view(b, c, n).permute(0, 2, 1)
 
 
 class OverlapPatchEmbed(nn.Module):
     """Overlapping patch embedding with stride-2 downsampling."""
 
-    def __init__(self, patch_size: int = 7, stride: int = 4, in_chans: int = 3, embed_dim: int = 768) -> None:
+    def __init__(
+        self,
+        patch_size: int = 7,
+        stride: int = 4,
+        in_chans: int = 3,
+        embed_dim: int = 768,
+    ) -> None:
         super().__init__()
         self.proj = nn.Conv2d(in_chans, embed_dim, patch_size, stride, patch_size // 2)
         self.norm = nn.BatchNorm2d(embed_dim)
@@ -151,10 +161,30 @@ class OverlapPatchEmbed(nn.Module):
 MSCANVariant = Literal["tiny", "small", "base", "large"]
 
 MSCAN_CONFIGS: dict[MSCANVariant, dict] = {
-    "tiny": {"embed_dims": [32, 64, 160, 256], "mlp_ratios": [8, 8, 4, 4], "depths": [3, 3, 5, 2], "drop_path_rate": 0.1},
-    "small": {"embed_dims": [64, 128, 320, 512], "mlp_ratios": [8, 8, 4, 4], "depths": [2, 2, 4, 2], "drop_path_rate": 0.1},
-    "base": {"embed_dims": [64, 128, 320, 512], "mlp_ratios": [8, 8, 4, 4], "depths": [3, 3, 12, 3], "drop_path_rate": 0.1},
-    "large": {"embed_dims": [64, 128, 320, 512], "mlp_ratios": [8, 8, 4, 4], "depths": [3, 5, 27, 3], "drop_path_rate": 0.3},
+    "tiny": {
+        "embed_dims": [32, 64, 160, 256],
+        "mlp_ratios": [8, 8, 4, 4],
+        "depths": [3, 3, 5, 2],
+        "drop_path_rate": 0.1,
+    },
+    "small": {
+        "embed_dims": [64, 128, 320, 512],
+        "mlp_ratios": [8, 8, 4, 4],
+        "depths": [2, 2, 4, 2],
+        "drop_path_rate": 0.1,
+    },
+    "base": {
+        "embed_dims": [64, 128, 320, 512],
+        "mlp_ratios": [8, 8, 4, 4],
+        "depths": [3, 3, 12, 3],
+        "drop_path_rate": 0.1,
+    },
+    "large": {
+        "embed_dims": [64, 128, 320, 512],
+        "mlp_ratios": [8, 8, 4, 4],
+        "depths": [3, 5, 27, 3],
+        "drop_path_rate": 0.3,
+    },
 }
 
 
@@ -186,13 +216,18 @@ class MSCAN(nn.Module):
         cur = 0
 
         for i in range(num_stages):
-            patch_embed = StemConv(in_chans, embed_dims[0]) if i == 0 else \
-                          OverlapPatchEmbed(3, 2, embed_dims[i - 1], embed_dims[i])
+            patch_embed = (
+                StemConv(in_chans, embed_dims[0])
+                if i == 0
+                else OverlapPatchEmbed(3, 2, embed_dims[i - 1], embed_dims[i])
+            )
 
-            block = nn.ModuleList([
-                Block(embed_dims[i], mlp_ratios[i], drop_rate, dpr[cur + j])
-                for j in range(depths[i])
-            ])
+            block = nn.ModuleList(
+                [
+                    Block(embed_dims[i], mlp_ratios[i], drop_rate, dpr[cur + j])
+                    for j in range(depths[i])
+                ]
+            )
             norm = nn.LayerNorm(embed_dims[i])
             cur += depths[i]
 
@@ -212,7 +247,9 @@ class MSCAN(nn.Module):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
             elif isinstance(m, nn.Conv2d):
-                fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels // m.groups
+                fan_out = (
+                    m.kernel_size[0] * m.kernel_size[1] * m.out_channels // m.groups
+                )
                 nn.init.normal_(m.weight, mean=0, std=math.sqrt(2.0 / fan_out))
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -238,8 +275,9 @@ class MSCAN(nn.Module):
     @classmethod
     def from_variant(cls, variant: MSCANVariant, **kwargs) -> "MSCAN":
         if variant not in MSCAN_CONFIGS:
-            raise ValueError(f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}")
+            raise ValueError(
+                f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}"
+            )
         config = MSCAN_CONFIGS[variant].copy()
         config.update(kwargs)
         return cls(**config)
-

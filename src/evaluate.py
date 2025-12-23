@@ -63,7 +63,9 @@ def evaluate(cfg: Config) -> dict[str, float]:
         pretrained=False,
     )
 
-    module = SegmentationModule.load_from_checkpoint(checkpoint_path, model=model_backbone)
+    module = SegmentationModule.load_from_checkpoint(
+        checkpoint_path, model=model_backbone
+    )
 
     trainer = L.Trainer(
         accelerator=cfg.trainer.accelerator,
@@ -154,7 +156,9 @@ def generate_predictions(cfg: Config) -> None:
 
     module.eval()
     with torch.inference_mode():
-        for batch_idx, batch in enumerate(tqdm(data_loader, desc="Generating predictions")):
+        for batch_idx, batch in enumerate(
+            tqdm(data_loader, desc="Generating predictions")
+        ):
             images = batch["image"].to(device)
             names = batch["name"]
 

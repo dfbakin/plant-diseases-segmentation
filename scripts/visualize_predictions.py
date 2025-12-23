@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 
 import matplotlib
+
+# ruff: noqa
 matplotlib.use("TkAgg")
 
 import cv2
@@ -67,7 +69,9 @@ def load_sample(metadata: dict, name: str) -> dict:
     image = cv2.cvtColor(cv2.imread(meta["image_path"]), cv2.COLOR_BGR2RGB)
     h, w = image.shape[:2]
 
-    gt_mask = (cv2.imread(meta["gt_mask_path"], cv2.IMREAD_GRAYSCALE) > 0).astype(np.uint8)
+    gt_mask = (cv2.imread(meta["gt_mask_path"], cv2.IMREAD_GRAYSCALE) > 0).astype(
+        np.uint8
+    )
 
     pred_mask_raw = cv2.imread(meta["prediction_path"], cv2.IMREAD_GRAYSCALE)
     pred_mask = (pred_mask_raw > 0).astype(np.uint8)
@@ -139,9 +143,17 @@ class PredictionVisualizer:
                 axes[2].imshow(sample["gt_mask"], cmap="gray", vmin=0, vmax=1)
                 axes[2].set_title("Ground Truth (raw)")
             else:
-                axes[1].imshow(create_overlay(sample["image"], sample["pred_mask"], COLOR_PREDICTION))
+                axes[1].imshow(
+                    create_overlay(
+                        sample["image"], sample["pred_mask"], COLOR_PREDICTION
+                    )
+                )
                 axes[1].set_title(f"Prediction (magenta)\nIoU: {metrics['iou']:.3f}")
-                axes[2].imshow(create_overlay(sample["image"], sample["gt_mask"], COLOR_GROUND_TRUTH))
+                axes[2].imshow(
+                    create_overlay(
+                        sample["image"], sample["gt_mask"], COLOR_GROUND_TRUTH
+                    )
+                )
                 axes[2].set_title(f"Ground Truth (cyan)\nDice: {metrics['dice']:.3f}")
 
             axes[1].axis("off")
@@ -163,7 +175,10 @@ class PredictionVisualizer:
             elif event.key in ["q", "escape"]:
                 plt.close(fig)
             elif event.key == "s":
-                save_path = self.predictions_dir / f"viz_{self.sample_names[self.current_idx]}.png"
+                save_path = (
+                    self.predictions_dir
+                    / f"viz_{self.sample_names[self.current_idx]}.png"
+                )
                 fig.savefig(save_path, dpi=150, bbox_inches="tight")
                 print(f"Saved: {save_path}")
             elif event.key == "r":
@@ -176,14 +191,22 @@ class PredictionVisualizer:
         btn_prev = Button(plt.axes([0.3, 0.02, 0.1, 0.05]), "← Prev")
         btn_next = Button(plt.axes([0.6, 0.02, 0.1, 0.05]), "Next →")
 
-        btn_prev.on_clicked(lambda _: (
-            setattr(self, "current_idx", (self.current_idx - 1) % len(self.sample_names)),
-            update_display(),
-        ))
-        btn_next.on_clicked(lambda _: (
-            setattr(self, "current_idx", (self.current_idx + 1) % len(self.sample_names)),
-            update_display(),
-        ))
+        btn_prev.on_clicked(
+            lambda _: (
+                setattr(
+                    self, "current_idx", (self.current_idx - 1) % len(self.sample_names)
+                ),
+                update_display(),
+            )
+        )
+        btn_next.on_clicked(
+            lambda _: (
+                setattr(
+                    self, "current_idx", (self.current_idx + 1) % len(self.sample_names)
+                ),
+                update_display(),
+            )
+        )
 
         update_display()
         print("Window opened. Use arrow keys or buttons to navigate. Press Q to quit.")
@@ -203,7 +226,9 @@ def create_comparison_grid(
 
     sample_names = list(metadata.keys())
     rng = np.random.default_rng(seed)
-    indices = rng.choice(len(sample_names), size=min(num_samples, len(sample_names)), replace=False)
+    indices = rng.choice(
+        len(sample_names), size=min(num_samples, len(sample_names)), replace=False
+    )
 
     cols = 4
     rows = (len(indices) + cols - 1) // cols
@@ -218,11 +243,15 @@ def create_comparison_grid(
         axes[row, col_base].set_title(f"{sample['name'][:15]}...", fontsize=8)
         axes[row, col_base].axis("off")
 
-        axes[row, col_base + 1].imshow(create_overlay(sample["image"], sample["pred_mask"], COLOR_PREDICTION))
+        axes[row, col_base + 1].imshow(
+            create_overlay(sample["image"], sample["pred_mask"], COLOR_PREDICTION)
+        )
         axes[row, col_base + 1].set_title("Pred (magenta)", fontsize=8)
         axes[row, col_base + 1].axis("off")
 
-        axes[row, col_base + 2].imshow(create_overlay(sample["image"], sample["gt_mask"], COLOR_GROUND_TRUTH))
+        axes[row, col_base + 2].imshow(
+            create_overlay(sample["image"], sample["gt_mask"], COLOR_GROUND_TRUTH)
+        )
         axes[row, col_base + 2].set_title("GT (cyan)", fontsize=8)
         axes[row, col_base + 2].axis("off")
 
@@ -241,10 +270,21 @@ def create_comparison_grid(
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize predictions interactively")
-    parser.add_argument("--predictions", type=str, required=True, help="Path to predictions directory")
-    parser.add_argument("--start-idx", type=int, default=0, help="Starting sample index")
-    parser.add_argument("--grid", type=str, default=None, help="Generate static grid and save to this path")
-    parser.add_argument("--grid-samples", type=int, default=16, help="Number of samples in grid")
+    parser.add_argument(
+        "--predictions", type=str, required=True, help="Path to predictions directory"
+    )
+    parser.add_argument(
+        "--start-idx", type=int, default=0, help="Starting sample index"
+    )
+    parser.add_argument(
+        "--grid",
+        type=str,
+        default=None,
+        help="Generate static grid and save to this path",
+    )
+    parser.add_argument(
+        "--grid-samples", type=int, default=16, help="Number of samples in grid"
+    )
     args = parser.parse_args()
 
     predictions_dir = Path(args.predictions)

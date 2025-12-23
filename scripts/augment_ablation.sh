@@ -28,7 +28,7 @@ poetry run python src/train.py \
   data.batch_size=32 \
   model.learning_rate=3e-4 \
   trainer.precision="32"
-  
+
 # Phase 2: Validate on second architecture
 python3 src/train.py --multirun \
   augmentation=baseline,artificial_color,spatial_color_light,full \

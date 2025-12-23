@@ -5,7 +5,10 @@ from typing import Any
 
 import lightning as L
 import matplotlib
+
+# ruff: noqa
 matplotlib.use("Agg")  # Headless backend - must be before pyplot import
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -53,7 +56,9 @@ class VisualizationCallback(Callback):
                     return logger
         return None
 
-    def _log_figure_to_mlflow(self, trainer: L.Trainer, fig_path: Path, artifact_name: str) -> None:
+    def _log_figure_to_mlflow(
+        self, trainer: L.Trainer, fig_path: Path, artifact_name: str
+    ) -> None:
         import mlflow
 
         if not self.log_to_mlflow:
@@ -65,8 +70,13 @@ class VisualizationCallback(Callback):
             mlflow.log_artifact(str(fig_path), artifact_path=artifact_name)
 
     def on_validation_batch_end(
-        self, trainer: L.Trainer, pl_module: L.LightningModule, outputs: Any,
-        batch: dict, batch_idx: int, dataloader_idx: int = 0,
+        self,
+        trainer: L.Trainer,
+        pl_module: L.LightningModule,
+        outputs: Any,
+        batch: dict,
+        batch_idx: int,
+        dataloader_idx: int = 0,
     ) -> None:
         if not trainer.is_global_zero or batch_idx != 0:
             return
@@ -80,7 +90,9 @@ class VisualizationCallback(Callback):
 
         # Denormalize
         device = images.device
-        images_denorm = (images * self.denorm_std.to(device) + self.denorm_mean.to(device)).clamp(0, 1)
+        images_denorm = (
+            images * self.denorm_std.to(device) + self.denorm_mean.to(device)
+        ).clamp(0, 1)
 
         n = min(self.num_samples, images.size(0))
         fig, axes = plt.subplots(n, 3, figsize=(12, 4 * n))
@@ -110,7 +122,9 @@ class VisualizationCallback(Callback):
         if trainer.current_epoch == 0:
             self._log_figure_to_mlflow(trainer, fig_path, "visualizations/epoch_000")
 
-    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_validation_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
         if not trainer.is_global_zero or self._last_fig_path is None:
             return
 
@@ -118,15 +132,24 @@ class VisualizationCallback(Callback):
         if current is None:
             return
 
-        is_best = (self.mode == "max" and current > self.best_value) or \
-                  (self.mode == "min" and current < self.best_value)
+        is_best = (self.mode == "max" and current > self.best_value) or (
+            self.mode == "min" and current < self.best_value
+        )
         if is_best:
             self.best_value = current.item()
-            self._log_figure_to_mlflow(trainer, self._last_fig_path, "visualizations/best")
+            self._log_figure_to_mlflow(
+                trainer, self._last_fig_path, "visualizations/best"
+            )
 
     def on_train_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
-        if trainer.is_global_zero and self._last_fig_path and self._last_fig_path.exists():
-            self._log_figure_to_mlflow(trainer, self._last_fig_path, "visualizations/final")
+        if (
+            trainer.is_global_zero
+            and self._last_fig_path
+            and self._last_fig_path.exists()
+        ):
+            self._log_figure_to_mlflow(
+                trainer, self._last_fig_path, "visualizations/final"
+            )
 
 
 class MLflowModelCheckpoint(Callback):
@@ -155,7 +178,9 @@ class MLflowModelCheckpoint(Callback):
                     return logger
         return None
 
-    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_validation_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
         if not trainer.is_global_zero:
             return
 
@@ -165,8 +190,9 @@ class MLflowModelCheckpoint(Callback):
         if current is None:
             return
 
-        is_best = (self.mode == "max" and current > self.best_value) or \
-                  (self.mode == "min" and current < self.best_value)
+        is_best = (self.mode == "max" and current > self.best_value) or (
+            self.mode == "min" and current < self.best_value
+        )
         if not is_best:
             return
 
@@ -199,9 +225,13 @@ class MLflowModelCheckpoint(Callback):
         ckpt_callback = trainer.checkpoint_callback
         if ckpt_callback is not None:
             if ckpt_callback.best_model_path:
-                client.log_param(run_id, "best_checkpoint_path", ckpt_callback.best_model_path)
+                client.log_param(
+                    run_id, "best_checkpoint_path", ckpt_callback.best_model_path
+                )
             if ckpt_callback.last_model_path:
-                client.log_param(run_id, "last_checkpoint_path", ckpt_callback.last_model_path)
+                client.log_param(
+                    run_id, "last_checkpoint_path", ckpt_callback.last_model_path
+                )
 
         client.log_param(run_id, "output_dir", str(trainer.default_root_dir))
 
@@ -230,7 +260,9 @@ class EarlyStoppingWithPatience(Callback):
         self.best_value = float("-inf") if mode == "max" else float("inf")
         self.wait_count = 0
 
-    def on_validation_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+    def on_validation_epoch_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
         if trainer.current_epoch < self.min_epochs:
             return
 
@@ -238,8 +270,9 @@ class EarlyStoppingWithPatience(Callback):
         if current is None:
             return
 
-        is_improvement = (self.mode == "max" and current > self.best_value) or \
-                         (self.mode == "min" and current < self.best_value)
+        is_improvement = (self.mode == "max" and current > self.best_value) or (
+            self.mode == "min" and current < self.best_value
+        )
 
         if is_improvement:
             self.best_value = current.item()
@@ -248,7 +281,3 @@ class EarlyStoppingWithPatience(Callback):
             self.wait_count += 1
             if self.wait_count >= self.patience:
                 trainer.should_stop = True
-
-
-
-

@@ -74,8 +74,12 @@ class SegmentationModule(L.LightningModule):
 
         self.train_metrics.update(logits, masks)
         self.log(
-            "train/loss", loss,
-            prog_bar=True, on_step=True, on_epoch=True, batch_size=images.size(0)
+            "train/loss",
+            loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+            batch_size=images.size(0),
         )
         return loss
 
@@ -90,7 +94,9 @@ class SegmentationModule(L.LightningModule):
             self.log(f"{prefix}/iou_disease", metrics["iou_disease"])
             self.log(f"{prefix}/acc_background", metrics["acc_background"])
             self.log(f"{prefix}/acc_disease", metrics["acc_disease"])
-            self.log(f"{prefix}/boundary_iou_background", metrics["boundary_iou_background"])
+            self.log(
+                f"{prefix}/boundary_iou_background", metrics["boundary_iou_background"]
+            )
             self.log(f"{prefix}/boundary_iou_disease", metrics["boundary_iou_disease"])
 
     def on_train_epoch_end(self) -> None:
@@ -104,7 +110,9 @@ class SegmentationModule(L.LightningModule):
         loss = self.compute_loss(logits, masks)
 
         self.val_metrics.update(logits, masks)
-        self.log("val/loss", loss, prog_bar=True, on_epoch=True, batch_size=images.size(0))
+        self.log(
+            "val/loss", loss, prog_bar=True, on_epoch=True, batch_size=images.size(0)
+        )
 
     def on_validation_epoch_end(self) -> None:
         metrics = self.val_metrics.compute()
@@ -137,7 +145,11 @@ class SegmentationModule(L.LightningModule):
         )
         return {
             "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1},
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
         }
 
     def predict_step(self, batch: dict, batch_idx: int) -> dict:
@@ -148,4 +160,3 @@ class SegmentationModule(L.LightningModule):
             "probabilities": F.softmax(logits, dim=1),
             "names": batch.get("name", []),
         }
-

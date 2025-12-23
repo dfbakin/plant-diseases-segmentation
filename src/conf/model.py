@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
 
 @dataclass
@@ -15,7 +15,9 @@ class ModelConfig:
 class DeepLabV3PlusConfig(ModelConfig):
     name: str = "deeplabv3plus"
 
-    encoder_name: str = "resnet50"  # Options: resnet50, resnet101, efficientnet-b4, mobilenet_v2
+    encoder_name: str = (
+        "resnet50"
+    )  # Options: resnet50, resnet101, efficientnet-b4, mobilenet_v2
     encoder_weights: str = "imagenet"
 
     learning_rate: float = 1e-4
@@ -27,7 +29,9 @@ class DeepLabV3PlusConfig(ModelConfig):
 class UNetConfig(ModelConfig):
     name: str = "unet"
 
-    encoder_name: str = "resnet50"  # Options: resnet50, resnet101, efficientnet-b4, mobilenet_v2
+    encoder_name: str = (
+        "resnet50"
+    )  # Options: resnet50, resnet101, efficientnet-b4, mobilenet_v2
     encoder_weights: str = "imagenet"
 
     learning_rate: float = 1e-4

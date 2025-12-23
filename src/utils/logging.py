@@ -38,7 +38,9 @@ def log_artifacts(artifact_paths: list[str | Path]) -> None:
                 mlflow.log_artifact(str(path))
 
 
-def _flatten_dict(d: dict[str, Any], parent_key: str = "", sep: str = ".") -> dict[str, Any]:
+def _flatten_dict(
+    d: dict[str, Any], parent_key: str = "", sep: str = "."
+) -> dict[str, Any]:
     """Flatten nested dict for MLflow params (truncates values >250 chars)."""
     items: list[tuple[str, Any]] = []
     for k, v in d.items():
@@ -47,9 +49,7 @@ def _flatten_dict(d: dict[str, Any], parent_key: str = "", sep: str = ".") -> di
             items.extend(_flatten_dict(v, new_key, sep=sep).items())
         else:
             str_val = str(v)
-            items.append((new_key, str_val[:247] + "..." if len(str_val) > 250 else str_val))
+            items.append(
+                (new_key, str_val[:247] + "..." if len(str_val) > 250 else str_val)
+            )
     return dict(items)
-
-
-
-

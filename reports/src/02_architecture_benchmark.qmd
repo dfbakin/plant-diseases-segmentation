@@ -1,7 +1,7 @@
 ---
 title: "Research Update: Provisional Results"
 subtitle: "Plant Disease Segmentation"
-format: beamer  
+format: beamer
 ---
 
 ## Recap
@@ -154,7 +154,7 @@ plt.show()
 
 from PIL import Image
 
-best_pred_path = os.path.join(mlruns_root, '6f3a0540c98c4e6d9a4abf38b4425243', 
+best_pred_path = os.path.join(mlruns_root, '6f3a0540c98c4e6d9a4abf38b4425243',
                                'artifacts/visualizations/best/predictions.png')
 
 if os.path.exists(best_pred_path):
@@ -178,7 +178,7 @@ else:
 #| fig-cap: "UNet Best Checkpoint Predictions"
 #| output-location: slide
 
-best_pred_path = os.path.join(mlruns_root, '21b9b27638fa471292333d7e38fb8b0e', 
+best_pred_path = os.path.join(mlruns_root, '21b9b27638fa471292333d7e38fb8b0e',
                                'artifacts/visualizations/best/predictions.png')
 
 if os.path.exists(best_pred_path):
@@ -202,7 +202,7 @@ else:
 #| fig-cap: "DeepLabv3+ Best Checkpoint Predictions"
 #| output-location: slide
 
-best_pred_path = os.path.join(mlruns_root, 'd19f99c8d92f4d4ba4f622b4d0a6a55e', 
+best_pred_path = os.path.join(mlruns_root, 'd19f99c8d92f4d4ba4f622b4d0a6a55e',
                                'artifacts/visualizations/best/predictions.png')
 
 if os.path.exists(best_pred_path):

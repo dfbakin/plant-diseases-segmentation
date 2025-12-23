@@ -43,12 +43,22 @@ def load_pretrained_mscan(
     Returns (loaded_keys, missing_keys). Raises FileNotFoundError if checkpoint missing.
     """
     if variant not in MSCAN_CHECKPOINT_NAMES:
-        raise ValueError(f"Unknown variant: {variant}. Available: {list(MSCAN_CHECKPOINT_NAMES.keys())}")
+        raise ValueError(
+            f"Unknown variant: {variant}. "
+            f"Available: {list(MSCAN_CHECKPOINT_NAMES.keys())}"
+        )
 
-    ckpt_path = Path(checkpoint_path) if checkpoint_path else Path(pretrained_dir) / MSCAN_CHECKPOINT_NAMES[variant]
+    ckpt_path = (
+        Path(checkpoint_path)
+        if checkpoint_path
+        else Path(pretrained_dir) / MSCAN_CHECKPOINT_NAMES[variant]
+    )
 
     if not ckpt_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}. Download MSCAN-{variant.upper()} weights.")
+        raise FileNotFoundError(
+            f"Checkpoint not found: {ckpt_path}. "
+            f"Download MSCAN-{variant.upper()} weights."
+        )
 
     logger.info(f"Loading pretrained MSCAN-{variant.upper()} from {ckpt_path}")
 
@@ -67,8 +77,10 @@ def load_pretrained_mscan(
 
     # Check shapes
     shape_mismatches = [
-        f"{k}: pretrained={pretrained_state_dict[k].shape}, model={model_state_dict[k].shape}"
-        for k in loadable_keys if pretrained_state_dict[k].shape != model_state_dict[k].shape
+        f"{k}: pretrained={pretrained_state_dict[k].shape}, "
+        f"model={model_state_dict[k].shape}"
+        for k in loadable_keys
+        if pretrained_state_dict[k].shape != model_state_dict[k].shape
     ]
     if shape_mismatches:
         msg = "Shape mismatches:\n" + "\n".join(shape_mismatches)
@@ -76,10 +88,17 @@ def load_pretrained_mscan(
             raise RuntimeError(msg)
         logger.warning(msg)
 
-    param_keys = [k for k in loadable_keys if "running" not in k and "num_batches" not in k]
-    logger.info(f"Loading {len(param_keys)} params, {len(missing_keys)} missing, {len(unexpected_keys)} unexpected")
+    param_keys = [
+        k for k in loadable_keys if "running" not in k and "num_batches" not in k
+    ]
+    logger.info(
+        f"Loading {len(param_keys)} params, {len(missing_keys)} missing, "
+        f"{len(unexpected_keys)} unexpected"
+    )
 
-    critical_missing = [k for k in missing_keys if "running" not in k and "num_batches" not in k]
+    critical_missing = [
+        k for k in missing_keys if "running" not in k and "num_batches" not in k
+    ]
     if critical_missing:
         msg = f"Missing keys: {critical_missing}"
         if strict:
@@ -90,15 +109,18 @@ def load_pretrained_mscan(
     return list(loadable_keys), load_result.missing_keys
 
 
-def get_pretrained_checkpoint_path(variant: MSCANVariant, pretrained_dir: str | Path = DEFAULT_PRETRAINED_DIR) -> Path:
+def get_pretrained_checkpoint_path(
+    variant: MSCANVariant, pretrained_dir: str | Path = DEFAULT_PRETRAINED_DIR
+) -> Path:
     if variant not in MSCAN_CHECKPOINT_NAMES:
         raise ValueError(f"Unknown variant: {variant}")
     return Path(pretrained_dir) / MSCAN_CHECKPOINT_NAMES[variant]
 
 
-def check_pretrained_available(variant: MSCANVariant, pretrained_dir: str | Path = DEFAULT_PRETRAINED_DIR) -> bool:
+def check_pretrained_available(
+    variant: MSCANVariant, pretrained_dir: str | Path = DEFAULT_PRETRAINED_DIR
+) -> bool:
     try:
         return get_pretrained_checkpoint_path(variant, pretrained_dir).exists()
     except ValueError:
         return False
-

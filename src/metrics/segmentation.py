@@ -1,26 +1,40 @@
 """Segmentation metrics: mIoU, mAcc, Dice, Boundary IoU."""
 
 import torch
-from torchmetrics import Metric
 import torch.nn.functional as F
+from torchmetrics import Metric
 
 
 class SegmentationMetrics(Metric):
     """Accumulates mIoU, Dice, and Boundary IoU across batches."""
 
-    def __init__(self, num_classes: int = 2, ignore_index: int | None = None, eps: float = 1e-8) -> None:
+    def __init__(
+        self, num_classes: int = 2, ignore_index: int | None = None, eps: float = 1e-8
+    ) -> None:
         super().__init__()
         assert num_classes > 0
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.eps = eps
 
-        self.add_state("intersection", default=torch.zeros(num_classes), dist_reduce_fx="sum")
-        self.add_state("boundary_intersection", default=torch.zeros(num_classes), dist_reduce_fx="sum")
-        self.add_state("boundary_union", default=torch.zeros(num_classes), dist_reduce_fx="sum")
+        self.add_state(
+            "intersection", default=torch.zeros(num_classes), dist_reduce_fx="sum"
+        )
+        self.add_state(
+            "boundary_intersection",
+            default=torch.zeros(num_classes),
+            dist_reduce_fx="sum",
+        )
+        self.add_state(
+            "boundary_union", default=torch.zeros(num_classes), dist_reduce_fx="sum"
+        )
         self.add_state("union", default=torch.zeros(num_classes), dist_reduce_fx="sum")
-        self.add_state("pred_sum", default=torch.zeros(num_classes), dist_reduce_fx="sum")
-        self.add_state("target_sum", default=torch.zeros(num_classes), dist_reduce_fx="sum")
+        self.add_state(
+            "pred_sum", default=torch.zeros(num_classes), dist_reduce_fx="sum"
+        )
+        self.add_state(
+            "target_sum", default=torch.zeros(num_classes), dist_reduce_fx="sum"
+        )
 
     def update(self, preds: torch.Tensor, target: torch.Tensor) -> None:
         """Update with preds (N, C, H, W) or (N, H, W) and target (N, H, W)."""
@@ -54,15 +68,23 @@ class SegmentationMetrics(Metric):
 
     def compute(self) -> dict[str, torch.Tensor]:
         iou_per_class = self.intersection / (self.union + self.eps)
-        acc_per_class = self.intersection / (self.target_sum + self.eps)  # TP / (TP + FN)
-        boundary_iou_per_class = self.boundary_intersection / (self.boundary_union + self.eps)
+        acc_per_class = self.intersection / (
+            self.target_sum + self.eps
+        )  # TP / (TP + FN)
+        boundary_iou_per_class = self.boundary_intersection / (
+            self.boundary_union + self.eps
+        )
 
         valid = self.union > 0
         miou = iou_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
         macc = acc_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
-        boundary_iou = boundary_iou_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
+        boundary_iou = (
+            boundary_iou_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
+        )
 
-        dice_per_class = (2 * self.intersection) / (self.pred_sum + self.target_sum + self.eps)
+        dice_per_class = (2 * self.intersection) / (
+            self.pred_sum + self.target_sum + self.eps
+        )
         dice = dice_per_class[valid].mean() if valid.any() else torch.tensor(0.0)
 
         result = {
@@ -77,17 +99,18 @@ class SegmentationMetrics(Metric):
 
         # Add named per-class metrics for binary segmentation
         if self.num_classes == 2:
-            result.update({
-                "iou_background": iou_per_class[0],
-                "iou_disease": iou_per_class[1],
-                "acc_background": acc_per_class[0],
-                "acc_disease": acc_per_class[1],
-                "boundary_iou_background": boundary_iou_per_class[0],
-                "boundary_iou_disease": boundary_iou_per_class[1],
-            })
+            result.update(
+                {
+                    "iou_background": iou_per_class[0],
+                    "iou_disease": iou_per_class[1],
+                    "acc_background": acc_per_class[0],
+                    "acc_disease": acc_per_class[1],
+                    "boundary_iou_background": boundary_iou_per_class[0],
+                    "boundary_iou_disease": boundary_iou_per_class[1],
+                }
+            )
 
         return result
-
 
     def update_boundary_metrics(
         self, preds: torch.Tensor, target: torch.Tensor, cls: int, dilation: int = 3
@@ -107,4 +130,6 @@ class SegmentationMetrics(Metric):
 
         intersection = (pred_boundary * target_boundary).sum()
         self.boundary_intersection[cls] += intersection
-        self.boundary_union[cls] += pred_boundary.sum() + target_boundary.sum() - intersection
+        self.boundary_union[cls] += (
+            pred_boundary.sum() + target_boundary.sum() - intersection
+        )

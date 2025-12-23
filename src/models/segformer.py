@@ -10,7 +10,8 @@ from transformers import SegformerConfig, SegformerForSemanticSegmentation
 
 
 class SegFormerWrapper(nn.Module):
-    """Wraps HuggingFace SegFormer for custom num_classes and upsamples output to input resolution."""
+    """Wraps HuggingFace SegFormer for custom num_classes
+    and upsamples output to input resolution."""
 
     VARIANT_MAP = {
         "b0": "nvidia/segformer-b0-finetuned-ade-512-512",
@@ -34,7 +35,10 @@ class SegFormerWrapper(nn.Module):
 
         model_name = self.VARIANT_MAP.get(variant.lower())
         if model_name is None:
-            raise ValueError(f"Unknown variant: {variant}. Use one of {list(self.VARIANT_MAP.keys())}")
+            raise ValueError(
+                f"Unknown variant: {variant}. "
+                f"Use one of {list(self.VARIANT_MAP.keys())}"
+            )
 
         if pretrained:
             self.model = SegformerForSemanticSegmentation.from_pretrained(
@@ -48,9 +52,10 @@ class SegFormerWrapper(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns logits upsampled to input resolution."""
         logits = self.model(pixel_values=x).logits
-        return F.interpolate(logits, size=x.shape[2:], mode="bilinear", align_corners=False)
+        return F.interpolate(
+            logits, size=x.shape[2:], mode="bilinear", align_corners=False
+        )
 
     @property
     def encoder_output_channels(self) -> list[int]:
         return list(self.model.config.hidden_sizes)
-

@@ -81,7 +81,7 @@ low_res_path = os.path.join(root, "Plant_leaf_diseases_dataset_without_augmentat
 
 if os.path.exists(low_res_path):
     img_low = Image.open(low_res_path)
-    
+
     plt.figure(figsize=(3, 3))
     plt.imshow(img_low)
     plt.xticks([])
@@ -95,7 +95,7 @@ if os.path.exists(low_res_path):
     width, height = img_low.size
     crop = img_low.crop((width//4, height//4, width//2, height//2))
     crop = crop.resize((256, 256), Image.NEAREST) # Zoom effect
-    
+
     plt.figure(figsize=(3, 3))
     plt.imshow(crop)
     plt.xticks([])
@@ -121,10 +121,10 @@ high_res_path = os.path.join(root, "plant-pathology-2020-fgvc7/images/Test_4.jpg
 
 if os.path.exists(high_res_path):
     img_high = Image.open(high_res_path)
-    
+
     # Downsample slightly for display if huge, but keep aspect
     img_high.thumbnail((1000, 1000))
-    
+
     plt.figure(figsize=(4, 3))
     plt.imshow(img_high)
     plt.xticks([])
