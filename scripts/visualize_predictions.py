@@ -27,6 +27,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+import imageio.v3 as iio
 
 import matplotlib
 
@@ -66,14 +67,12 @@ def load_sample(metadata: dict, name: str) -> dict:
     """Load images and masks for a sample."""
     meta = metadata[name]
 
-    image = cv2.cvtColor(cv2.imread(meta["image_path"]), cv2.COLOR_BGR2RGB)
+    image = iio.imread(meta["image_path"])
     h, w = image.shape[:2]
 
-    gt_mask = (cv2.imread(meta["gt_mask_path"], cv2.IMREAD_GRAYSCALE) > 0).astype(
-        np.uint8
-    )
+    gt_mask = (iio.imread(meta["gt_mask_path"], mode="L") > 0).astype(np.uint8)
 
-    pred_mask_raw = cv2.imread(meta["prediction_path"], cv2.IMREAD_GRAYSCALE)
+    pred_mask_raw = iio.imread(meta["prediction_path"], mode="L")
     pred_mask = (pred_mask_raw > 0).astype(np.uint8)
 
     # Resize prediction to match original image size if needed
