@@ -24,6 +24,15 @@ from omegaconf import DictConfig, OmegaConf
 
 from src.conf.augmentation import get_augmentation_config
 from src.conf.config import Config, register_configs
+from src.conf.scheduler import (
+    ConstantSchedulerConfig,
+    CosineSchedulerConfig,
+    CyclicSchedulerConfig,
+    OneCycleSchedulerConfig,
+    PlateauSchedulerConfig,
+    SchedulerConfig,
+    StepSchedulerConfig,
+)
 from src.data import PlantSegDataModule
 from src.models import SegmentationModule, create_model
 from src.training.callbacks import (
@@ -98,12 +107,33 @@ def train(cfg: Config) -> float:
         decoder_channels=getattr(cfg.model, "decoder_channels", None),
     )
 
+    scheduler_classes = {
+        "constant": ConstantSchedulerConfig,
+        "cosine": CosineSchedulerConfig,
+        "step": StepSchedulerConfig,
+        "cyclic": CyclicSchedulerConfig,
+        "one_cycle": OneCycleSchedulerConfig,
+        "plateau": PlateauSchedulerConfig,
+    }
+    sched_name = cfg.scheduler.name
+    sched_cls = scheduler_classes.get(sched_name, SchedulerConfig)
+    sched_kwargs = {
+        k: v for k, v in OmegaConf.to_container(cfg.scheduler).items() if k != "name"
+    }
+    scheduler_config = sched_cls(**sched_kwargs)
+
+    # Calculate steps per epoch for step-based schedulers
+    datamodule.setup("fit")
+    steps_per_epoch = len(datamodule.train_dataloader())
+
     module = SegmentationModule(
         model=model_backbone,
         num_classes=num_classes,
         learning_rate=cfg.model.learning_rate,
         weight_decay=cfg.model.weight_decay,
         loss_fn=cfg.model.loss_fn,
+        scheduler_config=scheduler_config,
+        steps_per_epoch=steps_per_epoch,
     )
 
     mlflow_logger = MLFlowLogger(

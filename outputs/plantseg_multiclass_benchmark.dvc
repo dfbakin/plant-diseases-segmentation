@@ -1,0 +1,6 @@
+outs:
+- md5: 42a8edc876b1c920bb2a4cc9b139aa87.dir
+  size: 1211913341
+  nfiles: 37
+  hash: md5
+  path: plantseg_multiclass_benchmark

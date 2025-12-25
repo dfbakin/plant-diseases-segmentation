@@ -8,6 +8,5 @@ poetry.lock
 requirements.txt
 /pretrained
 /mlruns
-/outputs
 
 /.mcp-servers

@@ -1,0 +1,6 @@
+outs:
+- md5: 9b89dbd274b524fae63372a6b46ff522.dir
+  size: 14932910955
+  nfiles: 245
+  hash: md5
+  path: plantseg_architecture_benchmark

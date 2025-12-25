@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.conf.scheduler import SchedulerConfig, create_scheduler
 from src.metrics.segmentation import SegmentationMetrics
 
 
@@ -25,6 +26,8 @@ class SegmentationModule(L.LightningModule):
         weight_decay: float = 1e-4,
         class_weights: torch.Tensor | None = None,
         loss_fn: str = "cross_entropy",
+        scheduler_config: SchedulerConfig | None = None,
+        steps_per_epoch: int | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -32,6 +35,8 @@ class SegmentationModule(L.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.loss_fn_name = loss_fn
+        self.scheduler_config = scheduler_config
+        self.steps_per_epoch = steps_per_epoch
 
         if class_weights is not None:
             self.register_buffer("class_weights", class_weights)
@@ -42,7 +47,7 @@ class SegmentationModule(L.LightningModule):
         self.val_metrics = SegmentationMetrics(num_classes=num_classes)
         self.test_metrics = SegmentationMetrics(num_classes=num_classes)
 
-        self.save_hyperparameters(ignore=["model", "class_weights"])
+        self.save_hyperparameters(ignore=["model", "class_weights", "scheduler_config"])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns logits of shape (N, num_classes, H, W)."""
@@ -138,19 +143,25 @@ class SegmentationModule(L.LightningModule):
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs if self.trainer else 100,
-            eta_min=1e-6,
+
+        if self.scheduler_config is None:
+            return {"optimizer": optimizer}
+
+        max_epochs = self.trainer.max_epochs if self.trainer else 100
+        steps_per_epoch = self.steps_per_epoch or 100
+
+        scheduler_dict = create_scheduler(
+            optimizer=optimizer,
+            config=self.scheduler_config,
+            max_epochs=max_epochs,
+            steps_per_epoch=steps_per_epoch,
+            learning_rate=self.learning_rate,
         )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
+
+        if scheduler_dict is None:
+            return {"optimizer": optimizer}
+
+        return {"optimizer": optimizer, "lr_scheduler": scheduler_dict}
 
     def predict_step(self, batch: dict, batch_idx: int) -> dict:
         images = batch["image"]

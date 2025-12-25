@@ -22,6 +22,14 @@ from src.conf.model import (
     SegNeXtConfig,
     UNetConfig,
 )
+from src.conf.scheduler import (
+    ConstantSchedulerConfig,
+    CosineSchedulerConfig,
+    CyclicSchedulerConfig,
+    OneCycleSchedulerConfig,
+    PlateauSchedulerConfig,
+    StepSchedulerConfig,
+)
 from src.conf.trainer import TrainerConfig
 
 
@@ -63,8 +71,11 @@ class Config:
             {"augmentation": "spatial_color_light"},
             {"model": "deeplabv3plus"},
             {"trainer": "default"},
+            {"scheduler": "cosine"},
         ]
     )
+
+    scheduler: Any = MISSING
 
     experiment: ExperimentConfig = field(default_factory=ExperimentConfig)
 
@@ -113,3 +124,11 @@ def register_configs() -> None:
         node=SpatialColorLightAugConfig,
     )
     cs.store(group="augmentation", name="full", node=FullAugConfig)
+
+    # Scheduler configs
+    cs.store(group="scheduler", name="constant", node=ConstantSchedulerConfig)
+    cs.store(group="scheduler", name="cosine", node=CosineSchedulerConfig)
+    cs.store(group="scheduler", name="step", node=StepSchedulerConfig)
+    cs.store(group="scheduler", name="cyclic", node=CyclicSchedulerConfig)
+    cs.store(group="scheduler", name="one_cycle", node=OneCycleSchedulerConfig)
+    cs.store(group="scheduler", name="plateau", node=PlateauSchedulerConfig)

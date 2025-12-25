@@ -1,0 +1,6 @@
+outs:
+- md5: be575c0bfdb218410f6ee2135159b0ae.dir
+  size: 26197146147
+  nfiles: 448
+  hash: md5
+  path: plantseg_augmentation_ablation_fp32_final
