@@ -77,7 +77,7 @@ class PlantSegDataset(Dataset):
         # Load optional metadata
         metadata_path = self.root / "Metadatav2.csv"
         if metadata_path.exists():
-            split_name = {"train": "Training", "val": "Validation", "test": "Testing"}
+            split_name = {"train": "Training", "val": "Validation", "test": "Test"}
             self.metadata = pd.read_csv(metadata_path)
             self.metadata = self.metadata[
                 self.metadata["Split"] == split_name.get(split, split)

@@ -133,10 +133,11 @@ class ClassificationModule(L.LightningModule):
 
         cam_eval = self._get_cam_evaluator()
 
-        # Enable gradients for CAM computation (needed during validation)
-        with torch.enable_grad():
-            images_with_grad = images.clone().requires_grad_(True)
-            cams = cam_eval.generate_cam(images_with_grad, labels)
+        # Enable gradients and inference_mode(False) for CAM computation
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                images_with_grad = images.detach().clone().requires_grad_(True)
+                cams = cam_eval.generate_cam(images_with_grad, labels)
 
         # Compute metrics for each sample
         for i in range(len(images)):
