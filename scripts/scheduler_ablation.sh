@@ -1,11 +1,15 @@
 set -e
 
+export MLFLOW_TRACKING_URI="ip_address:port"
+export MLFLOW_TRACKING_USERNAME="your_username"
+export MLFLOW_TRACKING_PASSWORD="your_password"
+
 EXPERIMENT_NAME="plantseg_scheduler_ablation"
 SEED=42
 MAX_EPOCHS=40
 IMAGE_SIZE=384
 BATCH_SIZE=16
-LR=3e-4
+LR=5e-4
 
 echo "[1/6] Training with constant LR..."
 python3 src/train.py \
@@ -20,7 +24,8 @@ python3 src/train.py \
     data.multiclass=true \
     trainer.max_epochs=${MAX_EPOCHS} \
     trainer.precision="32" \
-    scheduler=constant
+    scheduler=constant \
+    mlflow_tracking_uri=${MLFLOW_TRACKING_URI}
 
 echo "[2/6] Training with cosine annealing..."
 poetry run python src/train.py \
@@ -35,7 +40,8 @@ poetry run python src/train.py \
     data.multiclass=true \
     trainer.max_epochs=${MAX_EPOCHS} \
     trainer.precision="32" \
-    scheduler=cosine
+    scheduler=cosine \
+    mlflow_tracking_uri=${MLFLOW_TRACKING_URI}
 
 echo "[3/6] Training with step LR..."
 poetry run python src/train.py \
@@ -52,7 +58,8 @@ poetry run python src/train.py \
     trainer.precision="32" \
     scheduler=step \
     scheduler.step_size=10 \
-    scheduler.gamma=0.1
+    scheduler.gamma=0.1 \
+    mlflow_tracking_uri=${MLFLOW_TRACKING_URI}
 
 echo "[4/6] Training with cyclic LR (triangular2)..."
 poetry run python src/train.py \
@@ -69,7 +76,8 @@ poetry run python src/train.py \
     trainer.precision="32" \
     scheduler=cyclic \
     scheduler.step_size_up=10 \
-    scheduler.mode=triangular2
+    scheduler.mode=triangular2 \
+    mlflow_tracking_uri=${MLFLOW_TRACKING_URI}
 
 echo "[5/6] Training with one-cycle LR..."
 poetry run python src/train.py \
@@ -86,7 +94,8 @@ poetry run python src/train.py \
     trainer.precision="32" \
     scheduler=one_cycle \
     scheduler.max_lr_factor=10.0 \
-    scheduler.pct_start=0.3
+    scheduler.pct_start=0.3 \
+    mlflow_tracking_uri=${MLFLOW_TRACKING_URI}
 
 echo "[6/6] Training with reduce-on-plateau..."
 poetry run python src/train.py \
@@ -103,4 +112,5 @@ poetry run python src/train.py \
     trainer.precision="32" \
     scheduler=plateau \
     scheduler.patience=5 \
-    scheduler.factor=0.5
+    scheduler.factor=0.5 \
+    mlflow_tracking_uri=${MLFLOW_TRACKING_URI}
