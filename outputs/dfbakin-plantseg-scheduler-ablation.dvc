@@ -1,0 +1,6 @@
+outs:
+- md5: f598cdc9ee23fede43034df81b16e13b.dir
+  size: 8596759508
+  nfiles: 281
+  hash: md5
+  path: dfbakin-plantseg-scheduler-ablation

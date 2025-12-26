@@ -2,3 +2,4 @@
 /plantseg_augmentation_ablation_fp32_final
 /plantseg_multiclass_benchmark
 /sweeps
+/dfbakin-plantseg-scheduler-ablation

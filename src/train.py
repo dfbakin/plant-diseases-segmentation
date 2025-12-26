@@ -136,15 +136,20 @@ def train(cfg: Config) -> float:
         steps_per_epoch=steps_per_epoch,
     )
 
+    # Build descriptive run name
+    variant = getattr(cfg.model, "variant", None) or getattr(cfg.model, "encoder_name", "")
+    run_name = f"{cfg.model.name}_{variant}_{sched_name}_{augmentation_preset}_s{cfg.experiment.seed}"
+
     mlflow_logger = MLFlowLogger(
         experiment_name=cfg.mlflow.experiment_name,
         tracking_uri=cfg.mlflow.tracking_uri,
-        run_name=f"{cfg.model.name}_{augmentation_preset}_{cfg.experiment.seed}",
+        run_name=run_name,
         tags={
             "model": cfg.model.name,
-            "encoder": getattr(cfg.model, "encoder_name", None)
-            or getattr(cfg.model, "variant", "default"),
+            "encoder": variant or "default",
             "augmentation": augmentation_preset,
+            "scheduler": sched_name,
+            "learning_rate": str(cfg.model.learning_rate),
             "multiclass": str(multiclass),
             "num_classes": str(num_classes),
         },
