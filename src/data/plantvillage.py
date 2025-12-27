@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Callable, Literal
 
 import cv2
-import imageio.v3 as iio
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
@@ -144,7 +143,7 @@ class PlantVillageDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
     
-        image = iio.imread(str(sample["image_path"]))
+        image = cv2.cvtColor(cv2.imread(str(sample["image_path"])), cv2.COLOR_BGR2RGB)
 
         if self.transform:
             transformed = self.transform(image=image)
@@ -289,7 +288,7 @@ class PlantSegClassificationDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
 
-        image = iio.imread(str(sample["image_path"]))
+        image = cv2.cvtColor(cv2.imread(str(sample["image_path"])), cv2.COLOR_BGR2RGB)
 
         if self.return_mask:
             mask = cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE)

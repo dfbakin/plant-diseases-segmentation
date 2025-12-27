@@ -202,7 +202,7 @@ class ClassificationModule(L.LightningModule):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.trainer.max_epochs if self.trainer else 100,
-            eta_min=1e-6,
+            eta_min=1e-5,
         )
         return {
             "optimizer": optimizer,
