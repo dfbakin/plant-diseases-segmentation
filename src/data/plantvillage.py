@@ -145,6 +145,13 @@ class PlantVillageDataset(Dataset):
     
         image = cv2.cvtColor(cv2.imread(str(sample["image_path"])), cv2.COLOR_BGR2RGB)
 
+        if image.ndim == 2:
+            image = np.stack([image, image, image], axis=-1)
+        elif image.shape[-1] == 1:  # Grayscale with channel dim
+            image = np.concatenate([image, image, image], axis=-1)
+        elif image.shape[-1] == 4:  # RGBA -> RGB
+            image = image[:, :, :3]
+
         if self.transform:
             transformed = self.transform(image=image)
             image = transformed["image"]
@@ -289,6 +296,13 @@ class PlantSegClassificationDataset(Dataset):
         sample = self.samples[idx]
 
         image = cv2.cvtColor(cv2.imread(str(sample["image_path"])), cv2.COLOR_BGR2RGB)
+
+        if image.ndim == 2:
+            image = np.stack([image, image, image], axis=-1)
+        elif image.shape[-1] == 1:  # Grayscale with channel dim
+            image = np.concatenate([image, image, image], axis=-1)
+        elif image.shape[-1] == 4:  # RGBA -> RGB
+            image = image[:, :, :3]
 
         if self.return_mask:
             mask = cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE)

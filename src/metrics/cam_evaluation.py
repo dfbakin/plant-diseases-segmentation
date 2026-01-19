@@ -7,14 +7,16 @@ segmentation masks from PlantSeg dataset.
 from typing import Literal
 
 import numpy as np
+from scipy import ndimage
+from scipy.ndimage import maximum_filter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_grad_cam import GradCAM, LayerCAM
+from pytorch_grad_cam import GradCAM, GradCAMPlusPlus, LayerCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
 
-CAMMethod = Literal["gradcam", "layercam"]
+CAMMethod = Literal["gradcam", "gradcam++", "layercam"]
 
 
 class CAMEvaluator:
@@ -37,7 +39,11 @@ class CAMEvaluator:
         self.model = model
         self.threshold = threshold
 
-        cam_cls = {"gradcam": GradCAM, "layercam": LayerCAM}[cam_method]
+        cam_cls = {
+            "gradcam": GradCAM,
+            "gradcam++": GradCAMPlusPlus,
+            "layercam": LayerCAM,
+        }[cam_method]
         self.cam = cam_cls(model=model, target_layers=[target_layer])
 
     def generate_cam(
@@ -106,6 +112,8 @@ class CAMEvaluator:
         # F1
         f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
+        multiregion = self._compute_multiregion_metrics(cam, gt_binary, cam_binary)
+
         return {
             "pointing_acc": pointing_acc,
             "energy_inside": float(energy_inside),
@@ -113,6 +121,79 @@ class CAMEvaluator:
             "precision": float(precision),
             "recall": float(recall),
             "f1": float(f1),
+            **multiregion,
+        }
+
+    def _compute_multiregion_metrics(
+        self,
+        cam: np.ndarray,
+        gt_binary: np.ndarray,
+        cam_binary: np.ndarray,
+        peak_threshold: float = 0.7,
+        local_max_size: int = 20,
+    ) -> dict[str, float]:
+        """Compute metrics for multi-region masks (WSSS / SAM prompting).
+
+        Args:
+            cam: (H, W) CAM heatmap in [0, 1]
+            gt_binary: (H, W) binary ground truth mask
+            cam_binary: (H, W) thresholded CAM
+            peak_threshold: Threshold for detecting CAM peaks
+            local_max_size: Window size for local maximum detection
+
+        Returns:
+            Dictionary of multi-region metrics
+        """
+        # Find connected components in GT
+        labeled_gt, num_regions = ndimage.label(gt_binary)
+
+        if num_regions == 0:
+            return {
+                "num_gt_regions": 0,
+                "region_coverage": 1.0,
+                "peak_coverage": 1.0,
+                "peak_precision": 1.0,
+                "num_peaks": 0,
+            }
+
+        # --- Region Coverage ---
+        # How many GT regions have ANY CAM activation inside them?
+        regions_covered = 0
+        for region_id in range(1, num_regions + 1):
+            region_mask = (labeled_gt == region_id)
+            if (cam_binary * region_mask).sum() > 0:
+                regions_covered += 1
+        region_coverage = regions_covered / num_regions
+
+        # --- Multi-Peak Detection ---
+        # Find local maxima in CAM
+        local_max = (cam == maximum_filter(cam, size=local_max_size)) & (cam > peak_threshold)
+        peak_coords = np.argwhere(local_max)
+        num_peaks = len(peak_coords)
+
+        if num_peaks == 0:
+            # No peaks detected - use global max as single peak
+            peak_coords = np.array([list(np.unravel_index(cam.argmax(), cam.shape))])
+            num_peaks = 1
+
+        # How many peaks fall inside GT regions? (peak precision)
+        peaks_in_gt = sum(gt_binary[tuple(p)] > 0 for p in peak_coords)
+        peak_precision = peaks_in_gt / num_peaks
+
+        # How many GT regions have at least one peak? (peak coverage)
+        regions_with_peaks = 0
+        for region_id in range(1, num_regions + 1):
+            region_mask = (labeled_gt == region_id)
+            if any(region_mask[tuple(p)] > 0 for p in peak_coords):
+                regions_with_peaks += 1
+        peak_coverage = regions_with_peaks / num_regions
+
+        return {
+            "num_gt_regions": float(num_regions),
+            "region_coverage": float(region_coverage),
+            "peak_coverage": float(peak_coverage),
+            "peak_precision": float(peak_precision),
+            "num_peaks": float(num_peaks),
         }
 
     def _resize_cam(self, cam: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
@@ -128,23 +209,27 @@ class CAMMetricsAccumulator:
     """Accumulates CAM metrics across batches."""
 
     METRIC_NAMES = ["pointing_acc", "energy_inside", "iou", "precision", "recall", "f1"]
+    MULTIREGION_METRIC_NAMES = [
+        "num_gt_regions", "region_coverage", "peak_coverage", "peak_precision", "num_peaks"
+    ]
+    ALL_METRIC_NAMES = METRIC_NAMES + MULTIREGION_METRIC_NAMES
 
     def __init__(self):
         self.reset()
 
     def reset(self):
-        self._metrics = {name: [] for name in self.METRIC_NAMES}
+        self._metrics = {name: [] for name in self.ALL_METRIC_NAMES}
         self._count = 0
 
     def update(self, metrics: dict[str, float]):
-        for name in self.METRIC_NAMES:
+        for name in self.ALL_METRIC_NAMES:
             if name in metrics:
                 self._metrics[name].append(metrics[name])
         self._count += 1
 
     def compute(self) -> dict[str, float]:
         if self._count == 0:
-            return {name: 0.0 for name in self.METRIC_NAMES}
+            return {name: 0.0 for name in self.ALL_METRIC_NAMES}
         return {name: np.mean(values) for name, values in self._metrics.items()}
 
     @property

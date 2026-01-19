@@ -1,6 +1,6 @@
 set -e
 
-EXPERIMENT_NAME="classifier_cam_benchmark"
+EXPERIMENT_NAME="dfbakin_classifier_cam_benchmark"
 SEED=42
 MAX_EPOCHS=30
 IMAGE_SIZE=384
@@ -32,7 +32,7 @@ python3 src/train_classifier.py \
     seed=${SEED} \
     model.name=resnet18 \
     model.pretrained=true \
-    model.learning_rate=1e-4 \
+    model.learning_rate=4e-4 \
     data.image_size=${IMAGE_SIZE} \
     data.batch_size=${BATCH_SIZE} \
     data.num_workers=2 \
@@ -47,7 +47,7 @@ python3 src/train_classifier.py \
     seed=${SEED} \
     model.name=resnet50 \
     model.pretrained=true \
-    model.learning_rate=1e-4 \
+    model.learning_rate=4e-4 \
     data.image_size=${IMAGE_SIZE} \
     data.batch_size=${BATCH_SIZE} \
     data.num_workers=2 \
@@ -63,7 +63,7 @@ python3 src/train_classifier.py \
     seed=${SEED} \
     model.name=efficientnet_b0 \
     model.pretrained=true \
-    model.learning_rate=1e-4 \
+    model.learning_rate=4e-4 \
     data.image_size=${IMAGE_SIZE} \
     data.batch_size=${BATCH_SIZE} \
     data.num_workers=2 \
@@ -78,7 +78,7 @@ python3 src/train_classifier.py \
     seed=${SEED} \
     model.name=efficientnet_b2 \
     model.pretrained=true \
-    model.learning_rate=1e-4 \
+    model.learning_rate=4e-4 \
     data.image_size=${IMAGE_SIZE} \
     data.batch_size=${BATCH_SIZE} \
     data.num_workers=2 \
