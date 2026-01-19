@@ -1,0 +1,301 @@
+---
+title: "Research Update: Classifier + CAM Benchmark (Preliminary)"
+subtitle: "Plant Disease Segmentation — CAM quality evaluation on PlantSeg masks"
+format: beamer
+---
+
+## United Datasets for classification
+
+
+- **PlantVillage**: image-level labels, no masks
+- **PlantSeg**: masks + metadata; used as *classification samples* via disease label mapping
+
+- Single label space for both datasets:
+  - `0`: **healthy**
+  - `1–115`: PlantSeg diseases
+  - `116–119`: PlantVillage-only diseases
+
+---
+
+## CAM methods benchmarked
+
+- **Grad-CAM**: gradient-weighted activation maps (architecture-agnostic; fast baseline).
+- **Grad-CAM++**: improved Grad-CAM weighting; often better for multiple/small instances.
+- **Layer-CAM** (planned): per-pixel gradient weighting; often sharper for small regions.
+
+Idea: select that maximizes localization quality vs PlantSeg GT masks and use maximums for SAM cues
+
+---
+
+## CAM evaluation: metrics (brief)
+
+**Standard metrics**:
+
+- **Pointing accuracy**: does the CAM maximum fall inside the GT disease mask?
+- **Energy inside**: fraction of total CAM activation that lies inside the GT mask.
+- **IoU**: overlap between thresholded CAM mask and GT mask.
+
+**Sparse / multi-region metrics**:
+
+- **№GT regions**: number of connected lesion components in GT (diagnostic).
+- **Region coverage**: fraction of GT regions that have any CAM activation inside.
+- **Peak coverage**: fraction of GT regions that contain at least one detected CAM peak.
+- **Peak precision**: fraction of detected CAM peaks that fall inside GT.
+- **№Peaks**: number of detected CAM local maxima (diagnostic).
+
+---
+
+## Experiment setup
+
+- Train a classifier on **PlantVillage + PlantSeg (as classification)**
+- Validation is on **PlantSeg val** (has GT masks)
+
+- **Backbones trained**: ResNet18, ResNet50, EfficientNet-B0
+- **CAM methods trained**: Grad-CAM
+- **Planned**: Layer-CAM, Grad-CAM++ across ResNet18, ResNet50, EfficientNet-[B0, B2, B4]
+
+---
+
+## Preliminary results (max on validation set)
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+from pathlib import Path
+import pandas as pd
+
+EXPERIMENT_ID = "675534359741067840"  # dfbakin_classifier_cam_benchmark
+MLRUNS_ROOT = Path("../../mlruns") / EXPERIMENT_ID
+
+runs = {
+    "ResNet18 + Grad-CAM": "0675f056f5c544759e2f3056141ad4e1",
+    "ResNet50 + Grad-CAM": "2938c52ad1414ac797faa52e1c4f2bd8",
+    "EffNet-B0 + Grad-CAM": "5a87fdbf632742a69ebfd3e08ebbc241",
+}
+
+def parse_metric_file(path: Path):
+    # MLflow metric format: "timestamp value step"
+    if not path.exists():
+        return []
+    values = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 2:
+            values.append(float(parts[1]))
+    return values
+
+def metric_max(run_id: str, metric: str):
+    values = parse_metric_file(MLRUNS_ROOT / run_id / "metrics" / metric)
+    return max(values) if values else None
+
+rows = []
+for name, run_id in runs.items():
+    rows.append(
+        {
+            "Model": name,
+            r"val/acc $\uparrow$": metric_max(run_id, "val/acc"),
+            r"val/cam_iou $\uparrow$": metric_max(run_id, "val/cam_iou"),
+            r"val/cam_pointing_acc $\uparrow$": metric_max(run_id, "val/cam_pointing_acc"),
+            r"val/cam_energy_inside $\uparrow$": metric_max(run_id, "val/cam_energy_inside"),
+            r"val/cam_region_coverage $\uparrow$": metric_max(run_id, "val/cam_region_coverage"),
+            r"val/cam_peak_precision $\uparrow$": metric_max(run_id, "val/cam_peak_precision"),
+        }
+    )
+
+df = pd.DataFrame(rows)
+
+def fmt(x):
+    return "" if x is None else f"{x:.3f}"
+
+df_disp = df.copy()
+for col in df.columns:
+    if col != "Model":
+        df_disp[col] = df[col].map(fmt)
+
+from IPython.display import Markdown, display
+df_tab1 = df_disp.rename(
+    columns={
+        "Model": "Model",
+        r"val/acc $\uparrow$": r"acc $\uparrow$",
+        r"val/cam_iou $\uparrow$": r"CAM IoU $\uparrow$",
+        r"val/cam_pointing_acc $\uparrow$": r"Pointing $\uparrow$",
+    }
+)[["Model", r"acc $\uparrow$", r"CAM IoU $\uparrow$", r"Pointing $\uparrow$"]]
+
+display(Markdown(df_tab1.to_markdown(index=False)))
+```
+
+---
+
+## Preliminary results (cont.)
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+df_tab2 = df_disp.rename(
+    columns={
+        "Model": "Model",
+        r"val/cam_energy_inside $\uparrow$": r"Energy-in $\uparrow$",
+        r"val/cam_region_coverage $\uparrow$": r"Region cov. $\uparrow$",
+        r"val/cam_peak_precision $\uparrow$": r"Peak prec. $\uparrow$",
+    }
+)[
+    [
+        "Model",
+        r"Energy-in $\uparrow$",
+        r"Region cov. $\uparrow$",
+        r"Peak prec. $\uparrow$",
+    ]
+]
+
+display(Markdown(df_tab2.to_markdown(index=False)))
+```
+
+---
+
+## Curves: validation accuracy
+
+```{python}
+#| echo: false
+#| fig-cap: "Validation accuracy on PlantSeg (classification) across epochs"
+#| output-location: slide
+
+import matplotlib.pyplot as plt
+
+def parse_metric_series(path: Path):
+    # returns steps (epoch indices) and values
+    if not path.exists():
+        return [], []
+    steps, values = [], []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 3:
+            values.append(float(parts[1]))
+            steps.append(int(parts[2]))
+    return steps, values
+
+plt.figure(figsize=(9, 4))
+for name, run_id in runs.items():
+    steps, values = parse_metric_series(MLRUNS_ROOT / run_id / "metrics" / "val/acc")
+    if values:
+        plt.plot(range(len(values)), values, label=name, linewidth=2)
+
+plt.xlabel("Epoch")
+plt.ylabel("val/acc")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Curves: CAM IoU (localization)
+
+```{python}
+#| echo: false
+#| fig-cap: "CAM IoU (thresholded CAM vs GT disease mask) across epochs"
+#| output-location: slide
+
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(9, 4))
+for name, run_id in runs.items():
+    steps, values = parse_metric_series(MLRUNS_ROOT / run_id / "metrics" / "val/cam_iou")
+    if values:
+        plt.plot(range(len(values)), values, label=name, linewidth=2)
+
+plt.xlabel("Epoch")
+plt.ylabel("val/cam_iou")
+plt.grid(True, alpha=0.3)
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Curves: CAM pointing accuracy + region coverage
+
+```{python}
+#| echo: false
+#| fig-cap: "CAM: pointing accuracy and region coverage (multi-region)"
+#| output-location: slide
+
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+ax = axes[0]
+for name, run_id in runs.items():
+    _, values = parse_metric_series(MLRUNS_ROOT / run_id / "metrics" / "val/cam_pointing_acc")
+    if values:
+        ax.plot(range(len(values)), values, label=name, linewidth=2)
+ax.set_title("val/cam_pointing_acc")
+ax.set_xlabel("Epoch")
+ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+for name, run_id in runs.items():
+    _, values = parse_metric_series(MLRUNS_ROOT / run_id / "metrics" / "val/cam_region_coverage")
+    if values:
+        ax.plot(range(len(values)), values, label=name, linewidth=2)
+ax.set_title("val/cam_region_coverage")
+ax.set_xlabel("Epoch")
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=8)
+
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Curves: CAM energy inside + peak precision
+
+```{python}
+#| echo: false
+#| fig-cap: "CAM: energy inside GT and peak precision"
+#| output-location: slide
+
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+ax = axes[0]
+for name, run_id in runs.items():
+    _, values = parse_metric_series(MLRUNS_ROOT / run_id / "metrics" / "val/cam_energy_inside")
+    if values:
+        ax.plot(range(len(values)), values, label=name, linewidth=2)
+ax.set_title("val/cam_energy_inside")
+ax.set_xlabel("Epoch")
+ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+for name, run_id in runs.items():
+    _, values = parse_metric_series(MLRUNS_ROOT / run_id / "metrics" / "val/cam_peak_precision")
+    if values:
+        ax.plot(range(len(values)), values, label=name, linewidth=2)
+ax.set_title("val/cam_peak_precision")
+ax.set_xlabel("Epoch")
+ax.grid(True, alpha=0.3)
+ax.legend(fontsize=8)
+
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Notes + next steps
+
+- **CAM vs accuracy trade-off**: best classifier accuracy is not guaranteed to yield best CAM localization.
+- **Next runs**:
+  - Add **Layer-CAM** on the best 1–2 backbones.
+  - Add **test split** evaluation (PlantSeg test) for both accuracy and CAM metrics.
+- **Toward CAM $\rightarrow$ SAM**:
+  - Use the multi-region metrics (region/peak coverage/precision) to set prompt-generation + filtering heuristics.
+
+

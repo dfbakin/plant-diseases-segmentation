@@ -3,6 +3,7 @@
 
 __pycache__/
 ideas/
+literature/
 
 poetry.lock
 requirements.txt
