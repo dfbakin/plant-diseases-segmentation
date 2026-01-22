@@ -297,5 +297,3 @@ plt.show()
   - Add **test split** evaluation (PlantSeg test) for both accuracy and CAM metrics.
 - **Toward CAM $\rightarrow$ SAM**:
   - Use the multi-region metrics (region/peak coverage/precision) to set prompt-generation + filtering heuristics.
-
-
