@@ -12,7 +12,7 @@ BATCH_SIZE=16
 ACCUM_GRAD=2
 LR=5e-4
 
-echo "[1/6] Training with constant LR..."
+# [1/11] DONE - constant LR: val/miou=0.314, test/miou=0.377
 python3 src/train.py \
     experiment.name="${EXPERIMENT_NAME}" \
     experiment.seed=${SEED} \
@@ -29,7 +29,7 @@ python3 src/train.py \
     scheduler=constant \
     mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
 
-echo "[2/6] Training with cosine annealing..."
+# [2/11] DONE - cosine annealing: val/miou=0.374, test/miou=0.419
 python3 src/train.py \
     experiment.name="${EXPERIMENT_NAME}" \
     experiment.seed=${SEED} \
@@ -46,7 +46,7 @@ python3 src/train.py \
     scheduler=cosine \
     mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
 
-echo "[3/6] Training with step LR..."
+# [3/11] DONE - step LR: val/miou=0.363, test/miou=0.392
 python3 src/train.py \
     experiment.name="${EXPERIMENT_NAME}" \
     experiment.seed=${SEED} \
@@ -65,7 +65,7 @@ python3 src/train.py \
     scheduler.gamma=0.1 \
     mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
 
-echo "[4/6] Training with cyclic LR (triangular2)..."
+# [4/11] DONE - cyclic (triangular2, default): val/miou=0.406, test/miou=0.439
 python3 src/train.py \
     experiment.name="${EXPERIMENT_NAME}" \
     experiment.seed=${SEED} \
@@ -80,11 +80,10 @@ python3 src/train.py \
     trainer.precision="32" \
     trainer.accumulate_grad_batches=${ACCUM_GRAD} \
     scheduler=cyclic \
-    scheduler.step_size_up=10 \
     scheduler.mode=triangular2 \
     mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
 
-echo "[5/6] Training with one-cycle LR..."
+# [5/11] DONE - one-cycle LR: val/miou=0.250, test/miou=0.264
 python3 src/train.py \
     experiment.name="${EXPERIMENT_NAME}" \
     experiment.seed=${SEED} \
@@ -103,7 +102,7 @@ python3 src/train.py \
     scheduler.pct_start=0.3 \
     mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
 
-echo "[6/6] Training with reduce-on-plateau..."
+# [6/11] DONE - reduce-on-plateau: val/miou=0.350, test/miou=0.395
 python3 src/train.py \
     experiment.name="${EXPERIMENT_NAME}" \
     experiment.seed=${SEED} \
@@ -120,4 +119,101 @@ python3 src/train.py \
     scheduler=plateau \
     scheduler.patience=5 \
     scheduler.factor=0.5 \
+    mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
+
+echo "[7/11] Training with polynomial LR (power=0.9, DeepLab default)..."
+python3 src/train.py \
+    experiment.name="${EXPERIMENT_NAME}" \
+    experiment.seed=${SEED} \
+    model=segnext \
+    model.variant=base \
+    model.learning_rate=${LR} \
+    augmentation=spatial_color_light \
+    data.image_size=${IMAGE_SIZE} \
+    data.batch_size=${BATCH_SIZE} \
+    data.multiclass=true \
+    trainer.max_epochs=${MAX_EPOCHS} \
+    trainer.precision="32" \
+    trainer.accumulate_grad_batches=${ACCUM_GRAD} \
+    scheduler=polynomial \
+    scheduler.power=0.9 \
+    mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
+
+echo "[8/11] Training with polynomial LR (power=1.0, linear decay)..."
+python3 src/train.py \
+    experiment.name="${EXPERIMENT_NAME}" \
+    experiment.seed=${SEED} \
+    model=segnext \
+    model.variant=base \
+    model.learning_rate=${LR} \
+    augmentation=spatial_color_light \
+    data.image_size=${IMAGE_SIZE} \
+    data.batch_size=${BATCH_SIZE} \
+    data.multiclass=true \
+    trainer.max_epochs=${MAX_EPOCHS} \
+    trainer.precision="32" \
+    trainer.accumulate_grad_batches=${ACCUM_GRAD} \
+    scheduler=polynomial \
+    scheduler.power=1.0 \
+    mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
+
+echo "[9/11] Training with cyclic LR (triangular2, max_lr=3e-3, 4 cycles)..."
+python3 src/train.py \
+    experiment.name="${EXPERIMENT_NAME}" \
+    experiment.seed=${SEED} \
+    model=segnext \
+    model.variant=base \
+    model.learning_rate=${LR} \
+    augmentation=spatial_color_light \
+    data.image_size=${IMAGE_SIZE} \
+    data.batch_size=${BATCH_SIZE} \
+    data.multiclass=true \
+    trainer.max_epochs=${MAX_EPOCHS} \
+    trainer.precision="32" \
+    trainer.accumulate_grad_batches=${ACCUM_GRAD} \
+    scheduler=cyclic \
+    scheduler.mode=triangular2 \
+    scheduler.max_lr=3e-3 \
+    scheduler.num_cycles=4 \
+    mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
+
+echo "[10/11] Training with cyclic LR (exp_range, max_lr=2e-3, 3 cycles)..."
+python3 src/train.py \
+    experiment.name="${EXPERIMENT_NAME}" \
+    experiment.seed=${SEED} \
+    model=segnext \
+    model.variant=base \
+    model.learning_rate=${LR} \
+    augmentation=spatial_color_light \
+    data.image_size=${IMAGE_SIZE} \
+    data.batch_size=${BATCH_SIZE} \
+    data.multiclass=true \
+    trainer.max_epochs=${MAX_EPOCHS} \
+    trainer.precision="32" \
+    trainer.accumulate_grad_batches=${ACCUM_GRAD} \
+    scheduler=cyclic \
+    scheduler.mode=exp_range \
+    scheduler.max_lr=2e-3 \
+    scheduler.gamma=0.9999 \
+    scheduler.num_cycles=3 \
+    mlflow.tracking_uri=${MLFLOW_TRACKING_URI}
+
+echo "[11/11] Training with cyclic LR (triangular2, max_lr=1.5e-3, 5 cycles)..."
+python3 src/train.py \
+    experiment.name="${EXPERIMENT_NAME}" \
+    experiment.seed=${SEED} \
+    model=segnext \
+    model.variant=base \
+    model.learning_rate=${LR} \
+    augmentation=spatial_color_light \
+    data.image_size=${IMAGE_SIZE} \
+    data.batch_size=${BATCH_SIZE} \
+    data.multiclass=true \
+    trainer.max_epochs=${MAX_EPOCHS} \
+    trainer.precision="32" \
+    trainer.accumulate_grad_batches=${ACCUM_GRAD} \
+    scheduler=cyclic \
+    scheduler.mode=triangular2 \
+    scheduler.max_lr=1.5e-3 \
+    scheduler.num_cycles=5 \
     mlflow.tracking_uri=${MLFLOW_TRACKING_URI}

@@ -33,8 +33,8 @@ class StepSchedulerConfig(SchedulerConfig):
 class CyclicSchedulerConfig(SchedulerConfig):
     name: str = "cyclic"
     base_lr: float = 1e-6  # min LR
-    max_lr_factor: float = 1.0  # max_lr = learning_rate * max_lr_factor
-    step_size_up: int = 10  # epochs to go from base to max
+    max_lr: float = 1e-3  # max LR
+    num_cycles: int = 3  # number of full cycles
     mode: str = "triangular2"  # triangular, triangular2, exp_range
     gamma: float = 0.99  # decay factor for exp_range mode
 
@@ -46,6 +46,13 @@ class OneCycleSchedulerConfig(SchedulerConfig):
     pct_start: float = 0.3  # fraction of training to increase LR
     div_factor: float = 25.0  # initial_lr = max_lr / div_factor
     final_div_factor: float = 1e4  # final_lr = max_lr / final_div_factor
+
+
+@dataclass
+class PolynomialSchedulerConfig(SchedulerConfig):
+    name: str = "polynomial"
+    power: float = 0.9  # decay power (DeepLab default)
+    total_iters: int | None = None  # if None, uses max_epochs
 
 
 @dataclass
@@ -96,13 +103,23 @@ def create_scheduler(
         )
         return {"scheduler": scheduler, "interval": "epoch", "frequency": 1}
 
+    if name == "polynomial":
+        total_iters = config.total_iters or max_epochs
+        scheduler = lr_scheduler.PolynomialLR(
+            optimizer,
+            total_iters=total_iters,
+            power=config.power,
+        )
+        return {"scheduler": scheduler, "interval": "epoch", "frequency": 1}
+
     if name == "cyclic":
-        max_lr = learning_rate * config.max_lr_factor
+        total_steps = max_epochs * steps_per_epoch
+        step_size_up = total_steps // (2 * config.num_cycles)
         scheduler = lr_scheduler.CyclicLR(
             optimizer,
             base_lr=config.base_lr,
-            max_lr=max_lr,
-            step_size_up=config.step_size_up * steps_per_epoch,
+            max_lr=config.max_lr,
+            step_size_up=step_size_up,
             mode=config.mode,
             gamma=config.gamma if config.mode == "exp_range" else 1.0,
             cycle_momentum=False,

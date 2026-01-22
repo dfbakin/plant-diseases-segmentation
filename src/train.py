@@ -30,6 +30,7 @@ from src.conf.scheduler import (
     CyclicSchedulerConfig,
     OneCycleSchedulerConfig,
     PlateauSchedulerConfig,
+    PolynomialSchedulerConfig,
     SchedulerConfig,
     StepSchedulerConfig,
 )
@@ -111,6 +112,7 @@ def train(cfg: Config) -> float:
         "constant": ConstantSchedulerConfig,
         "cosine": CosineSchedulerConfig,
         "step": StepSchedulerConfig,
+        "polynomial": PolynomialSchedulerConfig,
         "cyclic": CyclicSchedulerConfig,
         "one_cycle": OneCycleSchedulerConfig,
         "plateau": PlateauSchedulerConfig,
