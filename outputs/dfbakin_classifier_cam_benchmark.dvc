@@ -1,0 +1,6 @@
+outs:
+- md5: 0f7fedb99eafa94bf82180941c288a8e.dir
+  size: 1211835759
+  nfiles: 14
+  hash: md5
+  path: dfbakin_classifier_cam_benchmark
