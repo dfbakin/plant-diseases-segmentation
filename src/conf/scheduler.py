@@ -114,12 +114,15 @@ def create_scheduler(
 
     if name == "cyclic":
         total_steps = max_epochs * steps_per_epoch
-        step_size_up = total_steps // (2 * config.num_cycles)
+        steps_per_cycle = total_steps // config.num_cycles
+        step_size_up = steps_per_cycle // 2
+        step_size_down = steps_per_cycle - step_size_up  # Descent absorbs odd remainder
         scheduler = lr_scheduler.CyclicLR(
             optimizer,
             base_lr=config.base_lr,
             max_lr=config.max_lr,
             step_size_up=step_size_up,
+            step_size_down=step_size_down,
             mode=config.mode,
             gamma=config.gamma if config.mode == "exp_range" else 1.0,
             cycle_momentum=False,

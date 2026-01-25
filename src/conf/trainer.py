@@ -33,7 +33,7 @@ class TrainerConfig:
 
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
 
-    log_every_n_steps: int = 10
+    log_every_n_steps: int = 50
 
     val_check_interval: float = 1.0  # Run validation every epoch
     check_val_every_n_epoch: int = 1

@@ -29,6 +29,7 @@ from src.conf.scheduler import (
     OneCycleSchedulerConfig,
     PlateauSchedulerConfig,
     StepSchedulerConfig,
+    PolynomialSchedulerConfig
 )
 from src.conf.trainer import TrainerConfig
 
@@ -132,3 +133,4 @@ def register_configs() -> None:
     cs.store(group="scheduler", name="cyclic", node=CyclicSchedulerConfig)
     cs.store(group="scheduler", name="one_cycle", node=OneCycleSchedulerConfig)
     cs.store(group="scheduler", name="plateau", node=PlateauSchedulerConfig)
+    cs.store(group="scheduler", name="polynomial", node=PolynomialSchedulerConfig)
