@@ -4,7 +4,8 @@ Class Index System:
 - 1-115: PlantSeg diseases (from DISEASE_CLASSES[1:])
 - 116-119: PlantVillage-only diseases (no PlantSeg ground truth)
 """
-from src.data.plantseg import DISEASE_CLASSES, PlantSegDataset
+
+from src.data.plantseg import DISEASE_CLASSES
 
 # PlantVillage-only diseases
 PLANTVILLAGE_ONLY_DISEASES = [

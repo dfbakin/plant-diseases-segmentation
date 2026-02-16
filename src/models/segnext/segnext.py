@@ -44,9 +44,7 @@ class SegNeXt(nn.Module):
         super().__init__()
 
         if variant not in MSCAN_CONFIGS:
-            raise ValueError(
-                f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}"
-            )
+            raise ValueError(f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}")
 
         self.num_classes = num_classes
         self.variant = variant

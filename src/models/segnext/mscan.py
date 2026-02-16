@@ -247,9 +247,7 @@ class MSCAN(nn.Module):
                 nn.init.constant_(m.bias, 0)
                 nn.init.constant_(m.weight, 1.0)
             elif isinstance(m, nn.Conv2d):
-                fan_out = (
-                    m.kernel_size[0] * m.kernel_size[1] * m.out_channels // m.groups
-                )
+                fan_out = m.kernel_size[0] * m.kernel_size[1] * m.out_channels // m.groups
                 nn.init.normal_(m.weight, mean=0, std=math.sqrt(2.0 / fan_out))
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -275,9 +273,7 @@ class MSCAN(nn.Module):
     @classmethod
     def from_variant(cls, variant: MSCANVariant, **kwargs) -> "MSCAN":
         if variant not in MSCAN_CONFIGS:
-            raise ValueError(
-                f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}"
-            )
+            raise ValueError(f"Unknown variant: {variant}. Use one of {list(MSCAN_CONFIGS.keys())}")
         config = MSCAN_CONFIGS[variant].copy()
         config.update(kwargs)
         return cls(**config)

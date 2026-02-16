@@ -49,20 +49,14 @@ def train(cfg: Config) -> float:
     augmentation_name = cfg.augmentation.name
     aug_config_class = get_augmentation_config(augmentation_name)
     aug_config = aug_config_class(
-        **{
-            k: v
-            for k, v in OmegaConf.to_container(cfg.augmentation).items()
-            if k != "name"
-        }
+        **{k: v for k, v in OmegaConf.to_container(cfg.augmentation).items() if k != "name"}
     )
     train_transform = aug_config.build(
         image_size=cfg.data.image_size,
         mean=list(cfg.data.normalization.mean),
         std=list(cfg.data.normalization.std),
     )
-    augmentation_preset = HydraConfig.get().runtime.choices.get(
-        "augmentation", augmentation_name
-    )
+    augmentation_preset = HydraConfig.get().runtime.choices.get("augmentation", augmentation_name)
     log.info(f"Using augmentation preset: {augmentation_preset}")
 
     multiclass = cfg.data.multiclass

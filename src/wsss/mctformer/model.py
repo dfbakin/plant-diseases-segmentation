@@ -1,13 +1,6 @@
 """MCTformer-V2: Multi-Class Token Transformer for weakly-supervised CAM generation.
 
-Ported from the original MCTformer repository to modern Python / PyTorch / timm.
-Changes from original:
-- Replaced `timm.models.registry.register_model` with `timm.models.register_model`
-- Replaced `timm.models.helpers.load_pretrained` (removed in modern timm)
-- Replaced hardcoded `.cuda()` with device-agnostic code
-- Removed debug print statements
-- Merged vision_transformer.py and models.py into a single file
-- Added type hints and docstrings
+Ported from https://github.com/xulianuwa/MCTformer to modern Python 3.12 / timm >= 1.0.
 """
 
 import math
@@ -17,11 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath, to_2tuple, trunc_normal_
-
-
-# ---------------------------------------------------------------------------
-# Building blocks (from vision_transformer.py)
-# ---------------------------------------------------------------------------
 
 
 class Mlp(nn.Module):
@@ -79,9 +67,7 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
         qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, C // self.num_heads)
-            .permute(2, 0, 3, 1, 4)
+            self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv[0], qkv[1], qkv[2]
 
@@ -168,11 +154,6 @@ class PatchEmbed(nn.Module):
         return x
 
 
-# ---------------------------------------------------------------------------
-# Base VisionTransformer (from vision_transformer.py)
-# ---------------------------------------------------------------------------
-
-
 class VisionTransformer(nn.Module):
     """Custom Vision Transformer with attention weight output.
 
@@ -252,9 +233,7 @@ class VisionTransformer(nn.Module):
     def no_weight_decay(self) -> set[str]:
         return {"pos_embed", "cls_token"}
 
-    def forward_features(
-        self, x: torch.Tensor, n: int
-    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    def forward_features(self, x: torch.Tensor, n: int) -> tuple[torch.Tensor, list[torch.Tensor]]:
         B, nc, w, h = x.shape
         x = self.patch_embed(x)
 
@@ -272,9 +251,7 @@ class VisionTransformer(nn.Module):
         x = self.norm(x)
         return x[:, 0], attn_weights
 
-    def interpolate_pos_encoding(
-        self, x: torch.Tensor, w: int, h: int
-    ) -> torch.Tensor:
+    def interpolate_pos_encoding(self, x: torch.Tensor, w: int, h: int) -> torch.Tensor:
         npatch = x.shape[1] - 1
         N = self.pos_embed.shape[1] - 1
         if npatch == N and w == h:
@@ -308,11 +285,6 @@ class VisionTransformer(nn.Module):
             return x_out, attn_weights
 
 
-# ---------------------------------------------------------------------------
-# MCTformerPlus (from models.py)
-# ---------------------------------------------------------------------------
-
-
 class MCTformerPlus(VisionTransformer):
     """MCTformer-V2: Multi-Class Token Transformer.
 
@@ -336,9 +308,7 @@ class MCTformerPlus(VisionTransformer):
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
-        self.head = nn.Conv2d(
-            self.embed_dim, self.num_classes, kernel_size=3, stride=1, padding=1
-        )
+        self.head = nn.Conv2d(self.embed_dim, self.num_classes, kernel_size=3, stride=1, padding=1)
         self.head.apply(self._init_weights)
 
         img_size = to_2tuple(input_size)
@@ -346,7 +316,6 @@ class MCTformerPlus(VisionTransformer):
         num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
         self.num_patches = num_patches
 
-        # Override cls_token: one per class instead of single [CLS]
         self.cls_token = nn.Parameter(torch.zeros(1, self.num_classes, self.embed_dim))
         self.pos_embed_cls = nn.Parameter(torch.zeros(1, self.num_classes, self.embed_dim))
         self.pos_embed_pat = nn.Parameter(torch.zeros(1, num_patches, self.embed_dim))
@@ -355,13 +324,14 @@ class MCTformerPlus(VisionTransformer):
         trunc_normal_(self.pos_embed_cls, std=0.02)
         trunc_normal_(self.pos_embed_pat, std=0.02)
 
+        if hasattr(self, "pos_embed"):
+            del self.pos_embed
+
         self.decay_parameter = decay_parameter
 
-    def interpolate_pos_encoding(
-        self, x: torch.Tensor, w: int, h: int
-    ) -> torch.Tensor:
+    def interpolate_pos_encoding(self, x: torch.Tensor, w: int, h: int) -> torch.Tensor:
         """Interpolate patch positional embeddings for variable input sizes."""
-        npatch = x.shape[1] - self.num_classes
+        npatch = x.shape[1]  # x is pure patch embeddings (cls tokens not yet added)
         N = self.num_patches
         if npatch == N and w == h:
             return self.pos_embed_pat
@@ -428,10 +398,7 @@ class MCTformerPlus(VisionTransformer):
         return_att: bool = False,
         n_layers: int = 12,
         attention_type: str = "fused",
-    ) -> (
-        list[torch.Tensor]
-        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-    ):
+    ) -> list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward pass.
 
         Args:
@@ -459,14 +426,9 @@ class MCTformerPlus(VisionTransformer):
         x_patch = x_patch.permute([0, 3, 1, 2]).contiguous()
         x_patch = self.head(x_patch)
 
-        x_patch_flattened = x_patch.view(x_patch.shape[0], x_patch.shape[1], -1).permute(
-            0, 2, 1
-        )
+        x_patch_flattened = x_patch.view(x_patch.shape[0], x_patch.shape[1], -1).permute(0, 2, 1)
 
-        sorted_patch_token, _indices = torch.sort(
-            x_patch_flattened, -2, descending=True
-        )
-        # Device-agnostic weight generation (original used .cuda())
+        sorted_patch_token, _indices = torch.sort(x_patch_flattened, -2, descending=True)
         weights = torch.logspace(
             start=0,
             end=x_patch_flattened.size(-2) - 1,
@@ -475,9 +437,7 @@ class MCTformerPlus(VisionTransformer):
             device=x_patch_flattened.device,
         )
         x_patch_logits = (
-            torch.sum(
-                sorted_patch_token * weights.unsqueeze(0).unsqueeze(-1), dim=-2
-            )
+            torch.sum(sorted_patch_token * weights.unsqueeze(0).unsqueeze(-1), dim=-2)
             / weights.sum()
         )
 
@@ -486,16 +446,17 @@ class MCTformerPlus(VisionTransformer):
         if not return_att:
             return [x_cls_logits, torch.stack(all_x_cls), x_patch_logits]
 
-        # --- CAM generation mode ---
-        feature_map = x_patch.detach().clone()  # B * C * h * w
+        feature_map = x_patch.detach().clone()
         feature_map = F.relu(feature_map)
         n, c, fh, fw = feature_map.shape
 
-        attn_stack = torch.stack(attn_weights)  # depth * B * H * N * N
-        attn_stack = torch.mean(attn_stack, dim=2)  # depth * B * N * N
-        mtatt = attn_stack[-n_layers:].mean(0)[
-            :, 0 : self.num_classes, self.num_classes :
-        ].reshape([n, c, fh, fw])
+        attn_stack = torch.stack(attn_weights)
+        attn_stack = torch.mean(attn_stack, dim=2)
+        mtatt = (
+            attn_stack[-n_layers:]
+            .mean(0)[:, 0 : self.num_classes, self.num_classes :]
+            .reshape([n, c, fh, fw])
+        )
         patch_attn = attn_stack[:, :, self.num_classes :, self.num_classes :]
 
         if attention_type == "fused":
@@ -510,11 +471,6 @@ class MCTformerPlus(VisionTransformer):
 
         x_logits = (x_cls_logits + x_patch_logits) / 2
         return x_logits, cams, patch_attn
-
-
-# ---------------------------------------------------------------------------
-# Factory function
-# ---------------------------------------------------------------------------
 
 
 def create_mctformer_v2(
@@ -555,7 +511,17 @@ def create_mctformer_v2(
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         if "model" in state:
             state = state["model"]
-        # Handle position embedding size mismatch via interpolation
+        # Checkpoint uses combined pos_embed [1, num_classes+num_patches, D].
+        # Split into pos_embed_cls and pos_embed_pat for this model.
+        if "pos_embed" in state and "pos_embed_cls" not in state:
+            combined = state.pop("pos_embed")
+            state["pos_embed_cls"] = combined[:, :num_classes, :]
+            state["pos_embed_pat"] = combined[:, num_classes:, :]
+        # Filter out keys with shape mismatches
+        model_state = model.state_dict()
+        state = {
+            k: v for k, v in state.items() if k in model_state and v.shape == model_state[k].shape
+        }
         model.load_state_dict(state, strict=False)
     elif pretrained:
         # Load DeiT-small pretrained weights (ImageNet)
@@ -565,14 +531,39 @@ def create_mctformer_v2(
             check_hash=True,
         )["model"]
         model_dict = model.state_dict()
-        # Remove keys with shape mismatch
+        # Remove head keys with shape mismatch
         for k in ["head.weight", "head.bias", "head_dist.weight", "head_dist.bias"]:
             if k in checkpoint and checkpoint[k].shape != model_dict.get(k, torch.empty(0)).shape:
                 del checkpoint[k]
+
+        # Replicate DeiT single cls_token → num_classes class tokens
+        if "cls_token" in checkpoint:
+            checkpoint["cls_token"] = checkpoint["cls_token"].repeat(1, num_classes, 1)
+
+        # Interpolate DeiT pos_embed to MCTformer split format
+        if "pos_embed" in checkpoint:
+            pos_embed_ckpt = checkpoint.pop("pos_embed")
+            embed_dim = pos_embed_ckpt.shape[-1]
+            # DeiT has 1 cls token + patch tokens
+            cls_pos = pos_embed_ckpt[:, :1, :].repeat(1, num_classes, 1)
+            pat_pos = pos_embed_ckpt[:, 1:, :]
+            orig_size = int(pat_pos.shape[1] ** 0.5)
+            target_size = input_size // 16
+
+            if orig_size != target_size:
+                pat_pos = pat_pos.reshape(1, orig_size, orig_size, embed_dim).permute(0, 3, 1, 2)
+                pat_pos = torch.nn.functional.interpolate(
+                    pat_pos, size=(target_size, target_size), mode="bicubic", align_corners=False
+                )
+                pat_pos = pat_pos.permute(0, 2, 3, 1).flatten(1, 2)
+
+            checkpoint["pos_embed_cls"] = cls_pos
+            checkpoint["pos_embed_pat"] = pat_pos
+
         pretrained_dict = {
             k: v
             for k, v in checkpoint.items()
-            if k in model_dict and k not in ["cls_token", "pos_embed"]
+            if k in model_dict and v.shape == model_dict[k].shape
         }
         model_dict.update(pretrained_dict)
         model.load_state_dict(model_dict)

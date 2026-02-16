@@ -1,8 +1,4 @@
-"""Attention-based CAM generation for MCTformer.
-
-Extracted from MCTformer's engine.py `generate_attention_maps_ms` function,
-refactored as a reusable class.
-"""
+"""Attention-based CAM generation for MCTformer (from engine.py)."""
 
 import logging
 from pathlib import Path
@@ -88,9 +84,7 @@ class MCTformerCAMGenerator:
             if self.patch_attn_refine:
                 cls_attentions = torch.matmul(
                     patch_attn.unsqueeze(1),
-                    cls_attentions.view(
-                        cls_attentions.shape[0], cls_attentions.shape[1], -1, 1
-                    ),
+                    cls_attentions.view(cls_attentions.shape[0], cls_attentions.shape[1], -1, 1),
                 ).reshape(
                     cls_attentions.shape[0],
                     cls_attentions.shape[1],
@@ -105,23 +99,19 @@ class MCTformerCAMGenerator:
                 align_corners=False,
             )[0]
             cls_attentions = (
-                cls_attentions.cpu().numpy()
-                * target.view(num_classes, 1, 1).cpu().numpy()
+                cls_attentions.cpu().numpy() * target.view(num_classes, 1, 1).cpu().numpy()
             )
 
-            # Odd indices are flipped versions
             if s % 2 == 1:
                 cls_attentions = np.flip(cls_attentions, axis=-1)
             cam_list.append(cls_attentions)
 
         sum_cam = np.sum(cam_list, axis=0)
 
-        # Build per-class CAM dict
         cam_dict: dict[int, np.ndarray] = {}
         for cls_ind in range(num_classes):
             if target[cls_ind] > 0:
                 cls_cam = sum_cam[cls_ind]
-                # Min-max normalize
                 cls_cam = (cls_cam - cls_cam.min()) / (cls_cam.max() - cls_cam.min() + 1e-8)
                 cam_dict[cls_ind] = cls_cam
 
@@ -168,7 +158,6 @@ class MCTformerCAMGenerator:
                 np.save(str(output_dir / f"{img_name}.npy"), cam_dict)
 
                 if visualize and vis_dir is not None:
-                    # Denormalize first image for visualization
                     img_tensor = image_list[0][0]
                     img_np = img_tensor.permute(1, 2, 0).cpu().numpy()
                     img_np = np.zeros_like(img_np)
@@ -177,16 +166,12 @@ class MCTformerCAMGenerator:
                     img_np = img_np.clip(0, 255).astype(np.uint8)
 
                     for cls_ind, cam in cam_dict.items():
-                        _save_cam_visualization(
-                            img_np, cam, vis_dir / f"{img_name}_{cls_ind}.png"
-                        )
+                        _save_cam_visualization(img_np, cam, vis_dir / f"{img_name}_{cls_ind}.png")
 
         log.info(f"Generated CAMs for {index} images -> {output_dir}")
 
 
-def _save_cam_visualization(
-    img: np.ndarray, cam: np.ndarray, save_path: Path
-) -> None:
+def _save_cam_visualization(img: np.ndarray, cam: np.ndarray, save_path: Path) -> None:
     """Overlay CAM heatmap on image and save."""
     img_float = np.float32(img) / 255.0
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)

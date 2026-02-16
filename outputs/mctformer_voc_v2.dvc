@@ -1,0 +1,6 @@
+outs:
+- md5: 9d44081f8e80dbbe0bf2016141a86ba4.dir
+  size: 527768777
+  nfiles: 3
+  hash: md5
+  path: mctformer_voc_v2

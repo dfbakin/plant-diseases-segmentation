@@ -459,7 +459,6 @@ def get_augmentation_config(name: str) -> type[AugmentationConfig]:
     """Get augmentation config class by name."""
     if name not in AUGMENTATION_REGISTRY:
         raise ValueError(
-            f"Unknown augmentation: {name}. "
-            f"Available: {list(AUGMENTATION_REGISTRY.keys())}"
+            f"Unknown augmentation: {name}. Available: {list(AUGMENTATION_REGISTRY.keys())}"
         )
     return AUGMENTATION_REGISTRY[name]

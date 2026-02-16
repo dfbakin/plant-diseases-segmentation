@@ -25,9 +25,7 @@ def get_train_transforms(
             # Color (preserve disease coloration patterns)
             A.OneOf(
                 [
-                    A.RandomBrightnessContrast(
-                        brightness_limit=0.2, contrast_limit=0.2, p=1.0
-                    ),
+                    A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
                     A.HueSaturationValue(
                         hue_shift_limit=10,
                         sat_shift_limit=20,
@@ -87,9 +85,7 @@ def get_strong_augment_transforms(
             A.RandomGamma(gamma_limit=(80, 120), p=0.5),
             A.GaussNoise(var_limit=(10.0, 50.0), p=0.4),
             A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-            A.CoarseDropout(
-                max_holes=8, max_height=32, max_width=32, fill_value=0, p=0.3
-            ),
+            A.CoarseDropout(max_holes=8, max_height=32, max_width=32, fill_value=0, p=0.3),
             A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ]

@@ -242,9 +242,7 @@ class LightHamHead(nn.Module):
         self.align_corners = align_corners
 
         self.squeeze = ConvBNReLU(sum(in_channels), ham_channels, kernel_size=1)
-        self.hamburger = Hamburger(
-            ham_channels, md_r, train_steps, eval_steps, num_groups
-        )
+        self.hamburger = Hamburger(ham_channels, md_r, train_steps, eval_steps, num_groups)
         self.align = ConvBNReLU(ham_channels, channels, kernel_size=1)
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else None
         self.conv_seg = nn.Conv2d(channels, num_classes, kernel_size=1)

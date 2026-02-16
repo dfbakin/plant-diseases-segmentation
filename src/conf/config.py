@@ -102,9 +102,7 @@ def register_configs() -> None:
     cs.store(group="augmentation", name="spatial_light", node=SpatialLightAugConfig)
     cs.store(group="augmentation", name="spatial_heavy", node=SpatialHeavyAugConfig)
     cs.store(group="augmentation", name="color_natural", node=ColorNaturalAugConfig)
-    cs.store(
-        group="augmentation", name="artificial_color", node=ArtificialColorAugConfig
-    )
+    cs.store(group="augmentation", name="artificial_color", node=ArtificialColorAugConfig)
     cs.store(group="augmentation", name="noise_blur", node=NoiseBlurAugConfig)
     cs.store(group="augmentation", name="natural_color", node=NaturalColorAugConfig)
     cs.store(

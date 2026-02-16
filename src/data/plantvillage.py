@@ -14,16 +14,16 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
 
-from src.data.plantseg import DISEASE_CLASSES, PlantSegDataset
+from src.data.plantseg import PlantSegDataset
 from src.data.plantvillage_mappings import (
     CLASSIFICATION_CLASSES,
     DISEASE_TO_CLASS_IDX,
+    EXCLUDED_FOLDERS,
     NUM_CLASSIFICATION_CLASSES,
     PLANTVILLAGE_FOLDER_TO_CLASS,
     PLANTVILLAGE_FOLDER_TO_PLANT,
-    EXCLUDED_FOLDERS,
-    PLANTVILLAGE_FOLDER_TO_PLANT,
 )
+
 
 class PlantVillageDataset(Dataset):
     """PlantVillage dataset for classification with PlantSeg-compatible indices.
@@ -65,7 +65,7 @@ class PlantVillageDataset(Dataset):
 
         self.samples = self._collect_samples()
         self._class_counts: np.ndarray | None = None
-    
+
     def _collect_samples(self) -> list[dict]:
         all_samples = []
 
@@ -142,7 +142,7 @@ class PlantVillageDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
-    
+
         image = cv2.cvtColor(cv2.imread(str(sample["image_path"])), cv2.COLOR_BGR2RGB)
 
         if image.ndim == 2:
@@ -208,9 +208,7 @@ class PlantVillageDataset(Dataset):
             Array of shape (len(self),) with weight for each sample.
         """
         class_weights = self.get_class_weights()
-        sample_weights = np.array(
-            [class_weights[sample["label"]] for sample in self.samples]
-        )
+        sample_weights = np.array([class_weights[sample["label"]] for sample in self.samples])
         return sample_weights
 
     @property
@@ -364,9 +362,7 @@ class PlantSegClassificationDataset(Dataset):
     def get_sample_weights(self) -> np.ndarray:
         """Per-sample weights for WeightedRandomSampler."""
         class_weights = self.get_class_weights()
-        sample_weights = np.array(
-            [class_weights[sample["label"]] for sample in self.samples]
-        )
+        sample_weights = np.array([class_weights[sample["label"]] for sample in self.samples])
         return sample_weights
 
     @property
@@ -380,8 +376,7 @@ def get_combined_class_weights(
 ) -> np.ndarray:
     """Compute class weights from combined datasets."""
     combined_counts = (
-        plantvillage_dataset.get_class_counts()
-        + plantseg_dataset.get_class_counts()
+        plantvillage_dataset.get_class_counts() + plantseg_dataset.get_class_counts()
     ).astype(np.float64)
 
     combined_counts = np.maximum(combined_counts, 1.0)
@@ -396,11 +391,7 @@ def get_combined_sample_weights(
     """Compute per-sample weights for combined datasets."""
     class_weights = get_combined_class_weights(plantvillage_dataset, plantseg_dataset)
 
-    pv_weights = np.array(
-        [class_weights[s["label"]] for s in plantvillage_dataset.samples]
-    )
-    ps_weights = np.array(
-        [class_weights[s["label"]] for s in plantseg_dataset.samples]
-    )
+    pv_weights = np.array([class_weights[s["label"]] for s in plantvillage_dataset.samples])
+    ps_weights = np.array([class_weights[s["label"]] for s in plantseg_dataset.samples])
 
     return np.concatenate([pv_weights, ps_weights])

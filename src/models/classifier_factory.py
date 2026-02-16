@@ -1,7 +1,4 @@
-"""Factory for creating classification models.
-
-Supports ResNet and EfficientNet from torchvision with pretrained weights.
-"""
+"""Factory for creating classification models."""
 
 from typing import Literal
 
@@ -23,9 +20,19 @@ from torchvision.models import (
 )
 
 ClassifierName = Literal[
-    "resnet18", "resnet34", "resnet50", "resnet101",
-    "efficientnet_b0", "efficientnet_b1", "efficientnet_b2", "efficientnet_b3",
-    "efficientnet_b4", "efficientnet_b5", "efficientnet_b6", "efficientnet_b7",
+    "resnet18",
+    "resnet34",
+    "resnet50",
+    "resnet101",
+    "efficientnet_b0",
+    "efficientnet_b1",
+    "efficientnet_b2",
+    "efficientnet_b3",
+    "efficientnet_b4",
+    "efficientnet_b5",
+    "efficientnet_b6",
+    "efficientnet_b7",
+    "mctformer_v2",
 ]
 
 RESNET_WEIGHTS = {
@@ -51,6 +58,7 @@ def create_classifier(
     name: ClassifierName,
     num_classes: int,
     pretrained: bool = True,
+    **kwargs,
 ) -> nn.Module:
     """Create a classification model.
 
@@ -58,6 +66,7 @@ def create_classifier(
         name: Model architecture name
         num_classes: Number of output classes
         pretrained: Use ImageNet pretrained weights
+        **kwargs: Model-specific arguments (e.g. input_size for MCTformer)
 
     Returns:
         Model with replaced classification head
@@ -68,6 +77,8 @@ def create_classifier(
         return _create_resnet(name, num_classes, pretrained)
     elif name.startswith("efficientnet"):
         return _create_efficientnet(name, num_classes, pretrained)
+    elif name == "mctformer_v2":
+        return _create_mctformer(num_classes, pretrained, **kwargs)
     else:
         raise ValueError(f"Unknown classifier: {name}")
 
@@ -94,3 +105,8 @@ def _create_efficientnet(name: str, num_classes: int, pretrained: bool) -> nn.Mo
 
     return model
 
+
+def _create_mctformer(num_classes: int, pretrained: bool, **kwargs) -> nn.Module:
+    from src.wsss.mctformer.model import create_mctformer_v2
+
+    return create_mctformer_v2(num_classes=num_classes, pretrained=pretrained, **kwargs)

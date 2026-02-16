@@ -79,9 +79,7 @@ class PlantSegDataset(Dataset):
         if metadata_path.exists():
             split_name = {"train": "Training", "val": "Validation", "test": "Test"}
             self.metadata = pd.read_csv(metadata_path)
-            self.metadata = self.metadata[
-                self.metadata["Split"] == split_name.get(split, split)
-            ]
+            self.metadata = self.metadata[self.metadata["Split"] == split_name.get(split, split)]
         else:
             self.metadata = None
 
@@ -116,9 +114,7 @@ class PlantSegDataset(Dataset):
         sample = self.samples[idx]
 
         image = cv2.cvtColor(cv2.imread(str(sample["image_path"])), cv2.COLOR_BGR2RGB)
-        mask = (cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE) > 0).astype(
-            np.int64
-        )
+        mask = (cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE) > 0).astype(np.int64)
 
         if self.transform:
             transformed = self.transform(image=image, mask=mask)
@@ -136,9 +132,7 @@ class PlantSegDataset(Dataset):
         class_counts = np.zeros(self.NUM_CLASSES, dtype=np.float64)
 
         for sample in self.samples:
-            mask = (
-                cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE) > 0
-            ).astype(np.int64)
+            mask = (cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE) > 0).astype(np.int64)
             unique, counts = np.unique(mask, return_counts=True)
             for cls, cnt in zip(unique, counts):
                 if cls < self.NUM_CLASSES:
@@ -162,9 +156,7 @@ class PlantSegMulticlassDataset(PlantSegDataset):
         sample = self.samples[idx]
 
         image = cv2.cvtColor(cv2.imread(str(sample["image_path"])), cv2.COLOR_BGR2RGB)
-        mask = cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE).astype(
-            np.int64
-        )
+        mask = cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE).astype(np.int64)
 
         if self.transform:
             transformed = self.transform(image=image, mask=mask)
@@ -182,9 +174,7 @@ class PlantSegMulticlassDataset(PlantSegDataset):
         class_counts = np.zeros(self.NUM_CLASSES, dtype=np.float64)
 
         for sample in self.samples:
-            mask = cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE).astype(
-                np.int64
-            )
+            mask = cv2.imread(str(sample["mask_path"]), cv2.IMREAD_GRAYSCALE).astype(np.int64)
             unique, counts = np.unique(mask, return_counts=True)
             for cls, cnt in zip(unique, counts):
                 if cls < self.NUM_CLASSES:

@@ -5,5 +5,3 @@ to modern Python 3.12 / timm >= 1.0.
 """
 
 from src.wsss.mctformer.model import MCTformerPlus, create_mctformer_v2
-
-__all__ = ["MCTformerPlus", "create_mctformer_v2"]

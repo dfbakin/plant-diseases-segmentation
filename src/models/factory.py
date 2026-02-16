@@ -25,9 +25,7 @@ def create_model(
     name = name.lower()
 
     if name == "deeplabv3plus":
-        return _create_deeplabv3plus(
-            num_classes, encoder_name, encoder_weights, **kwargs
-        )
+        return _create_deeplabv3plus(num_classes, encoder_name, encoder_weights, **kwargs)
     elif name == "unet":
         return _create_unet(num_classes, encoder_name, encoder_weights, **kwargs)
     elif name == "segformer":
@@ -77,9 +75,7 @@ def _create_segformer(
     """SegFormer via HuggingFace transformers. Variants: b0-b5."""
     from src.models.segformer import SegFormerWrapper
 
-    return SegFormerWrapper(
-        num_classes=num_classes, variant=variant, pretrained=pretrained
-    )
+    return SegFormerWrapper(num_classes=num_classes, variant=variant, pretrained=pretrained)
 
 
 def _create_segnext(
@@ -97,9 +93,7 @@ def _create_segnext(
     """
     from src.models.segnext import SegNeXt, load_pretrained_mscan
 
-    model = SegNeXt(
-        num_classes=num_classes, variant=variant, use_stage_0=use_stage_0, **kwargs
-    )
+    model = SegNeXt(num_classes=num_classes, variant=variant, use_stage_0=use_stage_0, **kwargs)
 
     if pretrained:
         load_pretrained_mscan(

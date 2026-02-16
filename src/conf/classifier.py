@@ -54,6 +54,35 @@ class CAMConfig:
 
 
 @dataclass
+class MCTformerModelConfig:
+    name: str = "mctformer_v2"
+    pretrained: bool = True
+    checkpoint_path: str | None = None
+    input_size: int = 448
+    learning_rate: float = 5e-4
+    weight_decay: float = 0.05
+    label_smoothing: float = 0.1
+    drop_path_rate: float = 0.1
+    num_classes: int = 20
+    n_layers: int = 3
+    attention_type: str = "fused"
+    patch_attn_refine: bool = True
+
+
+@dataclass
+class VOCDataConfig:
+    root: str = "data/VOC2012"
+    train_split: str = "train_aug_id"
+    val_split: str = "val"
+    image_size: int = 448
+    batch_size: int = 32
+    num_workers: int = 8
+    pin_memory: bool = True
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+
+@dataclass
 class ClassifierConfig:
     defaults: list[Any] = field(
         default_factory=lambda: [
@@ -94,3 +123,5 @@ def register_classifier_configs() -> None:
     cs.store(group="augmentation", name="spatial_color_light", node=SpatialColorLightAugConfig)
     cs.store(group="augmentation", name="full", node=FullAugConfig)
 
+    cs.store(group="model", name="mctformer_v2", node=MCTformerModelConfig)
+    cs.store(group="data", name="voc", node=VOCDataConfig)

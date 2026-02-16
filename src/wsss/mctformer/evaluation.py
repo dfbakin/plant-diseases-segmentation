@@ -1,7 +1,4 @@
-"""CAM evaluation: mIoU computation for .npy CAM files against GT masks.
-
-Ported from MCTformer's evaluation.py with cleaner interface and type hints.
-"""
+"""CAM evaluation: mIoU computation for CAM/mask files against GT masks."""
 
 import logging
 from pathlib import Path
@@ -12,9 +9,27 @@ from PIL import Image
 log = logging.getLogger(__name__)
 
 VOC_CATEGORIES = [
-    "background", "aeroplane", "bicycle", "bird", "boat", "bottle",
-    "bus", "car", "cat", "chair", "cow", "diningtable", "dog", "horse",
-    "motorbike", "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor",
+    "background",
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "diningtable",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "pottedplant",
+    "sheep",
+    "sofa",
+    "train",
+    "tvmonitor",
 ]
 
 
@@ -69,7 +84,7 @@ def evaluate_cam_miou(
 
         gt_file = gt_dir / f"{name}.png"
         gt = np.array(Image.open(gt_file))
-        cal = gt < 255  # Ignore void pixels
+        cal = gt < 255
 
         mask = (predict == gt) * cal
 
@@ -126,7 +141,6 @@ def evaluate_cam_threshold_sweep(
             best_miou = miou
             best_thr = t
         else:
-            # Early stop: mIoU started decreasing
             break
 
     log.info(f"Best threshold={best_thr:.2f}  mIoU={best_miou:.3f}%")

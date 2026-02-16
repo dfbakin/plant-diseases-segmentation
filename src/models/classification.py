@@ -10,9 +10,9 @@ import torchmetrics
 
 from src.metrics.cam_evaluation import (
     CAMEvaluator,
+    CAMMethod,
     CAMMetricsAccumulator,
     get_target_layer,
-    CAMMethod,
 )
 
 
@@ -31,6 +31,9 @@ class ClassificationModule(L.LightningModule):
         weight_decay: float = 1e-4,
         class_weights: torch.Tensor | None = None,
         label_smoothing: float = 0.0,
+        multi_label: bool = False,
+        warmup_epochs: int = 0,
+        min_lr: float = 1e-5,
         # CAM evaluation settings
         model_name: str | None = None,
         cam_method: CAMMethod = "gradcam",
@@ -43,6 +46,9 @@ class ClassificationModule(L.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.label_smoothing = label_smoothing
+        self.multi_label = multi_label
+        self.warmup_epochs = warmup_epochs
+        self.min_lr = min_lr
         self.model_name = model_name
         self.enable_cam_eval = enable_cam_eval
 
@@ -52,12 +58,22 @@ class ClassificationModule(L.LightningModule):
             self.class_weights = None
 
         # Classification metrics
-        metric_args = {"task": "multiclass", "num_classes": num_classes}
-        self.train_acc = torchmetrics.Accuracy(**metric_args)
-        self.val_acc = torchmetrics.Accuracy(**metric_args)
-        self.val_f1 = torchmetrics.F1Score(**metric_args, average="macro")
-        self.test_acc = torchmetrics.Accuracy(**metric_args)
-        self.test_f1 = torchmetrics.F1Score(**metric_args, average="macro")
+        if multi_label:
+            self.criterion = nn.MultiLabelSoftMarginLoss()
+            _MAP = torchmetrics.classification.MultilabelAveragePrecision
+            self.train_mAP = _MAP(num_labels=num_classes)
+            self.val_mAP = _MAP(num_labels=num_classes)
+            self.test_mAP = _MAP(num_labels=num_classes)
+        else:
+            metric_args = {
+                "task": "multiclass",
+                "num_classes": num_classes,
+            }
+            self.train_acc = torchmetrics.Accuracy(**metric_args)
+            self.val_acc = torchmetrics.Accuracy(**metric_args)
+            self.val_f1 = torchmetrics.F1Score(**metric_args, average="macro")
+            self.test_acc = torchmetrics.Accuracy(**metric_args)
+            self.test_f1 = torchmetrics.F1Score(**metric_args, average="macro")
 
         # CAM evaluation (lazy initialization)
         self._cam_evaluator: CAMEvaluator | None = None
@@ -85,9 +101,22 @@ class ClassificationModule(L.LightningModule):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-    def compute_loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def compute_loss(
+        self,
+        output: torch.Tensor | list,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.multi_label:
+            if isinstance(output, list):
+                cls_logits, all_cls_emb, patch_logits = output
+                loss = self.criterion(cls_logits, target)
+                for embed in all_cls_emb:
+                    loss = loss + 0.1 * self.criterion(embed.mean(-1), target)
+                loss = loss + self.criterion(patch_logits, target)
+                return loss
+            return self.criterion(output, target)
         return F.cross_entropy(
-            logits,
+            output,
             target.long(),
             weight=self.class_weights,
             label_smoothing=self.label_smoothing,
@@ -95,44 +124,76 @@ class ClassificationModule(L.LightningModule):
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
         images, labels = batch["image"], batch["label"]
-        logits = self(images)
-        loss = self.compute_loss(logits, labels)
+        output = self(images)
+        loss = self.compute_loss(output, labels)
 
-        # Detach predictions to prevent holding computation graph in metrics
-        preds = logits.detach().argmax(dim=1)
-        self.train_acc.update(preds, labels)
+        if self.multi_label:
+            logits = output[0] if isinstance(output, list) else output
+            self.train_mAP.update(torch.sigmoid(logits.detach()), labels.int())
+        else:
+            preds = output.detach().argmax(dim=1)
+            self.train_acc.update(preds, labels)
 
-        self.log("train/loss", loss.detach(), prog_bar=True, on_step=True, on_epoch=True, batch_size=images.size(0))
+        self.log(
+            "train/loss",
+            loss.detach(),
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+            batch_size=images.size(0),
+        )
         return loss
 
     def on_train_epoch_start(self) -> None:
-        # Ensure CAM hooks are released before training (they may be active from validation sanity check)
+        # Release CAM hooks before training (may be active from val sanity check)
         if self._cam_evaluator is not None:
             self._cam_evaluator.cam.activations_and_grads.release()
             self._cam_evaluator = None
 
     def on_train_epoch_end(self) -> None:
-        self.log("train/acc", self.train_acc.compute(), prog_bar=True)
-        self.train_acc.reset()
+        if self.multi_label:
+            self.log(
+                "train/mAP",
+                self.train_mAP.compute(),
+                prog_bar=True,
+            )
+            self.train_mAP.reset()
+        else:
+            self.log(
+                "train/acc",
+                self.train_acc.compute(),
+                prog_bar=True,
+            )
+            self.train_acc.reset()
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         images, labels = batch["image"], batch["label"]
-        logits = self(images)
-        loss = self.compute_loss(logits, labels)
+        output = self(images)
 
-        preds = logits.detach().argmax(dim=1)
-        self.val_acc.update(preds, labels)
-        self.val_f1.update(preds, labels)
+        if self.multi_label:
+            logits = output[0] if isinstance(output, list) else output
+            loss = self.compute_loss(logits, labels)
+            self.val_mAP.update(torch.sigmoid(logits.detach()), labels.int())
+        else:
+            logits = output
+            loss = self.compute_loss(logits, labels)
+            preds = logits.detach().argmax(dim=1)
+            self.val_acc.update(preds, labels)
+            self.val_f1.update(preds, labels)
 
-        self.log("val/loss", loss.detach(), prog_bar=True, on_epoch=True, batch_size=images.size(0))
+        self.log(
+            "val/loss",
+            loss.detach(),
+            prog_bar=True,
+            on_epoch=True,
+            batch_size=images.size(0),
+        )
 
         # CAM evaluation for samples with GT masks
         if self.enable_cam_eval and "mask" in batch:
             self._evaluate_cam_batch(batch, self.val_cam_metrics)
 
-    def _evaluate_cam_batch(
-        self, batch: dict, accumulator: CAMMetricsAccumulator
-    ) -> None:
+    def _evaluate_cam_batch(self, batch: dict, accumulator: CAMMetricsAccumulator) -> None:
         """Evaluate CAM quality for a batch with GT masks."""
         images = batch["image"]
         labels = batch["label"]
@@ -161,10 +222,18 @@ class ClassificationModule(L.LightningModule):
         del cams
 
     def on_validation_epoch_end(self) -> None:
-        self.log("val/acc", self.val_acc.compute(), prog_bar=True)
-        self.log("val/f1", self.val_f1.compute())
-        self.val_acc.reset()
-        self.val_f1.reset()
+        if self.multi_label:
+            self.log(
+                "val/mAP",
+                self.val_mAP.compute(),
+                prog_bar=True,
+            )
+            self.val_mAP.reset()
+        else:
+            self.log("val/acc", self.val_acc.compute(), prog_bar=True)
+            self.log("val/f1", self.val_f1.compute())
+            self.val_acc.reset()
+            self.val_f1.reset()
 
         # Log CAM metrics
         if self.enable_cam_eval and self.val_cam_metrics.count > 0:
@@ -189,24 +258,39 @@ class ClassificationModule(L.LightningModule):
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
         images, labels = batch["image"], batch["label"]
-        logits = self(images)
-        loss = self.compute_loss(logits, labels)
+        output = self(images)
 
-        preds = logits.detach().argmax(dim=1)
-        self.test_acc.update(preds, labels)
-        self.test_f1.update(preds, labels)
+        if self.multi_label:
+            logits = output[0] if isinstance(output, list) else output
+            loss = self.compute_loss(logits, labels)
+            self.test_mAP.update(torch.sigmoid(logits.detach()), labels.int())
+        else:
+            logits = output
+            loss = self.compute_loss(logits, labels)
+            preds = logits.detach().argmax(dim=1)
+            self.test_acc.update(preds, labels)
+            self.test_f1.update(preds, labels)
 
-        self.log("test/loss", loss.detach(), on_epoch=True, batch_size=images.size(0))
+        self.log(
+            "test/loss",
+            loss.detach(),
+            on_epoch=True,
+            batch_size=images.size(0),
+        )
 
         # CAM evaluation
         if self.enable_cam_eval and "mask" in batch:
             self._evaluate_cam_batch(batch, self.test_cam_metrics)
 
     def on_test_epoch_end(self) -> None:
-        self.log("test/acc", self.test_acc.compute())
-        self.log("test/f1", self.test_f1.compute())
-        self.test_acc.reset()
-        self.test_f1.reset()
+        if self.multi_label:
+            self.log("test/mAP", self.test_mAP.compute())
+            self.test_mAP.reset()
+        else:
+            self.log("test/acc", self.test_acc.compute())
+            self.log("test/f1", self.test_f1.compute())
+            self.test_acc.reset()
+            self.test_f1.reset()
 
         # Log CAM metrics
         if self.enable_cam_eval and self.test_cam_metrics.count > 0:
@@ -237,11 +321,21 @@ class ClassificationModule(L.LightningModule):
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=self.trainer.max_epochs if self.trainer else 100,
-            eta_min=1e-5,
+        max_epochs = self.trainer.max_epochs if self.trainer else 100
+        cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(max_epochs - self.warmup_epochs, 1), eta_min=self.min_lr
         )
+        if self.warmup_epochs > 0:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer, start_factor=1e-3, total_iters=self.warmup_epochs
+            )
+            scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer,
+                schedulers=[warmup, cosine],
+                milestones=[self.warmup_epochs],
+            )
+        else:
+            scheduler = cosine
         return {
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"},
@@ -249,9 +343,17 @@ class ClassificationModule(L.LightningModule):
 
     def predict_step(self, batch: dict, batch_idx: int) -> dict:
         images = batch["image"]
-        logits = self(images)
+        output = self(images)
+        if self.multi_label:
+            logits = output[0] if isinstance(output, list) else output
+            probs = torch.sigmoid(logits)
+            return {
+                "predictions": (probs > 0.5).int(),
+                "probabilities": probs,
+                "names": batch.get("name", []),
+            }
         return {
-            "predictions": logits.argmax(dim=1),
-            "probabilities": F.softmax(logits, dim=1),
+            "predictions": output.argmax(dim=1),
+            "probabilities": F.softmax(output, dim=1),
             "names": batch.get("name", []),
         }

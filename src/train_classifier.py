@@ -98,7 +98,9 @@ def train_classifier(cfg: ClassifierConfig) -> float:
         ps_val = Subset(ps_val, range(min(n, len(ps_val))))
 
     combined_train = ConcatDataset([pv_train, ps_train])
-    log.info(f"Train: PlantVillage={len(pv_train)}, PlantSeg={len(ps_train)}, Total={len(combined_train)}")
+    log.info(
+        f"Train: PV={len(pv_train)}, PS={len(ps_train)}, Total={len(combined_train)}"
+    )
     log.info(f"Val: PlantVillage={len(pv_val)}, PlantSeg={len(ps_val)}")
 
     # Create dataloaders

@@ -7,14 +7,13 @@ segmentation masks from PlantSeg dataset.
 from typing import Literal
 
 import numpy as np
-from scipy import ndimage
-from scipy.ndimage import maximum_filter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pytorch_grad_cam import GradCAM, GradCAMPlusPlus, LayerCAM
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-
+from scipy import ndimage
+from scipy.ndimage import maximum_filter
 
 CAMMethod = Literal["gradcam", "gradcam++", "layercam"]
 
@@ -160,7 +159,7 @@ class CAMEvaluator:
         # How many GT regions have ANY CAM activation inside them?
         regions_covered = 0
         for region_id in range(1, num_regions + 1):
-            region_mask = (labeled_gt == region_id)
+            region_mask = labeled_gt == region_id
             if (cam_binary * region_mask).sum() > 0:
                 regions_covered += 1
         region_coverage = regions_covered / num_regions
@@ -183,7 +182,7 @@ class CAMEvaluator:
         # How many GT regions have at least one peak? (peak coverage)
         regions_with_peaks = 0
         for region_id in range(1, num_regions + 1):
-            region_mask = (labeled_gt == region_id)
+            region_mask = labeled_gt == region_id
             if any(region_mask[tuple(p)] > 0 for p in peak_coords):
                 regions_with_peaks += 1
         peak_coverage = regions_with_peaks / num_regions
@@ -199,9 +198,7 @@ class CAMEvaluator:
     def _resize_cam(self, cam: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
         """Resize CAM to target shape using bilinear interpolation."""
         cam_tensor = torch.from_numpy(cam).unsqueeze(0).unsqueeze(0).float()
-        resized = F.interpolate(
-            cam_tensor, size=target_shape, mode="bilinear", align_corners=False
-        )
+        resized = F.interpolate(cam_tensor, size=target_shape, mode="bilinear", align_corners=False)
         return resized.squeeze().numpy()
 
 
@@ -210,7 +207,11 @@ class CAMMetricsAccumulator:
 
     METRIC_NAMES = ["pointing_acc", "energy_inside", "iou", "precision", "recall", "f1"]
     MULTIREGION_METRIC_NAMES = [
-        "num_gt_regions", "region_coverage", "peak_coverage", "peak_precision", "num_peaks"
+        "num_gt_regions",
+        "region_coverage",
+        "peak_coverage",
+        "peak_precision",
+        "num_peaks",
     ]
     ALL_METRIC_NAMES = METRIC_NAMES + MULTIREGION_METRIC_NAMES
 
@@ -255,4 +256,3 @@ def get_target_layer(model: nn.Module, model_name: str) -> nn.Module:
         return model.features[-1]
     else:
         raise ValueError(f"Unknown model for CAM: {model_name}")
-
