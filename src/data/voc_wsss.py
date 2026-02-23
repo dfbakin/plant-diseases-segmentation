@@ -31,6 +31,7 @@ class WSSDataset(Dataset):
         image_ext: str = ".jpg",
         image_size: int = 512,
         transform: A.Compose | None = None,
+        is_train: bool = True,
     ) -> None:
         self.image_dir = Path(image_dir)
         self.mask_dir = Path(mask_dir)
@@ -43,14 +44,14 @@ class WSSDataset(Dataset):
         if transform is not None:
             self.transform = transform
         else:
-            self.transform = A.Compose(
-                [
-                    A.Resize(image_size, image_size),
-                    A.HorizontalFlip(p=0.5),
-                    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-                    ToTensorV2(),
-                ]
-            )
+            steps = [A.Resize(image_size, image_size)]
+            if is_train:
+                steps.append(A.HorizontalFlip(p=0.5))
+            steps.extend([
+                A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+                ToTensorV2(),
+            ])
+            self.transform = A.Compose(steps)
 
     def __len__(self) -> int:
         return len(self.names)

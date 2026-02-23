@@ -18,9 +18,11 @@ class WeakCLIPModule(L.LightningModule):
         self,
         model: WeakCLIP,
         num_classes: int = 21,
-        learning_rate: float = 1e-4,
+        learning_rate: float = 2e-4,
         weight_decay: float = 3e-5,
         warmup_iters: int = 1500,
+        poly_power: float = 0.9,
+        total_iters: int = 80_000,
         identity_loss_weight: float = 0.4,
     ) -> None:
         super().__init__()
@@ -29,6 +31,8 @@ class WeakCLIPModule(L.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.warmup_iters = warmup_iters
+        self.poly_power = poly_power
+        self.total_iters = total_iters
         self.identity_loss_weight = identity_loss_weight
         self.save_hyperparameters(ignore=["model"])
 
@@ -127,4 +131,17 @@ class WeakCLIPModule(L.LightningModule):
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        return {"optimizer": optimizer}
+
+        def poly_lr_lambda(current_step: int) -> float:
+            if current_step < self.warmup_iters:
+                return current_step / max(1, self.warmup_iters)
+            progress = (current_step - self.warmup_iters) / max(
+                1, self.total_iters - self.warmup_iters
+            )
+            return max(0.0, (1.0 - progress) ** self.poly_power)
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1},
+        }

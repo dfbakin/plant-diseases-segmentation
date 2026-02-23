@@ -43,6 +43,7 @@ class WeakCLIPTrainConfig:
     train_mask_dir: str = "outputs/pseudo_masks"
     val_image_dir: str = "data/VOC2012/JPEGImages"
     val_mask_dir: str = "data/VOC2012/SegmentationClassAug"
+    val_names_file: str = "data/VOC2012/ImageSets/Segmentation/val.txt"
     image_ext: str = ".jpg"
 
     clip_pretrained: str = "pretrained/ViT-B-16.pt"
@@ -52,16 +53,17 @@ class WeakCLIPTrainConfig:
     tau: float = 0.07
 
     batch_size: int = 8
-    max_epochs: int = 20
-    learning_rate: float = 1e-4
+    max_epochs: int = 60
+    learning_rate: float = 2e-4
     weight_decay: float = 3e-5
     warmup_iters: int = 1500
+    poly_power: float = 0.9
     identity_loss_weight: float = 0.4
     num_workers: int = 8
     precision: str = "16-mixed"
     seed: int = 0
 
-    limit_val_batches: int | float = 200
+    limit_val_batches: int | float = 1.0
 
     experiment_name: str = "weakclip"
     output_dir: str = "outputs/weakclip"
@@ -226,22 +228,29 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
 
     model = build_weakclip_model(cfg, class_names)
 
+    train_ds = WSSDataset(
+        image_dir=cfg.train_image_dir,
+        mask_dir=cfg.train_mask_dir,
+        image_ext=cfg.image_ext,
+        image_size=cfg.image_size,
+        is_train=True,
+    )
+    log.info(f"Train set: {len(train_ds)} images from {cfg.train_mask_dir}")
+
+    steps_per_epoch = len(train_ds) // cfg.batch_size
+    total_iters = steps_per_epoch * cfg.max_epochs
+    log.info(f"LR schedule: {total_iters} total iters, {cfg.warmup_iters} warmup, poly^{cfg.poly_power}")
+
     lit_module = WeakCLIPModule(
         model=model,
         num_classes=cfg.num_classes,
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
         warmup_iters=cfg.warmup_iters,
+        poly_power=cfg.poly_power,
+        total_iters=total_iters,
         identity_loss_weight=cfg.identity_loss_weight,
     )
-
-    train_ds = WSSDataset(
-        image_dir=cfg.train_image_dir,
-        mask_dir=cfg.train_mask_dir,
-        image_ext=cfg.image_ext,
-        image_size=cfg.image_size,
-    )
-    log.info(f"Train set: {len(train_ds)} images from {cfg.train_mask_dir}")
 
     val_loader = None
     if cfg.val_mask_dir and Path(cfg.val_mask_dir).exists():
@@ -250,7 +259,16 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
             mask_dir=cfg.val_mask_dir,
             image_ext=cfg.image_ext,
             image_size=cfg.image_size,
+            is_train=False,
         )
+        if cfg.val_names_file and Path(cfg.val_names_file).exists():
+            allowed = set(
+                l.strip()
+                for l in Path(cfg.val_names_file).read_text().splitlines()
+                if l.strip()
+            )
+            val_ds.names = [n for n in val_ds.names if n in allowed]
+            log.info(f"Filtered val to {len(val_ds.names)} images via {cfg.val_names_file}")
         val_loader = DataLoader(
             val_ds,
             batch_size=cfg.batch_size,
@@ -291,13 +309,14 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
     OmegaConf.save(cfg, config_path)
     mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(config_path))
 
-    monitor = "val/loss" if val_loader is not None else "train/loss"
+    monitor = "val/mIoU" if val_loader is not None else "train/loss"
+    monitor_mode = "max" if monitor == "val/mIoU" else "min"
     callbacks = [
         ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
             filename="weakclip-{epoch:02d}-{" + monitor + ":.4f}",
             monitor=monitor,
-            mode="min",
+            mode=monitor_mode,
             save_top_k=5,
             save_last=True,
         ),
