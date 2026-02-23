@@ -45,7 +45,32 @@ cs = ConfigStore.instance()
 cs.store(name="export_labels_config", node=ExportLabelsConfig)
 
 
-def export_voc_masks(cfg: ExportLabelsConfig) -> dict[str, np.ndarray]:
+VOC_CLASSES = [
+    "background",
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "dining table",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "potted plant",
+    "sheep",
+    "sofa",
+    "train",
+    "tv monitor",
+]
+
+
+def export_voc_masks(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
     from PIL import Image
 
     voc_root = Path(cfg.voc_root)
@@ -62,12 +87,12 @@ def export_voc_masks(cfg: ExportLabelsConfig) -> dict[str, np.ndarray]:
             if 0 < cls_idx < 255:
                 label[cls_idx - 1] = 1.0
         labels[name] = label
-    return labels
+    return labels, VOC_CLASSES
 
 
-def export_plantseg(cfg: ExportLabelsConfig) -> dict[str, np.ndarray]:
+def export_plantseg(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
     from src.data.plantvillage import PlantSegClassificationDataset
-    from src.data.plantvillage_mappings import NUM_CLASSIFICATION_CLASSES
+    from src.data.plantvillage_mappings import CLASSIFICATION_CLASSES, NUM_CLASSIFICATION_CLASSES
 
     ds = PlantSegClassificationDataset(root=cfg.root, split=cfg.pv_split)
     labels = {}
@@ -75,12 +100,12 @@ def export_plantseg(cfg: ExportLabelsConfig) -> dict[str, np.ndarray]:
         label = np.zeros(NUM_CLASSIFICATION_CLASSES, dtype=np.float32)
         label[sample["label"]] = 1.0
         labels[sample["name"]] = label
-    return labels
+    return labels, CLASSIFICATION_CLASSES
 
 
-def export_plantvillage(cfg: ExportLabelsConfig) -> dict[str, np.ndarray]:
+def export_plantvillage(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
     from src.data.plantvillage import PlantVillageDataset
-    from src.data.plantvillage_mappings import NUM_CLASSIFICATION_CLASSES
+    from src.data.plantvillage_mappings import CLASSIFICATION_CLASSES, NUM_CLASSIFICATION_CLASSES
 
     ds = PlantVillageDataset(root=cfg.root, split=cfg.pv_split)
     labels = {}
@@ -88,7 +113,7 @@ def export_plantvillage(cfg: ExportLabelsConfig) -> dict[str, np.ndarray]:
         label = np.zeros(NUM_CLASSIFICATION_CLASSES, dtype=np.float32)
         label[sample["label"]] = 1.0
         labels[sample["name"]] = label
-    return labels
+    return labels, CLASSIFICATION_CLASSES
 
 
 EXPORTERS = {
@@ -102,17 +127,21 @@ def export_labels(cfg: ExportLabelsConfig) -> None:
     if cfg.mode not in EXPORTERS:
         raise ValueError(f"Unknown mode: {cfg.mode}. Choose from {list(EXPORTERS.keys())}")
 
-    labels = EXPORTERS[cfg.mode](cfg)
+    labels, class_names = EXPORTERS[cfg.mode](cfg)
 
     output = Path(cfg.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.save(str(output), labels)
+
+    class_names_path = output.parent / "class_names.txt"
+    class_names_path.write_text("\n".join(class_names) + "\n")
 
     sample_name = next(iter(labels))
     log.info(
         f"Exported {len(labels)} labels to {output} "
         f"(num_classes={len(labels[sample_name])}, sample={sample_name})"
     )
+    log.info(f"Exported {len(class_names)} class names to {class_names_path}")
 
 
 @hydra.main(version_base=None, config_name="export_labels_config")

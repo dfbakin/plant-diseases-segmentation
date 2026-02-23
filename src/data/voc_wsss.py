@@ -1,4 +1,8 @@
-"""PASCAL VOC 2012 WSSS dataset: images + pseudo segmentation masks."""
+"""Dataset-agnostic WSSS dataset: images + pseudo/GT segmentation masks.
+
+Derives image list from mask_dir glob. Works with any dataset whose
+pseudo masks were produced by the CAM refinement pipeline.
+"""
 
 from pathlib import Path
 
@@ -9,23 +13,32 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
-class VOCWSSDataset(Dataset):
-    """VOC 2012 images + pseudo segmentation masks for WSSS training."""
+class WSSDataset(Dataset):
+    """Images + segmentation masks for WSSS training.
+
+    Args:
+        image_dir: Directory containing source images.
+        mask_dir: Directory containing .png masks (pseudo or GT).
+        image_ext: Image file extension (e.g. ".jpg", ".png").
+        image_size: Resize target for both images and masks.
+        transform: Optional albumentations pipeline (must handle both image and mask).
+    """
 
     def __init__(
         self,
-        root: str | Path,
-        pseudo_mask_dir: str = "SegmentationClassAug",
-        split: str = "train_aug_id",
+        image_dir: str | Path,
+        mask_dir: str | Path,
+        image_ext: str = ".jpg",
         image_size: int = 512,
         transform: A.Compose | None = None,
     ) -> None:
-        self.root = Path(root)
-        self.image_dir = self.root / "JPEGImages"
-        self.mask_dir = self.root / pseudo_mask_dir
+        self.image_dir = Path(image_dir)
+        self.mask_dir = Path(mask_dir)
+        self.image_ext = image_ext
 
-        split_file = self.root / "ImageSets" / "Segmentation" / f"{split}.txt"
-        self.names = split_file.read_text().strip().splitlines()
+        self.names = sorted(f.stem for f in self.mask_dir.glob("*.png"))
+        if not self.names:
+            raise FileNotFoundError(f"No .png masks found in {self.mask_dir}")
 
         if transform is not None:
             self.transform = transform
@@ -43,8 +56,10 @@ class VOCWSSDataset(Dataset):
         return len(self.names)
 
     def __getitem__(self, idx: int) -> dict:
-        name = self.names[idx].strip()
-        img = np.array(Image.open(self.image_dir / f"{name}.jpg").convert("RGB"))
+        name = self.names[idx]
+        img = np.array(
+            Image.open(self.image_dir / f"{name}{self.image_ext}").convert("RGB")
+        )
         mask = np.array(Image.open(self.mask_dir / f"{name}.png"))
 
         augmented = self.transform(image=img, mask=mask)

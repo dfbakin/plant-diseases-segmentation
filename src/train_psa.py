@@ -19,7 +19,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.wsss.refinement.aff_dataset import VOCAffDataset
+from src.wsss.refinement.aff_dataset import AffDataset
 from src.wsss.refinement.affinity_net import AffinityNet
 from src.wsss.refinement.resnet38d import Normalize
 
@@ -48,10 +48,10 @@ class PolyOptimizer(torch.optim.SGD):
 class PSATrainConfig:
     defaults: list[Any] = field(default_factory=lambda: ["_self_"])
 
-    voc_root: str = "data/VOC2012"
+    image_dir: str = "data/VOC2012/JPEGImages"
+    image_ext: str = ".jpg"
     la_crf_dir: str = "outputs/cams/la_crf"
     ha_crf_dir: str = "outputs/cams/ha_crf"
-    split: str = "train_aug_id"
 
     backbone_weights: str = "pretrained/res38_cls.pth"
     output_path: str = "outputs/psa/psa_aff.pth"
@@ -79,11 +79,11 @@ def train_psa(cfg: PSATrainConfig) -> None:
     log.info(f"Loaded backbone from {cfg.backbone_weights}")
 
     normalize_fn = Normalize()
-    dataset = VOCAffDataset(
-        voc_root=cfg.voc_root,
+    dataset = AffDataset(
+        image_dir=cfg.image_dir,
         la_crf_dir=cfg.la_crf_dir,
         ha_crf_dir=cfg.ha_crf_dir,
-        split=cfg.split,
+        image_ext=cfg.image_ext,
         cropsize=cfg.cropsize,
         normalize_fn=normalize_fn,
     )

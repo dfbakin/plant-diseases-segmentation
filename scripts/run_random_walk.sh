@@ -8,10 +8,10 @@ echo "=== Random Walk Refinement ==="
 
 python src/run_random_walk.py \
     cam_dir=outputs/cams/cam_npy \
+    image_dir=data/VOC2012/JPEGImages \
+    image_ext=.jpg \
     aff_checkpoint=outputs/psa/psa_aff.pth \
     output_dir=outputs/pseudo_masks \
-    voc_root=data/VOC2012 \
-    split_file=data/VOC2012/ImageSets/Segmentation/train_aug_id.txt \
     bg_threshold=0.3 \
     beta=8 \
     logt=6

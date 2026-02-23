@@ -5,6 +5,7 @@ from typing import Any
 import lightning as L
 import torch
 import torch.nn.functional as F
+from torchmetrics import JaccardIndex
 
 from src.wsss.weakclip.losses import cues_from_pseudo_mask, seeding_loss, stable_softmax
 from src.wsss.weakclip.model import WeakCLIP
@@ -30,6 +31,10 @@ class WeakCLIPModule(L.LightningModule):
         self.warmup_iters = warmup_iters
         self.identity_loss_weight = identity_loss_weight
         self.save_hyperparameters(ignore=["model"])
+
+        self.val_miou = JaccardIndex(
+            task="multiclass", num_classes=num_classes, ignore_index=255
+        )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return self.model(x)
@@ -89,7 +94,24 @@ class WeakCLIPModule(L.LightningModule):
         total_loss = sum(losses.values())
 
         bs = images.size(0)
-        self.log("val/loss", total_loss.detach(), prog_bar=True, batch_size=bs)
+        self.log("val/loss", total_loss.detach(), prog_bar=True, batch_size=bs, sync_dist=True)
+        self.log(
+            "val/loss_seeding", losses["loss_seeding"].detach(), batch_size=bs, sync_dist=True
+        )
+        self.log(
+            "val/loss_identity", losses["loss_identity"].detach(), batch_size=bs, sync_dist=True
+        )
+
+        mask_size = gt_mask.shape[2:]
+        preds = F.interpolate(seg_logits, size=mask_size, mode="bilinear", align_corners=False)
+        pred_labels = preds.argmax(dim=1)
+        gt_labels = gt_mask.squeeze(1)
+        self.val_miou.update(pred_labels, gt_labels)
+
+    def on_validation_epoch_end(self) -> None:
+        miou = self.val_miou.compute()
+        self.log("val/mIoU", miou, prog_bar=True)
+        self.val_miou.reset()
 
     def configure_optimizers(self) -> dict[str, Any]:
         frozen = {"backbone", "text_encoder"}

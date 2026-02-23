@@ -7,12 +7,13 @@ cd /workspace/plant-diseases-segmentation
 echo "=== Train PSA Affinity Network ==="
 
 python src/train_psa.py \
-    voc_root=data/VOC2012 \
+    image_dir=data/VOC2012/JPEGImages \
+    image_ext=.jpg \
     la_crf_dir=outputs/cams/la_crf \
     ha_crf_dir=outputs/cams/ha_crf \
     backbone_weights=pretrained/res38_cls.pth \
     output_path=outputs/psa/psa_aff.pth \
-    batch_size=8 \
+    batch_size=16 \
     max_epochs=5 \
     lr=0.01 \
     num_workers=8 \

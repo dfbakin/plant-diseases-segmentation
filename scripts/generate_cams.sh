@@ -24,7 +24,7 @@ python src/generate_cams.py \
     attention_type=fused \
     patch_attn_refine=true \
     gt_dir=data/VOC2012/SegmentationClassAug \
-    eval_threshold_sweep=true
+    eval_threshold_sweep=false
 
 echo "=== CAM generation complete ==="
 echo "Output: outputs/cams/cam_npy/"

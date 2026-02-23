@@ -1,10 +1,10 @@
 """Evaluate pseudo masks against ground truth (mIoU).
 
-Model-agnostic: compares any prediction mask directory against VOC GT.
-Computes per-class IoU and mean IoU.
+Dataset-agnostic: compares any prediction mask directory against GT masks.
+Derives image list from pred_dir glob. Computes per-class IoU and mean IoU.
 
 Example:
-    python src/evaluate_masks.py pred_dir=outputs/pseudo_masks
+    python src/evaluate_masks.py pred_dir=outputs/pseudo_masks gt_dir=data/VOC2012/SegmentationClassAug
 """
 
 import logging
@@ -52,7 +52,6 @@ class EvalConfig:
 
     pred_dir: str = "outputs/pseudo_masks"
     gt_dir: str = "data/VOC2012/SegmentationClassAug"
-    split_file: str = "data/VOC2012/ImageSets/Segmentation/train_aug_id.txt"
     num_cls: int = 21
 
 
@@ -113,7 +112,7 @@ def compute_miou(
 
 
 def evaluate_masks(cfg: EvalConfig) -> None:
-    names = Path(cfg.split_file).read_text().strip().splitlines()
+    names = sorted(f.stem for f in Path(cfg.pred_dir).glob("*.png"))
     log.info(f"Evaluating {len(names)} masks: {cfg.pred_dir} vs {cfg.gt_dir}")
 
     result = compute_miou(cfg.pred_dir, cfg.gt_dir, names, cfg.num_cls)

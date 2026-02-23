@@ -1,7 +1,7 @@
 """Apply random walk refinement to produce final pseudo masks.
 
 Reads raw CAMs + trained AffinityNet, outputs .png pseudo masks.
-Model-agnostic: works with any CAM source + any trained affinity net.
+Dataset-agnostic: derives image list from cam_dir glob.
 
 Example:
     python src/run_random_walk.py cam_dir=outputs/cams/cam_npy
@@ -33,10 +33,10 @@ class RWConfig:
     defaults: list[Any] = field(default_factory=lambda: ["_self_"])
 
     cam_dir: str = "outputs/cams/cam_npy"
+    image_dir: str = "data/VOC2012/JPEGImages"
+    image_ext: str = ".jpg"
     aff_checkpoint: str = "outputs/psa/psa_aff.pth"
     output_dir: str = "outputs/pseudo_masks"
-    voc_root: str = "data/VOC2012"
-    split_file: str = "data/VOC2012/ImageSets/Segmentation/train_aug_id.txt"
 
     bg_threshold: float = 0.3
     beta: int = 8
@@ -73,29 +73,21 @@ def run_random_walk(cfg: RWConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     tfm = build_rw_transform()
 
-    names = Path(cfg.split_file).read_text().strip().splitlines()
+    cam_dir = Path(cfg.cam_dir)
+    image_dir = Path(cfg.image_dir)
+    names = sorted(f.stem for f in cam_dir.glob("*.npy"))
     log.info(f"Running random walk for {len(names)} images (beta={cfg.beta}, logt={cfg.logt})")
 
-    cam_dir = Path(cfg.cam_dir)
-    image_dir = Path(cfg.voc_root) / "JPEGImages"
-
     for name in tqdm(names, desc="Random Walk"):
-        name = name.strip()
-        cam_path = cam_dir / f"{name}.npy"
-        if not cam_path.exists():
-            continue
+        cam_dict = np.load(str(cam_dir / f"{name}.npy"), allow_pickle=True).item()
+        img_pil = PIL.Image.open(image_dir / f"{name}{cfg.image_ext}").convert("RGB")
 
-        cam_dict = np.load(str(cam_path), allow_pickle=True).item()
-        img_pil = PIL.Image.open(image_dir / f"{name}.jpg").convert("RGB")
-
-        # Resize to a multiple of 8 for feature alignment
         orig_w, orig_h = img_pil.size
         new_w = (orig_w // 8) * 8
         new_h = (orig_h // 8) * 8
         img_resized = img_pil.resize((new_w, new_h), resample=PIL.Image.BICUBIC)
         img_t = tfm(img_resized).unsqueeze(0)
 
-        # Resize CAMs to match
         resized_cam_dict = {}
         for cls_idx, cam in cam_dict.items():
             cam_t = torch.from_numpy(cam).unsqueeze(0).unsqueeze(0).float()
@@ -115,8 +107,9 @@ def run_random_walk(cfg: RWConfig) -> None:
             device=device,
         )
 
-        # Resize back to original resolution
-        label_pil = PIL.Image.fromarray(label).resize((orig_w, orig_h), resample=PIL.Image.NEAREST)
+        label_pil = PIL.Image.fromarray(label).resize(
+            (orig_w, orig_h), resample=PIL.Image.NEAREST
+        )
         label_pil.save(str(output_dir / f"{name}.png"))
 
     log.info(f"Saved pseudo masks to {output_dir}")

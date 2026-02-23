@@ -1,10 +1,14 @@
-"""Train WeakCLIP on pseudo masks from MCTformer + CRF + PSA pipeline.
+"""Train WeakCLIP on pseudo masks from the CAM refinement pipeline.
 
-Loads CLIP ViT-B/16 pretrained backbone, freezes it and the text encoder,
-trains context decoder + FPN + decode head with seeding + identity loss.
+Dataset-agnostic: reads class names from a text file, images and masks
+from explicit directories. Works with any dataset that went through
+export_labels -> generate_cams -> apply_crf -> train_psa -> random_walk.
 
 Example:
-    python src/train_weakclip.py pseudo_mask_dir=outputs/pseudo_masks
+    python src/train_weakclip.py \
+        class_names_file=outputs/labels/voc_classes.txt \
+        train_image_dir=data/VOC2012/JPEGImages \
+        train_mask_dir=outputs/pseudo_masks
 """
 
 import logging
@@ -18,52 +22,32 @@ import open_clip
 import torch
 from hydra.core.config_store import ConfigStore
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
-from omegaconf import DictConfig
+from lightning.pytorch.loggers import MLFlowLogger
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
-from src.data.voc_wsss import VOCWSSDataset
+from src.data.voc_wsss import WSSDataset
 from src.wsss.weakclip.lightning import WeakCLIPModule
 from src.wsss.weakclip.model import WeakCLIP
 
 log = logging.getLogger(__name__)
-
-VOC_CLASSES = (
-    "background",
-    "aeroplane",
-    "bicycle",
-    "bird",
-    "boat",
-    "bottle",
-    "bus",
-    "car",
-    "cat",
-    "chair",
-    "cow",
-    "dining table",
-    "dog",
-    "horse",
-    "motorbike",
-    "person",
-    "potted plant",
-    "sheep",
-    "sofa",
-    "train",
-    "tv monitor",
-)
 
 
 @dataclass
 class WeakCLIPTrainConfig:
     defaults: list[Any] = field(default_factory=lambda: ["_self_"])
 
-    voc_root: str = "data/VOC2012"
-    pseudo_mask_dir: str = "outputs/pseudo_masks"
-    train_split: str = "train_aug_id"
-    val_split: str = "val"
+    class_names_file: str = "outputs/labels/voc_classes.txt"
+
+    train_image_dir: str = "data/VOC2012/JPEGImages"
+    train_mask_dir: str = "outputs/pseudo_masks"
+    val_image_dir: str = "data/VOC2012/JPEGImages"
+    val_mask_dir: str = "data/VOC2012/SegmentationClassAug"
+    image_ext: str = ".jpg"
 
     clip_pretrained: str = "pretrained/ViT-B-16.pt"
     context_length: int = 5
-    num_classes: int = 21
+    num_classes: int = 0
     image_size: int = 512
     tau: float = 0.07
 
@@ -77,24 +61,42 @@ class WeakCLIPTrainConfig:
     precision: str = "16-mixed"
     seed: int = 0
 
-    experiment_name: str = "weakclip_voc"
+    limit_val_batches: int | float = 200
+
+    experiment_name: str = "weakclip"
     output_dir: str = "outputs/weakclip"
+
+    mlflow_tracking_uri: str | None = None
+    mlflow_experiment_name: str = "${experiment_name}"
 
 
 cs = ConfigStore.instance()
 cs.store(name="weakclip_train_config", node=WeakCLIPTrainConfig)
 
 
-def tokenize_class_names(class_names: tuple[str, ...], context_length: int = 5) -> torch.LongTensor:
-    """Tokenize VOC class names using CLIP tokenizer (context_length tokens each)."""
+def load_class_names(path: str | Path) -> tuple[str, ...]:
+    """Load class names from text file (one name per line)."""
+    lines = Path(path).read_text().strip().splitlines()
+    names = tuple(line.strip() for line in lines if line.strip())
+    if not names:
+        raise ValueError(f"No class names found in {path}")
+    return names
+
+
+def tokenize_class_names(
+    class_names: tuple[str, ...], context_length: int = 5
+) -> torch.LongTensor:
+    """Tokenize class names using CLIP tokenizer."""
     tokenizer = open_clip.get_tokenizer("ViT-B-16")
     tokens = tokenizer(list(class_names))
     return tokens[:, :context_length].long()
 
 
-def build_weakclip_model(cfg: WeakCLIPTrainConfig) -> WeakCLIP:
+def build_weakclip_model(
+    cfg: WeakCLIPTrainConfig, class_names: tuple[str, ...]
+) -> WeakCLIP:
     """Build WeakCLIP model with CLIP pretrained weights."""
-    class_tokens = tokenize_class_names(VOC_CLASSES, cfg.context_length)
+    class_tokens = tokenize_class_names(class_names, cfg.context_length)
 
     model = WeakCLIP(
         num_classes=cfg.num_classes,
@@ -143,7 +145,6 @@ def build_weakclip_model(cfg: WeakCLIPTrainConfig) -> WeakCLIP:
         if_pyramid_queried_feature=True,
     )
 
-    # Load CLIP pretrained weights for backbone + text encoder
     clip_path = Path(cfg.clip_pretrained)
     if clip_path.exists():
         log.info(f"Loading CLIP weights from {clip_path}")
@@ -170,7 +171,7 @@ def _map_clip_to_backbone(clip_sd: dict, backbone_sd: dict) -> dict:
     for k, v in clip_sd.items():
         if not k.startswith(prefix):
             continue
-        new_k = k[len(prefix) :]
+        new_k = k[len(prefix):]
         new_k = new_k.replace("transformer.resblocks", "resblocks")
         if new_k in backbone_sd and v.shape == backbone_sd[new_k].shape:
             mapped[new_k] = v
@@ -210,7 +211,20 @@ def _map_clip_to_text_encoder(clip_sd: dict, te_sd: dict) -> dict:
 
 def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
     L.seed_everything(cfg.seed)
-    model = build_weakclip_model(cfg)
+
+    class_names = load_class_names(cfg.class_names_file)
+    log.info(f"Loaded {len(class_names)} class names from {cfg.class_names_file}")
+
+    if cfg.num_classes == 0:
+        cfg.num_classes = len(class_names)
+        log.info(f"Auto-set num_classes={cfg.num_classes} from class names file")
+    elif cfg.num_classes != len(class_names):
+        raise ValueError(
+            f"num_classes={cfg.num_classes} does not match "
+            f"{len(class_names)} names in {cfg.class_names_file}"
+        )
+
+    model = build_weakclip_model(cfg, class_names)
 
     lit_module = WeakCLIPModule(
         model=model,
@@ -221,18 +235,32 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
         identity_loss_weight=cfg.identity_loss_weight,
     )
 
-    train_ds = VOCWSSDataset(
-        root=cfg.voc_root,
-        pseudo_mask_dir=cfg.pseudo_mask_dir,
-        split=cfg.train_split,
+    train_ds = WSSDataset(
+        image_dir=cfg.train_image_dir,
+        mask_dir=cfg.train_mask_dir,
+        image_ext=cfg.image_ext,
         image_size=cfg.image_size,
     )
-    val_ds = VOCWSSDataset(
-        root=cfg.voc_root,
-        pseudo_mask_dir="SegmentationClassAug",
-        split=cfg.val_split,
-        image_size=cfg.image_size,
-    )
+    log.info(f"Train set: {len(train_ds)} images from {cfg.train_mask_dir}")
+
+    val_loader = None
+    if cfg.val_mask_dir and Path(cfg.val_mask_dir).exists():
+        val_ds = WSSDataset(
+            image_dir=cfg.val_image_dir,
+            mask_dir=cfg.val_mask_dir,
+            image_ext=cfg.image_ext,
+            image_size=cfg.image_size,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+        )
+        log.info(f"Val set: {len(val_ds)} images from {cfg.val_mask_dir}")
+    else:
+        log.warning("No val_mask_dir provided or directory missing, training without validation")
 
     train_loader = DataLoader(
         train_ds,
@@ -242,24 +270,35 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
         pin_memory=True,
         drop_last=True,
     )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-    )
 
     output_dir = Path(cfg.output_dir) / cfg.experiment_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
+
+    mlflow_logger = MLFlowLogger(
+        experiment_name=cfg.mlflow_experiment_name,
+        tracking_uri=cfg.mlflow_tracking_uri,
+        run_name=f"weakclip_{cfg.image_size}_{cfg.seed}",
+        tags={
+            "model": "weakclip",
+            "image_size": str(cfg.image_size),
+            "num_classes": str(cfg.num_classes),
+        },
+    )
+
+    config_path = output_dir / "config.yaml"
+    OmegaConf.save(cfg, config_path)
+    mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(config_path))
+
+    monitor = "val/loss" if val_loader is not None else "train/loss"
     callbacks = [
         ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
-            filename="weakclip-{epoch:02d}-{val/loss:.4f}",
-            monitor="val/loss",
+            filename="weakclip-{epoch:02d}-{" + monitor + ":.4f}",
+            monitor=monitor,
             mode="min",
-            save_top_k=3,
+            save_top_k=5,
             save_last=True,
         ),
         LearningRateMonitor(logging_interval="step"),
@@ -269,12 +308,13 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
         max_epochs=cfg.max_epochs,
         accelerator="auto",
         precision=cfg.precision,
+        logger=mlflow_logger,
         callbacks=callbacks,
         default_root_dir=str(output_dir),
         log_every_n_steps=50,
+        limit_val_batches=cfg.limit_val_batches,
     )
 
-    log.info(f"Training WeakCLIP: {len(train_ds)} train, {len(val_ds)} val images")
     trainer.fit(lit_module, train_loader, val_loader)
     log.info(f"Training complete. Checkpoints at {output_dir / 'checkpoints'}")
 

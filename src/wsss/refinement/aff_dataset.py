@@ -65,26 +65,26 @@ class ExtractAffinityLabelInRadius:
         return torch.from_numpy(bg_pos), torch.from_numpy(fg_pos), torch.from_numpy(neg)
 
 
-class VOCAffDataset(Dataset):
-    """VOC affinity dataset for PSA training using la_crf + ha_crf probability maps."""
+class AffDataset(Dataset):
+    """Dataset-agnostic affinity dataset for PSA training using la_crf + ha_crf label maps."""
 
     def __init__(
         self,
-        voc_root: str | Path,
+        image_dir: str | Path,
         la_crf_dir: str | Path,
         ha_crf_dir: str | Path,
-        split: str = "train_aug_id",
+        image_ext: str = ".jpg",
         cropsize: int = 448,
         radius: int = 5,
         normalize_fn=None,
     ):
-        self.voc_root = Path(voc_root)
+        self.image_dir = Path(image_dir)
         self.la_crf_dir = Path(la_crf_dir)
         self.ha_crf_dir = Path(ha_crf_dir)
+        self.image_ext = image_ext
         self.normalize_fn = normalize_fn
 
-        split_file = self.voc_root / "ImageSets" / "Segmentation" / f"{split}.txt"
-        self.names = split_file.read_text().strip().splitlines()
+        self.names = sorted(f.stem for f in self.la_crf_dir.glob("*.npy"))
         self.cropsize = cropsize
         self.extract_aff = ExtractAffinityLabelInRadius(cropsize=cropsize // 8, radius=radius)
 
@@ -93,43 +93,32 @@ class VOCAffDataset(Dataset):
 
     def __getitem__(self, idx: int):
         name = self.names[idx].strip()
-        img = PIL.Image.open(self.voc_root / "JPEGImages" / f"{name}.jpg").convert("RGB")
+        img = PIL.Image.open(self.image_dir / f"{name}{self.image_ext}").convert("RGB")
 
-        la_probs = np.load(str(self.la_crf_dir / f"{name}.npy"))
-        ha_probs = np.load(str(self.ha_crf_dir / f"{name}.npy"))
+        la_label = np.load(str(self.la_crf_dir / f"{name}.npy"))
+        ha_label = np.load(str(self.ha_crf_dir / f"{name}.npy"))
 
-        # Stack la + ha probabilities, then crop jointly with image
-        label = np.concatenate([la_probs, ha_probs], axis=0)  # (2*C, H, W)
-        label = np.transpose(label, (1, 2, 0))  # (H, W, 2*C)
+        # Stack la + ha as 2-channel label map for joint cropping
+        label = np.stack([la_label, ha_label], axis=-1)  # (H, W, 2)
 
         img = np.array(img)
         img, label = _random_crop(img, label, self.cropsize)
         img, label = _random_hflip(img, label)
 
-        # Apply normalization
         if self.normalize_fn:
             img = self.normalize_fn(img)
         else:
             img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))  # (3, H, W)
 
-        # Derive affinity labels from la/ha argmax
-        label = np.transpose(label, (2, 0, 1))  # (2*C, H, W)
-        num_cls = label.shape[0] // 2
-        la_part = label[:num_cls]
-        ha_part = label[num_cls:]
-
-        no_score_region = np.max(np.concatenate([la_part, ha_part], axis=0), axis=0) < 1e-5
-        la_label = np.argmax(la_part, axis=0).astype(np.uint8)
-        ha_label = np.argmax(ha_part, axis=0).astype(np.uint8)
+        la_label = label[:, :, 0]
+        ha_label = label[:, :, 1]
 
         # Combine: la foreground is trusted fg, ha background is trusted bg
         combined = la_label.copy()
         combined[la_label == 0] = 255
         combined[ha_label == 0] = 0
-        combined[no_score_region] = 255
 
-        # Downsample to feature map size (stride 8) then extract affinity labels
         from PIL import Image as PILImage
 
         combined_pil = PILImage.fromarray(combined)

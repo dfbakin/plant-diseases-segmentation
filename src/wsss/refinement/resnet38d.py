@@ -187,3 +187,4 @@ class Net(nn.Module):
                 layer.eval()
                 layer.bias.requires_grad = False
                 layer.weight.requires_grad = False
+        return self

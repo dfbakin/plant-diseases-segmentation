@@ -1,14 +1,16 @@
 """Apply DenseCRF to raw CAMs at two alpha levels (la/ha) for PSA training.
 
 Reads .npy CAM dicts, applies CRF, writes refined .npy dicts.
-Model-agnostic: works with any CAM source.
+Uses multiprocessing for speed (CRF is CPU-bound).
 
 Example:
-    python src/apply_crf.py cam_dir=outputs/cams/cam_npy
+    python src/apply_crf.py cam_dir=outputs/cams/cam_npy num_workers=8
 """
 
 import logging
 from dataclasses import dataclass, field
+from functools import partial
+from multiprocessing import Pool
 from pathlib import Path
 from typing import Any
 
@@ -38,17 +40,46 @@ class CRFConfig:
     bg_threshold: float = 0.3
     la_alpha: float = 4.0
     ha_alpha: float = 32.0
-    crf_iters: int = 10
+    crf_iters: int = 5
     num_cls: int = 21
+    num_workers: int = 8
 
 
 cs = ConfigStore.instance()
 cs.store(name="crf_config", node=CRFConfig)
 
 
+def _process_one(
+    name: str,
+    cam_dir: str,
+    image_dir: str,
+    image_ext: str,
+    la_dir: str,
+    ha_dir: str,
+    bg_threshold: float,
+    la_alpha: float,
+    ha_alpha: float,
+    crf_iters: int,
+    num_cls: int,
+) -> str:
+    la_path = Path(la_dir) / f"{name}.npy"
+    ha_path = Path(ha_dir) / f"{name}.npy"
+    if la_path.exists() and ha_path.exists():
+        return name
+
+    cam_dict = np.load(str(Path(cam_dir) / f"{name}.npy"), allow_pickle=True).item()
+    img = np.array(Image.open(Path(image_dir) / f"{name}{image_ext}").convert("RGB"))
+
+    la_probs = apply_crf(img, cam_dict, bg_threshold, la_alpha, crf_iters, num_cls)
+    ha_probs = apply_crf(img, cam_dict, bg_threshold, ha_alpha, crf_iters, num_cls)
+
+    np.save(str(la_path), np.argmax(la_probs, axis=0).astype(np.uint8))
+    np.save(str(ha_path), np.argmax(ha_probs, axis=0).astype(np.uint8))
+    return name
+
+
 def run_crf(cfg: CRFConfig) -> None:
     cam_dir = Path(cfg.cam_dir)
-    image_dir = Path(cfg.image_dir)
     la_dir = Path(cfg.la_crf_dir)
     ha_dir = Path(cfg.ha_crf_dir)
     la_dir.mkdir(parents=True, exist_ok=True)
@@ -57,22 +88,31 @@ def run_crf(cfg: CRFConfig) -> None:
     cam_files = sorted(cam_dir.glob("*.npy"))
     names = [f.stem for f in cam_files]
     log.info(
-        f"Applying CRF to {len(names)} images (la_alpha={cfg.la_alpha}, ha_alpha={cfg.ha_alpha})"
+        f"Applying CRF to {len(names)} images "
+        f"(la={cfg.la_alpha}, ha={cfg.ha_alpha}, iters={cfg.crf_iters}, workers={cfg.num_workers})"
     )
 
-    for name in tqdm(names, desc="CRF"):
-        cam_dict = np.load(str(cam_dir / f"{name}.npy"), allow_pickle=True).item()
-        img = np.array(Image.open(image_dir / f"{name}{cfg.image_ext}").convert("RGB"))
+    worker_fn = partial(
+        _process_one,
+        cam_dir=str(cam_dir),
+        image_dir=cfg.image_dir,
+        image_ext=cfg.image_ext,
+        la_dir=str(la_dir),
+        ha_dir=str(ha_dir),
+        bg_threshold=cfg.bg_threshold,
+        la_alpha=cfg.la_alpha,
+        ha_alpha=cfg.ha_alpha,
+        crf_iters=cfg.crf_iters,
+        num_cls=cfg.num_cls,
+    )
 
-        la_probs = apply_crf(
-            img, cam_dict, cfg.bg_threshold, cfg.la_alpha, cfg.crf_iters, cfg.num_cls
-        )
-        ha_probs = apply_crf(
-            img, cam_dict, cfg.bg_threshold, cfg.ha_alpha, cfg.crf_iters, cfg.num_cls
-        )
-
-        np.save(str(la_dir / f"{name}.npy"), la_probs)
-        np.save(str(ha_dir / f"{name}.npy"), ha_probs)
+    if cfg.num_workers > 1:
+        with Pool(cfg.num_workers) as pool:
+            for _ in tqdm(pool.imap_unordered(worker_fn, names), total=len(names), desc="CRF"):
+                pass
+    else:
+        for name in tqdm(names, desc="CRF"):
+            worker_fn(name)
 
     log.info(f"Done. la_crf -> {la_dir}, ha_crf -> {ha_dir}")
 

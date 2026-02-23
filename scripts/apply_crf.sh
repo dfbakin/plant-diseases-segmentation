@@ -14,7 +14,9 @@ python src/apply_crf.py \
     ha_crf_dir=outputs/cams/ha_crf \
     bg_threshold=0.3 \
     la_alpha=4.0 \
-    ha_alpha=32.0
+    ha_alpha=32.0 \
+    crf_iters=5 \
+    num_workers=64
 
 echo "=== CRF complete ==="
 echo "Output: outputs/cams/la_crf/ and outputs/cams/ha_crf/"
