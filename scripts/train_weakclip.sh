@@ -16,12 +16,18 @@ python src/train_weakclip.py \
     image_ext=.jpg \
     clip_pretrained=pretrained/ViT-B-16.pt \
     image_size=512 \
-    batch_size=32 \
-    max_epochs=80 \
-    learning_rate=4e-4 \
-    poly_power=0.9 \
-    num_workers=8 \
+    batch_size=16 \
+    max_epochs=31 \
+    learning_rate=1e-4 \
+    min_lr=1e-6 \
+    warmup_iters=1500 \
+    weight_decay=3e-5 \
+    identity_loss_weight=0.4 \
+    use_crf_loss=true \
+    crf_iters=10 \
+    norm_eval=true \
+    num_workers=16 \
     precision="32" \
-    experiment_name=weakclip_voc_scheduler
+    experiment_name=weakclip-voc
 
 echo "=== WeakCLIP training complete ==="

@@ -38,7 +38,7 @@ class FPNDecodeHead(nn.Module):
             for _ in range(num_ups):
                 head_layers.extend(
                     [
-                        nn.Conv2d(curr_ch, channels, 3, padding=1),
+                        nn.Conv2d(curr_ch, channels, 3, padding=1, bias=False),
                         nn.BatchNorm2d(channels),
                         nn.ReLU(inplace=True),
                         nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
@@ -46,11 +46,15 @@ class FPNDecodeHead(nn.Module):
                 )
                 curr_ch = channels
             if not head_layers:
-                head_layers.append(nn.Conv2d(curr_ch, channels, 3, padding=1))
+                head_layers.extend([
+                    nn.Conv2d(curr_ch, channels, 3, padding=1, bias=False),
+                    nn.BatchNorm2d(channels),
+                    nn.ReLU(inplace=True),
+                ])
             self.scale_heads.append(nn.Sequential(*head_layers))
 
         self.dropout = nn.Dropout2d(dropout)
-        self.cls_seg = nn.Conv2d(channels, num_classes, 1)
+        self.conv_seg = nn.Conv2d(channels, num_classes, 1)
 
     def forward(self, inputs: list[torch.Tensor]) -> torch.Tensor:
         output = self.scale_heads[0](inputs[0])
@@ -62,7 +66,7 @@ class FPNDecodeHead(nn.Module):
                 align_corners=False,
             )
         output = self.dropout(output)
-        return self.cls_seg(output)
+        return self.conv_seg(output)
 
     def compute_loss(
         self,

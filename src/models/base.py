@@ -25,6 +25,7 @@ class SegmentationModule(L.LightningModule):
         weight_decay: float = 1e-4,
         class_weights: torch.Tensor | None = None,
         loss_fn: str = "cross_entropy",
+        ignore_index: int | None = None,
     ) -> None:
         super().__init__()
         self.model = model
@@ -32,15 +33,22 @@ class SegmentationModule(L.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.loss_fn_name = loss_fn
+        self.ignore_index = ignore_index
 
         if class_weights is not None:
             self.register_buffer("class_weights", class_weights)
         else:
             self.class_weights = None
 
-        self.train_metrics = SegmentationMetrics(num_classes=num_classes)
-        self.val_metrics = SegmentationMetrics(num_classes=num_classes)
-        self.test_metrics = SegmentationMetrics(num_classes=num_classes)
+        self.train_metrics = SegmentationMetrics(
+            num_classes=num_classes, ignore_index=ignore_index
+        )
+        self.val_metrics = SegmentationMetrics(
+            num_classes=num_classes, ignore_index=ignore_index
+        )
+        self.test_metrics = SegmentationMetrics(
+            num_classes=num_classes, ignore_index=ignore_index
+        )
 
         self.save_hyperparameters(ignore=["model", "class_weights"])
 
@@ -48,10 +56,20 @@ class SegmentationModule(L.LightningModule):
         """Returns logits of shape (N, num_classes, H, W)."""
         return self.model(x)
 
+    @staticmethod
+    def _squeeze_mask(masks: torch.Tensor) -> torch.Tensor:
+        """Normalize mask to (N, H, W) regardless of whether input is (N, H, W) or (N, 1, H, W)."""
+        if masks.dim() == 4:
+            return masks.squeeze(1)
+        return masks
+
     def compute_loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self.loss_fn_name == "dice":
             return self._dice_loss(logits, target)
-        return F.cross_entropy(logits, target.long(), weight=self.class_weights)
+        kwargs: dict = {"weight": self.class_weights}
+        if self.ignore_index is not None:
+            kwargs["ignore_index"] = self.ignore_index
+        return F.cross_entropy(logits, target.long(), **kwargs)
 
     def _dice_loss(
         self, logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0
@@ -68,7 +86,7 @@ class SegmentationModule(L.LightningModule):
         return 1.0 - dice_per_class.mean()
 
     def training_step(self, batch: dict, batch_idx: int) -> torch.Tensor:
-        images, masks = batch["image"], batch["mask"]
+        images, masks = batch["image"], self._squeeze_mask(batch["mask"])
         logits = self(images)
         loss = self.compute_loss(logits, masks)
 
@@ -103,7 +121,7 @@ class SegmentationModule(L.LightningModule):
         self.train_metrics.reset()
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
-        images, masks = batch["image"], batch["mask"]
+        images, masks = batch["image"], self._squeeze_mask(batch["mask"])
         logits = self(images)
         loss = self.compute_loss(logits, masks)
 
@@ -116,7 +134,7 @@ class SegmentationModule(L.LightningModule):
         self.val_metrics.reset()
 
     def test_step(self, batch: dict, batch_idx: int) -> None:
-        images, masks = batch["image"], batch["mask"]
+        images, masks = batch["image"], self._squeeze_mask(batch["mask"])
         logits = self(images)
         loss = self.compute_loss(logits, masks)
 
@@ -137,7 +155,7 @@ class SegmentationModule(L.LightningModule):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.trainer.max_epochs if self.trainer else 100,
-            eta_min=1e-6,
+            eta_min=1e-5,
         )
         return {
             "optimizer": optimizer,

@@ -53,12 +53,15 @@ class WeakCLIPTrainConfig:
     tau: float = 0.07
 
     batch_size: int = 8
-    max_epochs: int = 60
-    learning_rate: float = 2e-4
+    max_epochs: int = 15
+    learning_rate: float = 1e-4
     weight_decay: float = 3e-5
     warmup_iters: int = 1500
-    poly_power: float = 0.9
+    min_lr: float = 1e-6
     identity_loss_weight: float = 0.4
+    use_crf_loss: bool = True
+    crf_iters: int = 10
+    norm_eval: bool = True
     num_workers: int = 8
     precision: str = "16-mixed"
     seed: int = 0
@@ -166,8 +169,14 @@ def build_weakclip_model(
     return model
 
 
-def _map_clip_to_backbone(clip_sd: dict, backbone_sd: dict) -> dict:
-    """Map CLIP state_dict keys to CLIPVisionTransformer keys."""
+def _map_clip_to_backbone(
+    clip_sd: dict, backbone_sd: dict, patch_size: int = 16, width: int = 768
+) -> dict:
+    """Map CLIP state_dict keys to CLIPVisionTransformer keys.
+
+    Handles positional embedding interpolation from CLIP's 224px resolution
+    to the model's target resolution (e.g. 512px).
+    """
     mapped = {}
     prefix = "visual."
     for k, v in clip_sd.items():
@@ -175,7 +184,27 @@ def _map_clip_to_backbone(clip_sd: dict, backbone_sd: dict) -> dict:
             continue
         new_k = k[len(prefix):]
         new_k = new_k.replace("transformer.resblocks", "resblocks")
-        if new_k in backbone_sd and v.shape == backbone_sd[new_k].shape:
+
+        if new_k not in backbone_sd:
+            continue
+
+        if new_k == "positional_embedding" and v.shape != backbone_sd[new_k].shape:
+            clip_token_size = 224 // patch_size  # 14 for ViT-B/16
+            target_size = int((backbone_sd[new_k].shape[0] - 1) ** 0.5)
+            cls_pos = v[0:1, :]
+            spatial_pos = v[1:, :].reshape(1, clip_token_size, clip_token_size, width)
+            spatial_pos = spatial_pos.permute(0, 3, 1, 2)
+            spatial_pos = torch.nn.functional.interpolate(
+                spatial_pos, size=(target_size, target_size), mode="bilinear", align_corners=False
+            )
+            spatial_pos = spatial_pos.reshape(width, target_size * target_size).permute(1, 0)
+            mapped[new_k] = torch.cat([cls_pos, spatial_pos], dim=0)
+            log.info(
+                f"Interpolated positional_embedding: {v.shape} -> {mapped[new_k].shape}"
+            )
+            continue
+
+        if v.shape == backbone_sd[new_k].shape:
             mapped[new_k] = v
     return mapped
 
@@ -237,9 +266,19 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
     )
     log.info(f"Train set: {len(train_ds)} images from {cfg.train_mask_dir}")
 
-    steps_per_epoch = len(train_ds) // cfg.batch_size
+    steps_per_epoch = max(1, len(train_ds) // cfg.batch_size)
     total_iters = steps_per_epoch * cfg.max_epochs
-    log.info(f"LR schedule: {total_iters} total iters, {cfg.warmup_iters} warmup, poly^{cfg.poly_power}")
+    log.info(
+        f"LR schedule: {total_iters} total iters ({cfg.max_epochs} epochs x "
+        f"{steps_per_epoch} steps), {cfg.warmup_iters} warmup, "
+        f"cosine lr={cfg.learning_rate} -> {cfg.min_lr}"
+    )
+    if total_iters > 25_000:
+        log.warning(
+            f"total_iters={total_iters} is significantly above the paper's 20k. "
+            f"The cosine schedule will spend many steps near min_lr={cfg.min_lr}. "
+            f"Consider reducing max_epochs (paper uses ~15 epochs at batch_size=8)."
+        )
 
     lit_module = WeakCLIPModule(
         model=model,
@@ -247,9 +286,12 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
         warmup_iters=cfg.warmup_iters,
-        poly_power=cfg.poly_power,
         total_iters=total_iters,
+        min_lr=cfg.min_lr,
         identity_loss_weight=cfg.identity_loss_weight,
+        use_crf_loss=cfg.use_crf_loss,
+        crf_iters=cfg.crf_iters,
+        norm_eval=cfg.norm_eval,
     )
 
     val_loader = None
