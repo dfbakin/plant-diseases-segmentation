@@ -4,7 +4,7 @@ set -e
 export PATH="/venv/main/bin:$PATH"
 cd /workspace/plant-diseases-segmentation
 
-CHECKPOINT="${1:-outputs/weakclip/weakclip-voc/checkpoints/weakclip-epoch=10-val/mIoU=0.6361.ckpt}"
+CHECKPOINT="${1:-outputs/weakclip/weakclip-voc/checkpoints/weakclip-epoch=09-val/mIoU=0.6445.ckpt}"
 
 echo "=== Generate WeakCLIP Pseudo Masks (multi-scale + flip + slide) ==="
 echo "Checkpoint: ${CHECKPOINT}"

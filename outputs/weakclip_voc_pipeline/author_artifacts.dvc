@@ -1,0 +1,6 @@
+outs:
+- md5: 342dae6f7d7784e6f896865d5bf07c23.dir
+  size: 2049619677
+  nfiles: 2
+  hash: md5
+  path: author_artifacts

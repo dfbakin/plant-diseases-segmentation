@@ -38,9 +38,9 @@ class CRFConfig:
     ha_crf_dir: str = "outputs/cams/ha_crf"
 
     bg_threshold: float = 0.3
-    la_alpha: float = 4.0
-    ha_alpha: float = 32.0
-    crf_iters: int = 5
+    la_scale_factor: float = 1.0
+    ha_scale_factor: float = 12.0
+    crf_iters: int = 10
     num_cls: int = 21
     num_workers: int = 8
 
@@ -57,8 +57,8 @@ def _process_one(
     la_dir: str,
     ha_dir: str,
     bg_threshold: float,
-    la_alpha: float,
-    ha_alpha: float,
+    la_scale_factor: float,
+    ha_scale_factor: float,
     crf_iters: int,
     num_cls: int,
 ) -> str:
@@ -70,8 +70,14 @@ def _process_one(
     cam_dict = np.load(str(Path(cam_dir) / f"{name}.npy"), allow_pickle=True).item()
     img = np.array(Image.open(Path(image_dir) / f"{name}{image_ext}").convert("RGB"))
 
-    la_probs = apply_crf(img, cam_dict, bg_threshold, la_alpha, crf_iters, num_cls)
-    ha_probs = apply_crf(img, cam_dict, bg_threshold, ha_alpha, crf_iters, num_cls)
+    la_probs = apply_crf(
+        img, cam_dict, bg_threshold, t=crf_iters, num_cls=num_cls,
+        scale_factor=la_scale_factor,
+    )
+    ha_probs = apply_crf(
+        img, cam_dict, bg_threshold, t=crf_iters, num_cls=num_cls,
+        scale_factor=ha_scale_factor,
+    )
 
     np.save(str(la_path), np.argmax(la_probs, axis=0).astype(np.uint8))
     np.save(str(ha_path), np.argmax(ha_probs, axis=0).astype(np.uint8))
@@ -89,7 +95,8 @@ def run_crf(cfg: CRFConfig) -> None:
     names = [f.stem for f in cam_files]
     log.info(
         f"Applying CRF to {len(names)} images "
-        f"(la={cfg.la_alpha}, ha={cfg.ha_alpha}, iters={cfg.crf_iters}, workers={cfg.num_workers})"
+        f"(la_sf={cfg.la_scale_factor}, ha_sf={cfg.ha_scale_factor}, "
+        f"iters={cfg.crf_iters}, workers={cfg.num_workers})"
     )
 
     worker_fn = partial(
@@ -100,8 +107,8 @@ def run_crf(cfg: CRFConfig) -> None:
         la_dir=str(la_dir),
         ha_dir=str(ha_dir),
         bg_threshold=cfg.bg_threshold,
-        la_alpha=cfg.la_alpha,
-        ha_alpha=cfg.ha_alpha,
+        la_scale_factor=cfg.la_scale_factor,
+        ha_scale_factor=cfg.ha_scale_factor,
         crf_iters=cfg.crf_iters,
         num_cls=cfg.num_cls,
     )

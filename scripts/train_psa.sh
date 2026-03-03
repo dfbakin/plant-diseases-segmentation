@@ -13,7 +13,7 @@ python src/train_psa.py \
     ha_crf_dir=outputs/cams/ha_crf \
     backbone_weights=pretrained/res38_cls.pth \
     output_path=outputs/psa/psa_aff.pth \
-    batch_size=16 \
+    batch_size=8 \
     max_epochs=5 \
     lr=0.01 \
     num_workers=8 \
