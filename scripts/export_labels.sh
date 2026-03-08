@@ -27,6 +27,14 @@ case "${MODE}" in
             output=outputs/labels/plantseg_train.npy \
             "$@"
         ;;
+    plantseg_wsss)
+        python src/export_labels.py \
+            mode=plantseg_wsss \
+            root=data/plantsegv3 \
+            pv_split=train \
+            output=outputs/labels/plantseg_wsss_train.npy \
+            "$@"
+        ;;
     plantvillage)
         python src/export_labels.py \
             mode=plantvillage \
@@ -36,7 +44,7 @@ case "${MODE}" in
             "$@"
         ;;
     *)
-        echo "Unknown mode: ${MODE}. Choose from: voc, plantseg, plantvillage"
+        echo "Unknown mode: ${MODE}. Choose from: voc, plantseg, plantseg_wsss, plantvillage"
         exit 1
         ;;
 esac

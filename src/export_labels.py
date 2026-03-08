@@ -7,6 +7,7 @@ or MCTformer classification predictions.
 Example:
     python src/export_labels.py mode=voc_masks voc_root=data/VOC2012
     python src/export_labels.py mode=plantseg root=data/plantsegv3
+    python src/export_labels.py mode=plantseg_wsss root=data/plantsegv3 pv_split=train
     python src/export_labels.py mode=plantvillage root=data/plant-village
 """
 
@@ -103,6 +104,41 @@ def export_plantseg(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], lis
     return labels, CLASSIFICATION_CLASSES
 
 
+def export_plantseg_wsss(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Export labels from PlantSeg GT masks using DISEASE_CLASSES.
+
+    Uses 115 foreground disease classes (DISEASE_CLASSES[1:]) so that
+    segmentation class indices match the GT annotations directly.
+    Healthy-only images (mask contains only background) are skipped.
+    """
+    from PIL import Image as PILImage
+
+    from src.data.plantseg import DISEASE_CLASSES, PlantSegMulticlassDataset
+
+    num_fg = len(DISEASE_CLASSES) - 1  # 115 diseases (exclude background)
+    class_names = DISEASE_CLASSES[1:]
+
+    ds = PlantSegMulticlassDataset(root=cfg.root, split=cfg.pv_split, transform=None)
+
+    labels: dict[str, np.ndarray] = {}
+    skipped = 0
+    for sample in tqdm(ds.samples, desc="PlantSeg WSSS"):
+        mask = np.array(PILImage.open(sample["mask_path"]))
+        present = set(np.unique(mask)) - {0, 255}
+        if not present:
+            skipped += 1
+            continue
+
+        label = np.zeros(num_fg, dtype=np.float32)
+        for cls_idx in present:
+            if 1 <= cls_idx <= num_fg:
+                label[cls_idx - 1] = 1.0
+        labels[sample["name"]] = label
+
+    log.info(f"PlantSeg WSSS: {len(labels)} images with diseases, {skipped} healthy-only skipped")
+    return labels, class_names
+
+
 def export_plantvillage(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
     from src.data.plantvillage import PlantVillageDataset
     from src.data.plantvillage_mappings import CLASSIFICATION_CLASSES, NUM_CLASSIFICATION_CLASSES
@@ -119,6 +155,7 @@ def export_plantvillage(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray],
 EXPORTERS = {
     "voc_masks": export_voc_masks,
     "plantseg": export_plantseg,
+    "plantseg_wsss": export_plantseg_wsss,
     "plantvillage": export_plantvillage,
 }
 

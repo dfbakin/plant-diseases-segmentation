@@ -1,11 +1,12 @@
-"""MCTformer-V2 multi-label classification training on PASCAL VOC 2012.
+"""MCTformer-V2 multi-label classification training.
 
-Matches original MCTformer training: timm augmentation, LR scaling, warmup.
+Supports PASCAL VOC 2012 (default) and PlantSeg datasets via ``dataset``
+config switch.
 
 Examples:
     python src/train_mctformer.py
+    python src/train_mctformer.py dataset=plantseg data.root=data/plantsegv3
     python src/train_mctformer.py model.checkpoint_path=pretrained/MCTformerV2.pth
-    python src/train_mctformer.py data.image_size=384 data.batch_size=32
 """
 
 import logging
@@ -26,17 +27,34 @@ from lightning.pytorch.loggers import MLFlowLogger
 from omegaconf import DictConfig, OmegaConf
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
 from src.conf.classifier import MCTformerModelConfig, VOCDataConfig
-from src.data.voc_classification import VOCClassificationDataset
+from src.data.voc_classification import (
+    NUM_PLANTSEG_FG_CLASSES,
+    PlantSegMCTformerDataset,
+    VOCClassificationDataset,
+)
 from src.models.classification import ClassificationModule
 from src.models.classifier_factory import create_classifier
 
 log = logging.getLogger(__name__)
 
 NUM_VOC_CLASSES = 20
+
+
+@dataclass
+class PlantSegDataConfig:
+    root: str = "data/plantsegv3"
+    train_split: str = "train"
+    val_split: str = "val"
+    image_size: int = 448
+    batch_size: int = 32
+    num_workers: int = 8
+    pin_memory: bool = True
+    mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+    std: tuple[float, float, float] = (0.229, 0.224, 0.225)
 
 
 @dataclass
@@ -55,11 +73,13 @@ class MCTformerTrainerConfig:
 class MCTformerConfig:
     defaults: list[Any] = field(default_factory=lambda: ["_self_"])
 
+    dataset: str = "voc"
     experiment_name: str = "mctformer_voc"
     seed: int = 0
 
     model: MCTformerModelConfig = field(default_factory=MCTformerModelConfig)
     data: VOCDataConfig = field(default_factory=VOCDataConfig)
+    plantseg_data: PlantSegDataConfig = field(default_factory=PlantSegDataConfig)
     trainer: MCTformerTrainerConfig = field(default_factory=MCTformerTrainerConfig)
 
     mlflow_tracking_uri: Optional[str] = None
@@ -97,47 +117,78 @@ def build_val_transform(image_size: int) -> transforms.Compose:
     )
 
 
+def _build_datasets(
+    cfg: MCTformerConfig,
+) -> tuple[Dataset, Dataset, int]:
+    """Build train/val datasets and return (train_ds, val_ds, num_classes)."""
+    if cfg.dataset == "plantseg":
+        dcfg = cfg.plantseg_data
+        image_size = dcfg.image_size
+        train_ds = PlantSegMCTformerDataset(
+            root=dcfg.root,
+            split=dcfg.train_split,
+            image_size=image_size,
+            transform=build_train_transform(image_size),
+        )
+        val_ds = PlantSegMCTformerDataset(
+            root=dcfg.root,
+            split=dcfg.val_split,
+            image_size=image_size,
+            transform=build_val_transform(image_size),
+        )
+        return train_ds, val_ds, NUM_PLANTSEG_FG_CLASSES
+    else:
+        dcfg = cfg.data
+        image_size = dcfg.image_size
+        train_ds = VOCClassificationDataset(
+            root=dcfg.root,
+            split=dcfg.train_split,
+            image_size=image_size,
+            transform=build_train_transform(image_size),
+        )
+        val_ds = VOCClassificationDataset(
+            root=dcfg.root,
+            split=dcfg.val_split,
+            image_size=image_size,
+            transform=build_val_transform(image_size),
+        )
+        return train_ds, val_ds, NUM_VOC_CLASSES
+
+
 def train_mctformer(cfg: MCTformerConfig) -> float:
-    """Train MCTformer-V2 on VOC. Returns best validation mAP."""
+    """Train MCTformer-V2. Returns best validation mAP."""
     L.seed_everything(cfg.seed, workers=True)
     log.info(f"Config:\n{OmegaConf.to_yaml(cfg)}")
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_ds = VOCClassificationDataset(
-        root=cfg.data.root,
-        split=cfg.data.train_split,
-        image_size=cfg.data.image_size,
-        transform=build_train_transform(cfg.data.image_size),
-    )
-    val_ds = VOCClassificationDataset(
-        root=cfg.data.root,
-        split=cfg.data.val_split,
-        image_size=cfg.data.image_size,
-        transform=build_val_transform(cfg.data.image_size),
-    )
+    train_ds, val_ds, num_classes = _build_datasets(cfg)
+    if cfg.model.num_classes != num_classes:
+        log.info(f"Overriding model.num_classes: {cfg.model.num_classes} -> {num_classes}")
+        cfg.model.num_classes = num_classes
+    log.info(f"Dataset: {cfg.dataset}, num_classes: {num_classes}")
     log.info(f"Train: {len(train_ds)} images, Val: {len(val_ds)} images")
 
+    dcfg = cfg.plantseg_data if cfg.dataset == "plantseg" else cfg.data
     train_loader = DataLoader(
         train_ds,
-        batch_size=cfg.data.batch_size,
+        batch_size=dcfg.batch_size,
         shuffle=True,
-        num_workers=cfg.data.num_workers,
-        pin_memory=cfg.data.pin_memory,
+        num_workers=dcfg.num_workers,
+        pin_memory=dcfg.pin_memory,
         drop_last=True,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=int(1.5 * cfg.data.batch_size),
+        batch_size=int(1.5 * dcfg.batch_size),
         shuffle=False,
-        num_workers=cfg.data.num_workers,
-        pin_memory=cfg.data.pin_memory,
+        num_workers=dcfg.num_workers,
+        pin_memory=dcfg.pin_memory,
     )
 
-    # LR scaling: original scales lr linearly with batch_size / 512
-    scaled_lr = cfg.model.learning_rate * cfg.data.batch_size / 512.0
-    log.info(f"LR scaling: {cfg.model.learning_rate} * {cfg.data.batch_size}/512 = {scaled_lr}")
+    scaled_lr = cfg.model.learning_rate * dcfg.batch_size / 512.0
+    log.info(f"LR scaling: {cfg.model.learning_rate} * {dcfg.batch_size}/512 = {scaled_lr}")
 
     backbone = create_classifier(
         name=cfg.model.name,
@@ -166,12 +217,12 @@ def train_mctformer(cfg: MCTformerConfig) -> float:
     mlflow_logger = MLFlowLogger(
         experiment_name=cfg.mlflow_experiment_name,
         tracking_uri=cfg.mlflow_tracking_uri,
-        run_name=f"mctformer_{cfg.data.image_size}_{cfg.seed}",
+        run_name=f"mctformer_{dcfg.image_size}_{cfg.seed}",
         tags={
             "model": cfg.model.name,
-            "image_size": str(cfg.data.image_size),
+            "image_size": str(dcfg.image_size),
             "num_classes": str(cfg.model.num_classes),
-            "dataset": "voc2012",
+            "dataset": cfg.dataset,
         },
     )
 

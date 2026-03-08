@@ -53,6 +53,7 @@ class EvalConfig:
     pred_dir: str = "outputs/pseudo_masks"
     gt_dir: str = "data/VOC2012/SegmentationClassAug"
     num_cls: int = 21
+    class_names_file: str = ""
 
 
 cs = ConfigStore.instance()
@@ -111,9 +112,30 @@ def compute_miou(
     }
 
 
+def _load_class_names(path: str) -> list[str]:
+    """Load class names from file (one per line).
+
+    The file is expected to list *foreground* class names.  This function
+    prepends "background" so that index 0 maps to "background".
+    """
+    names = Path(path).read_text().strip().splitlines()
+    return ["background"] + [n.strip() for n in names]
+
+
 def evaluate_masks(cfg: EvalConfig) -> None:
     names = sorted(f.stem for f in Path(cfg.pred_dir).glob("*.png"))
     log.info(f"Evaluating {len(names)} masks: {cfg.pred_dir} vs {cfg.gt_dir}")
+
+    if cfg.class_names_file:
+        class_names = _load_class_names(cfg.class_names_file)
+        if cfg.num_cls != len(class_names):
+            log.info(
+                f"Overriding num_cls from class_names_file: "
+                f"{cfg.num_cls} -> {len(class_names)}"
+            )
+            cfg.num_cls = len(class_names)
+    else:
+        class_names = VOC_CLASSES
 
     result = compute_miou(cfg.pred_dir, cfg.gt_dir, names, cfg.num_cls)
 
@@ -121,8 +143,8 @@ def evaluate_masks(cfg: EvalConfig) -> None:
     log.info("Per-class IoU:")
     for c in range(cfg.num_cls):
         if result["valid_classes"][c]:
-            name = VOC_CLASSES[c] if c < len(VOC_CLASSES) else f"class_{c}"
-            log.info(f"  {name:15s}: {result['iou_per_class'][c] * 100:.2f}%")
+            cname = class_names[c] if c < len(class_names) else f"class_{c}"
+            log.info(f"  {cname:40s}: {result['iou_per_class'][c] * 100:.2f}%")
 
 
 @hydra.main(version_base=None, config_name="eval_config")
