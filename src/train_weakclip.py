@@ -100,8 +100,22 @@ def tokenize_class_names(
 def build_weakclip_model(
     cfg: WeakCLIPTrainConfig, class_names: tuple[str, ...]
 ) -> WeakCLIP:
-    """Build WeakCLIP model with CLIP pretrained weights."""
-    class_tokens = tokenize_class_names(class_names, cfg.context_length)
+    """Build WeakCLIP model with CLIP pretrained weights.
+
+    ``class_names`` should list *foreground* names only.  This function
+    prepends "background" so the text encoder produces ``num_classes``
+    embeddings (including background), keeping score_map, FPN, and decode
+    head all at ``num_classes`` channels.
+    """
+    all_names = ("background",) + class_names
+    if len(all_names) != cfg.num_classes:
+        log.warning(
+            f"class_names ({len(class_names)} fg) + background = {len(all_names)}, "
+            f"but num_classes={cfg.num_classes}. Using {len(all_names)}."
+        )
+        cfg.num_classes = len(all_names)
+
+    class_tokens = tokenize_class_names(all_names, cfg.context_length)
 
     model = WeakCLIP(
         num_classes=cfg.num_classes,
@@ -246,13 +260,17 @@ def train_weakclip(cfg: WeakCLIPTrainConfig) -> None:
     class_names = load_class_names(cfg.class_names_file)
     log.info(f"Loaded {len(class_names)} class names from {cfg.class_names_file}")
 
+    num_fg = len(class_names)
     if cfg.num_classes == 0:
-        cfg.num_classes = len(class_names)
-        log.info(f"Auto-set num_classes={cfg.num_classes} from class names file")
-    elif cfg.num_classes != len(class_names):
+        cfg.num_classes = num_fg + 1
+        log.info(
+            f"Auto-set num_classes={cfg.num_classes} "
+            f"({num_fg} foreground + 1 background)"
+        )
+    elif cfg.num_classes < num_fg:
         raise ValueError(
-            f"num_classes={cfg.num_classes} does not match "
-            f"{len(class_names)} names in {cfg.class_names_file}"
+            f"num_classes={cfg.num_classes} is less than the "
+            f"{num_fg} foreground names in {cfg.class_names_file}"
         )
 
     model = build_weakclip_model(cfg, class_names)

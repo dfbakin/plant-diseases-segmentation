@@ -41,6 +41,7 @@ class GenCAMConfig:
 
     num_classes: int = 20
     input_size: int = 448
+    max_size: int = 0
     patch_size: int = 16
     scales: list[float] = field(default_factory=lambda: [1.0, 0.75, 1.25])
     n_layers: int = 3
@@ -148,15 +149,31 @@ def generate_cams(cfg: GenCAMConfig) -> None:
         img_pil = PIL.Image.open(img_path).convert("RGB")
         label = torch.from_numpy(labels[name]).float()
 
+        max_long = cfg.max_size if cfg.max_size > 0 else int(cfg.input_size * 1.75)
+        long_side = max(img_pil.size)
+        if long_side > max_long:
+            ratio = max_long / long_side
+            img_pil = img_pil.resize(
+                (round(img_pil.width * ratio), round(img_pil.height * ratio)),
+                resample=PIL.Image.BICUBIC,
+            )
+
         image_list = []
         for s in cfg.scales:
-            target_size = (round(img_pil.size[0] * s), round(img_pil.size[1] * s))
-            s_img = img_pil.resize(target_size, resample=PIL.Image.BICUBIC)
+            tw = round(img_pil.size[0] * s)
+            th = round(img_pil.size[1] * s)
+            scaled_long = max(tw, th)
+            if scaled_long > max_long:
+                r = max_long / scaled_long
+                tw, th = round(tw * r), round(th * r)
+            s_img = img_pil.resize((tw, th), resample=PIL.Image.BICUBIC)
             t_img = tfm(s_img).unsqueeze(0)
             image_list.append(t_img)
             image_list.append(torch.flip(t_img, [-1]))
 
         cam_dict = generate_cam_single(model, image_list, label, cfg, device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         if cam_dict:
             np.save(str(output_dir / f"{name}.npy"), cam_dict)
 

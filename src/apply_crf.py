@@ -68,7 +68,14 @@ def _process_one(
         return name
 
     cam_dict = np.load(str(Path(cam_dir) / f"{name}.npy"), allow_pickle=True).item()
-    img = np.array(Image.open(Path(image_dir) / f"{name}{image_ext}").convert("RGB"))
+    pil_img = Image.open(Path(image_dir) / f"{name}{image_ext}").convert("RGB")
+
+    sample_cam = next(iter(cam_dict.values()))
+    cam_h, cam_w = sample_cam.shape
+    if (pil_img.height, pil_img.width) != (cam_h, cam_w):
+        pil_img = pil_img.resize((cam_w, cam_h), Image.BILINEAR)
+
+    img = np.array(pil_img)
 
     la_probs = apply_crf(
         img, cam_dict, bg_threshold, t=crf_iters, num_cls=num_cls,

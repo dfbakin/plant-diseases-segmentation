@@ -43,6 +43,7 @@ class RWConfig:
     logt: int = 6
     num_cls: int = 21
     cropsize: int = 448
+    max_size: int = 0
 
 
 cs = ConfigStore.instance()
@@ -78,21 +79,35 @@ def run_random_walk(cfg: RWConfig) -> None:
     names = sorted(f.stem for f in cam_dir.glob("*.npy"))
     log.info(f"Running random walk for {len(names)} images (beta={cfg.beta}, logt={cfg.logt})")
 
+    max_long = cfg.max_size if cfg.max_size > 0 else cfg.cropsize
+    log.info(f"Max long side for random walk: {max_long}")
+
     for name in tqdm(names, desc="Random Walk"):
         cam_dict = np.load(str(cam_dir / f"{name}.npy"), allow_pickle=True).item()
         img_pil = PIL.Image.open(image_dir / f"{name}{cfg.image_ext}").convert("RGB")
-
         orig_w, orig_h = img_pil.size
-        new_w = (orig_w // 8) * 8
-        new_h = (orig_h // 8) * 8
-        img_resized = img_pil.resize((new_w, new_h), resample=PIL.Image.BICUBIC)
+
+        sample_cam = next(iter(cam_dict.values()))
+        cam_h, cam_w = sample_cam.shape
+
+        proc_w, proc_h = cam_w, cam_h
+        long_side = max(proc_w, proc_h)
+        if long_side > max_long:
+            ratio = max_long / long_side
+            proc_w = round(proc_w * ratio)
+            proc_h = round(proc_h * ratio)
+
+        proc_w = max((proc_w // 8) * 8, 80)
+        proc_h = max((proc_h // 8) * 8, 80)
+
+        img_resized = img_pil.resize((proc_w, proc_h), resample=PIL.Image.BICUBIC)
         img_t = tfm(img_resized).unsqueeze(0)
 
         resized_cam_dict = {}
         for cls_idx, cam in cam_dict.items():
             cam_t = torch.from_numpy(cam).unsqueeze(0).unsqueeze(0).float()
             cam_resized = torch.nn.functional.interpolate(
-                cam_t, size=(new_h, new_w), mode="bilinear", align_corners=False
+                cam_t, size=(proc_h, proc_w), mode="bilinear", align_corners=False
             )
             resized_cam_dict[cls_idx] = cam_resized.squeeze().numpy()
 
@@ -111,6 +126,9 @@ def run_random_walk(cfg: RWConfig) -> None:
             (orig_w, orig_h), resample=PIL.Image.NEAREST
         )
         label_pil.save(str(output_dir / f"{name}.png"))
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     log.info(f"Saved pseudo masks to {output_dir}")
 

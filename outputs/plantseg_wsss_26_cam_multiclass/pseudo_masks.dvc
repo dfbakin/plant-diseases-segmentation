@@ -1,0 +1,6 @@
+outs:
+- md5: c2b7c8fb876714b1466ed219aa659418.dir
+  size: 29843191
+  nfiles: 7916
+  hash: md5
+  path: pseudo_masks

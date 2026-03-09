@@ -1,0 +1,6 @@
+outs:
+- md5: 1860bf9f87ed4a6d9b4ead85850f36b1.dir
+  size: 539613626
+  nfiles: 3
+  hash: md5
+  path: mctformer_plantseg_multiclass

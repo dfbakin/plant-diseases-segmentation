@@ -76,13 +76,25 @@ def compute_miou(
     for name in tqdm(name_list, desc="Evaluating"):
         name = name.strip()
         pred_path = pred_dir / f"{name}.png"
+        if not pred_path.exists():
+            pred_path = pred_dir / f"{name}.npy"
         gt_path = gt_dir / f"{name}.png"
 
         if not pred_path.exists() or not gt_path.exists():
             continue
 
-        pred = np.array(Image.open(pred_path))
+        if pred_path.suffix == ".npy":
+            pred = np.load(str(pred_path))
+        else:
+            pred = np.array(Image.open(pred_path))
         gt = np.array(Image.open(gt_path))
+
+        if pred.shape != gt.shape:
+            pred = np.array(
+                Image.fromarray(pred.astype(np.uint8)).resize(
+                    (gt.shape[1], gt.shape[0]), resample=Image.NEAREST
+                )
+            )
 
         # Ignore 255 (void) in GT
         valid = gt != 255
@@ -123,7 +135,10 @@ def _load_class_names(path: str) -> list[str]:
 
 
 def evaluate_masks(cfg: EvalConfig) -> None:
-    names = sorted(f.stem for f in Path(cfg.pred_dir).glob("*.png"))
+    pred_dir = Path(cfg.pred_dir)
+    png_names = {f.stem for f in pred_dir.glob("*.png")}
+    npy_names = {f.stem for f in pred_dir.glob("*.npy")}
+    names = sorted(png_names | npy_names)
     log.info(f"Evaluating {len(names)} masks: {cfg.pred_dir} vs {cfg.gt_dir}")
 
     if cfg.class_names_file:

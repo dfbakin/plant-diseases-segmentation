@@ -13,10 +13,10 @@ cd /workspace/plant-diseases-segmentation
 
 EXPERIMENT_NAME="mctformer_plantseg"
 SEED=0
-IMAGE_SIZE=448
+IMAGE_SIZE=512
 BATCH_SIZE=32
-MAX_EPOCHS=45
-NUM_WORKERS=8
+MAX_EPOCHS=80
+NUM_WORKERS=16
 
 export MLFLOW_TRACKING_URI=null
 
@@ -31,7 +31,7 @@ python src/train_mctformer.py \
     seed=${SEED} \
     model.name=mctformer_v2 \
     model.pretrained=true \
-    model.learning_rate=5e-4 \
+    model.learning_rate=8e-4 \
     model.weight_decay=0.05 \
     model.drop_path_rate=0.1 \
     model.label_smoothing=0.1 \
@@ -43,7 +43,7 @@ python src/train_mctformer.py \
     plantseg_data.batch_size=${BATCH_SIZE} \
     plantseg_data.num_workers=${NUM_WORKERS} \
     trainer.max_epochs=${MAX_EPOCHS} \
-    trainer.precision="16-mixed"
+    trainer.precision="32"
 
 echo ""
 echo "=== Training complete ==="

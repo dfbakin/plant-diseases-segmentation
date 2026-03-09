@@ -60,7 +60,7 @@ WEAKCLIP_EXPERIMENT="weakclip-plantseg"
 CLIP_PRETRAINED="pretrained/ViT-B-16.pt"
 WEAKCLIP_MASK_DIR="${OUT_BASE}/weakclip_masks"
 
-NUM_WORKERS=8
+NUM_WORKERS=16
 
 # Parse SKIP_STEPS as comma-separated list
 SKIP_STEPS="${SKIP_STEPS:-}"
@@ -72,7 +72,7 @@ should_skip() {
 echo "============================================"
 echo "  PlantSeg WSSS Pipeline"
 echo "  Classes: ${NUM_FG} fg + 1 bg = ${NUM_CLS}"
-echo "  Data: ${DATA_ROOT}"
+echo "  Data: ${DATA_ROOT}"т
 echo "  Output: ${OUT_BASE}"
 echo "============================================"
 echo ""
@@ -106,9 +106,9 @@ if ! should_skip 1; then
             model.weight_decay=0.05 \
             model.drop_path_rate=0.1 \
             model.label_smoothing=0.1 \
-            model.input_size=448 \
+            model.input_size=512 \
             plantseg_data.root="${DATA_ROOT}" \
-            plantseg_data.image_size=448 \
+            plantseg_data.image_size=512 \
             plantseg_data.batch_size=32 \
             plantseg_data.num_workers=${NUM_WORKERS} \
             trainer.max_epochs=45 \
@@ -144,8 +144,9 @@ if ! should_skip 2; then
         "label_file=${LABEL_FILE}" \
         output_dir="${CAM_DIR}" \
         num_classes=${NUM_FG} \
-        input_size=448 \
-        "scales=[1.0,0.75,1.25]" \
+        input_size=512 \
+        max_size=896 \
+        "scales=[1.0,0.75,1.25,1.5,1.75]" \
         n_layers=3 \
         attention_type=fused \
         patch_attn_refine=true \
@@ -204,10 +205,10 @@ if ! should_skip 5; then
         backbone_weights="${PSA_BACKBONE}" \
         output_path="${PSA_CKPT}" \
         batch_size=8 \
-        max_epochs=5 \
+        max_epochs=10 \
         lr=0.01 \
         num_workers=${NUM_WORKERS} \
-        cropsize=448
+        cropsize=512
     echo "PSA: ${PSA_CKPT}"
     echo ""
 fi
@@ -224,7 +225,9 @@ if ! should_skip 6; then
         bg_threshold=0.39 \
         beta=8 \
         logt=6 \
-        num_cls=${NUM_CLS}
+        num_cls=${NUM_CLS} \
+        cropsize=512 \
+        max_size=640
     echo "Pseudo masks: ${PSEUDO_MASK_DIR}"
     echo ""
 fi
@@ -245,6 +248,7 @@ if ! should_skip 8; then
     echo "=== Step 8: Train WeakCLIP on pseudo masks ==="
     python src/train_weakclip.py \
         class_names_file="${CLASS_NAMES}" \
+        num_classes=${NUM_CLS} \
         train_image_dir="${IMAGE_DIR}" \
         train_mask_dir="${PSEUDO_MASK_DIR}" \
         val_image_dir="${VAL_IMAGE_DIR}" \
@@ -283,6 +287,7 @@ if ! should_skip 9; then
     python src/generate_refine_weakclip_masks.py \
         "checkpoint='${WEAKCLIP_CKPT}'" \
         class_names_file="${CLASS_NAMES}" \
+        num_classes=${NUM_CLS} \
         image_dir="${IMAGE_DIR}" \
         image_ext="${IMAGE_EXT}" \
         labels_file="${LABEL_FILE}" \

@@ -98,8 +98,11 @@ class AffDataset(Dataset):
         la_label = np.load(str(self.la_crf_dir / f"{name}.npy"))
         ha_label = np.load(str(self.ha_crf_dir / f"{name}.npy"))
 
-        # Stack la + ha as 2-channel label map for joint cropping
         label = np.stack([la_label, ha_label], axis=-1)  # (H, W, 2)
+
+        lbl_h, lbl_w = la_label.shape[:2]
+        if (img.height, img.width) != (lbl_h, lbl_w):
+            img = img.resize((lbl_w, lbl_h), resample=PIL.Image.BILINEAR)
 
         img = np.array(img)
         img, label = _random_crop(img, label, self.cropsize)

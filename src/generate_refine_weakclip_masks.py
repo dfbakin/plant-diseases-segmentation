@@ -164,7 +164,7 @@ def generate_refine_masks(cfg: StreamMasksConfig) -> None:
 
     class_names = load_class_names(cfg.class_names_file)
     if cfg.num_classes == 0:
-        cfg.num_classes = len(class_names)
+        cfg.num_classes = len(class_names) + 1
 
     log.info(f"Loading checkpoint from {cfg.checkpoint} (format={cfg.checkpoint_format})")
     if cfg.checkpoint_format == "author":
