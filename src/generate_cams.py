@@ -50,6 +50,7 @@ class GenCAMConfig:
 
     gt_dir: str = ""
     eval_threshold_sweep: bool = False
+    eval_sweep_samples: int = 0
 
 
 cs = ConfigStore.instance()
@@ -186,6 +187,7 @@ def generate_cams(cfg: GenCAMConfig) -> None:
             gt_dir=cfg.gt_dir,
             name_list=names,
             num_cls=cfg.num_classes + 1,
+            max_samples=cfg.eval_sweep_samples,
         )
         log.info(
             f"Best mIoU: {result['best_miou']:.2f}% at threshold={result['best_threshold']:.2f}"

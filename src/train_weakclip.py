@@ -167,7 +167,10 @@ def build_weakclip_model(
     clip_path = Path(cfg.clip_pretrained)
     if clip_path.exists():
         log.info(f"Loading CLIP weights from {clip_path}")
-        sd = torch.load(str(clip_path), map_location="cpu", weights_only=False)
+        try:
+            sd = torch.jit.load(str(clip_path), map_location="cpu").state_dict()
+        except Exception:
+            sd = torch.load(str(clip_path), map_location="cpu", weights_only=False)
         if isinstance(sd, dict) and "state_dict" in sd:
             sd = sd["state_dict"]
 

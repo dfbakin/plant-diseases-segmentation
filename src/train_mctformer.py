@@ -33,6 +33,7 @@ from torchvision import transforms
 from src.conf.classifier import MCTformerModelConfig, VOCDataConfig
 from src.data.voc_classification import (
     NUM_PLANTSEG_FG_CLASSES,
+    BinaryPlantDataset,
     PlantSegMCTformerDataset,
     VOCClassificationDataset,
 )
@@ -47,6 +48,7 @@ NUM_VOC_CLASSES = 20
 @dataclass
 class PlantSegDataConfig:
     root: str = "data/plantsegv3"
+    pv_root: str = "data/plant-village"
     train_split: str = "train"
     val_split: str = "val"
     image_size: int = 448
@@ -121,7 +123,27 @@ def _build_datasets(
     cfg: MCTformerConfig,
 ) -> tuple[Dataset, Dataset, int]:
     """Build train/val datasets and return (train_ds, val_ds, num_classes)."""
-    if cfg.dataset == "plantseg":
+    if cfg.dataset == "plantseg_binary":
+        dcfg = cfg.plantseg_data
+        image_size = dcfg.image_size
+        train_ds = BinaryPlantDataset(
+            plantseg_root=dcfg.root,
+            plantvillage_root=dcfg.pv_root,
+            split=dcfg.train_split,
+            image_size=image_size,
+            transform=build_train_transform(image_size),
+            include_plantvillage=True,
+        )
+        val_ds = BinaryPlantDataset(
+            plantseg_root=dcfg.root,
+            plantvillage_root=dcfg.pv_root,
+            split=dcfg.val_split,
+            image_size=image_size,
+            transform=build_val_transform(image_size),
+            include_plantvillage=True,
+        )
+        return train_ds, val_ds, 1
+    elif cfg.dataset == "plantseg":
         dcfg = cfg.plantseg_data
         image_size = dcfg.image_size
         train_ds = PlantSegMCTformerDataset(
@@ -170,7 +192,7 @@ def train_mctformer(cfg: MCTformerConfig) -> float:
     log.info(f"Dataset: {cfg.dataset}, num_classes: {num_classes}")
     log.info(f"Train: {len(train_ds)} images, Val: {len(val_ds)} images")
 
-    dcfg = cfg.plantseg_data if cfg.dataset == "plantseg" else cfg.data
+    dcfg = cfg.plantseg_data if cfg.dataset in ("plantseg", "plantseg_binary") else cfg.data
     train_loader = DataLoader(
         train_ds,
         batch_size=dcfg.batch_size,

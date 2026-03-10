@@ -57,6 +57,7 @@ class GenerateMasksConfig:
     flip: bool = True
     crop_size: int = 512
     stride: int = 341
+    max_long_edge: int = 0
 
     clip_pretrained: str = "pretrained/ViT-B-16.pt"
     image_size: int = 512
@@ -294,13 +295,18 @@ def generate_weakclip_masks(cfg: GenerateMasksConfig) -> None:
         f"crop={cfg.crop_size}, stride={cfg.stride}"
     )
 
+    from src.generate_refine_weakclip_masks import _resize_if_needed
+
     for name in tqdm(names, desc="Generating masks"):
         img_path = image_dir / f"{name}{cfg.image_ext}"
         if not img_path.exists():
             log.warning(f"Image not found: {img_path}")
             continue
 
-        _, img_tensor = _load_image(img_path)
+        img_np, img_tensor = _load_image(img_path)
+        _, img_tensor, _ = _resize_if_needed(
+            img_np, img_tensor, cfg.max_long_edge,
+        )
         img_tensor = img_tensor.to(device)
 
         prob = multiscale_flip_inference(

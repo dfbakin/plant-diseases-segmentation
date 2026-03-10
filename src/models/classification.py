@@ -58,12 +58,19 @@ class ClassificationModule(L.LightningModule):
             self.class_weights = None
 
         # Classification metrics
+        self._binary_metric = False
         if multi_label:
             self.criterion = nn.MultiLabelSoftMarginLoss()
-            _MAP = torchmetrics.classification.MultilabelAveragePrecision
-            self.train_mAP = _MAP(num_labels=num_classes)
-            self.val_mAP = _MAP(num_labels=num_classes)
-            self.test_mAP = _MAP(num_labels=num_classes)
+            if num_classes == 1:
+                self._binary_metric = True
+                _make_ap = lambda: torchmetrics.classification.BinaryAveragePrecision()
+            else:
+                _make_ap = lambda: torchmetrics.classification.MultilabelAveragePrecision(
+                    num_labels=num_classes
+                )
+            self.train_mAP = _make_ap()
+            self.val_mAP = _make_ap()
+            self.test_mAP = _make_ap()
         else:
             metric_args = {
                 "task": "multiclass",
@@ -129,7 +136,11 @@ class ClassificationModule(L.LightningModule):
 
         if self.multi_label:
             logits = output[0] if isinstance(output, list) else output
-            self.train_mAP.update(torch.sigmoid(logits.detach()), labels.int())
+            preds = torch.sigmoid(logits.detach())
+            tgt = labels.int()
+            if self._binary_metric:
+                preds, tgt = preds.squeeze(-1), tgt.squeeze(-1)
+            self.train_mAP.update(preds, tgt)
         else:
             preds = output.detach().argmax(dim=1)
             self.train_acc.update(preds, labels)
@@ -173,7 +184,11 @@ class ClassificationModule(L.LightningModule):
         if self.multi_label:
             logits = output[0] if isinstance(output, list) else output
             loss = self.compute_loss(logits, labels)
-            self.val_mAP.update(torch.sigmoid(logits.detach()), labels.int())
+            preds = torch.sigmoid(logits.detach())
+            tgt = labels.int()
+            if self._binary_metric:
+                preds, tgt = preds.squeeze(-1), tgt.squeeze(-1)
+            self.val_mAP.update(preds, tgt)
         else:
             logits = output
             loss = self.compute_loss(logits, labels)
@@ -263,7 +278,11 @@ class ClassificationModule(L.LightningModule):
         if self.multi_label:
             logits = output[0] if isinstance(output, list) else output
             loss = self.compute_loss(logits, labels)
-            self.test_mAP.update(torch.sigmoid(logits.detach()), labels.int())
+            preds = torch.sigmoid(logits.detach())
+            tgt = labels.int()
+            if self._binary_metric:
+                preds, tgt = preds.squeeze(-1), tgt.squeeze(-1)
+            self.test_mAP.update(preds, tgt)
         else:
             logits = output
             loss = self.compute_loss(logits, labels)

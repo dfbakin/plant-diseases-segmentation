@@ -1,0 +1,6 @@
+outs:
+- md5: ac5f1e2305aa01e0aa9283dbc61b5e55.dir
+  size: 5900358
+  nfiles: 1247
+  hash: md5
+  path: gt_binary_val

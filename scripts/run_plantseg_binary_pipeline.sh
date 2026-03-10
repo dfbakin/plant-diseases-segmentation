@@ -1,47 +1,58 @@
 #!/bin/bash
 set -e
 
-# Full WSSS pipeline on PlantSeg dataset
+# Binary (2-class) WSSS pipeline on PlantSeg + PlantVillage
+#
+# 2 classes: background (0) + disease (1).
+# MCTformer trains on ALL PlantSeg + ALL PlantVillage (healthy=0, diseased=1).
+# CAM generation and all downstream refinement use PlantSeg images only.
 #
 # Steps:
-#   0. Export image-level labels (plantseg_wsss mode, 115 disease classes)
-#   1. Train MCTformer classifier (optional, skip with MCTFORMER_CKPT)
-#   2. Generate CAMs
-#   3. Apply CRF (la + ha)
-#   4. Evaluate CRF masks vs GT
-#   5. Train PSA affinity network
-#   6. Random Walk refinement -> pseudo masks
-#   7. Evaluate pseudo masks vs GT
-#   8. Train WeakCLIP on pseudo masks
-#   9. Generate + refine WeakCLIP masks (streaming, no intermediate probs)
-#  10. Evaluate WeakCLIP masks vs GT
+#   0a. Export combined labels (MCTformer training: PlantSeg + PlantVillage)
+#   0b. Export PlantSeg-only labels (CAM generation + downstream)
+#   0c. Generate binary GT masks from multiclass PlantSeg annotations
+#   1.  Train binary MCTformer classifier
+#   2.  Generate CAMs (PlantSeg only)
+#   3.  Apply CRF (la + ha)
+#   4.  Evaluate CRF masks vs binary GT
+#   5.  Train PSA affinity network
+#   6.  Random Walk refinement -> pseudo masks
+#   7.  Evaluate pseudo masks vs binary GT
+#   8.  Train WeakCLIP on pseudo masks
+#   9.  Generate + refine WeakCLIP masks (streaming)
+#  10.  Evaluate WeakCLIP masks vs binary GT
 #
 # Usage:
-#   ./scripts/run_plantseg_pipeline.sh                          # full pipeline
-#   MCTFORMER_CKPT=outputs/.../last.ckpt ./scripts/run_plantseg_pipeline.sh  # skip training
-#   SKIP_STEPS="0,1" ./scripts/run_plantseg_pipeline.sh         # skip specific steps
+#   ./scripts/run_plantseg_binary_pipeline.sh
+#   MCTFORMER_CKPT=outputs/.../last.ckpt ./scripts/run_plantseg_binary_pipeline.sh
+#   SKIP_STEPS="0,1" ./scripts/run_plantseg_binary_pipeline.sh
+#   WEAKCLIP_QUALITY=fast ./scripts/run_plantseg_binary_pipeline.sh   # ~12x faster step 9
 
 export PATH="/venv/main/bin:$PATH"
 cd /workspace/plant-diseases-segmentation
 
 # ─── Configuration ────────────────────────────────────────────
 DATA_ROOT="data/plantsegv3"
+PV_ROOT="data/plant-village"
 IMAGE_DIR="${DATA_ROOT}/images/train"
 GT_DIR="${DATA_ROOT}/annotations/train"
 VAL_IMAGE_DIR="${DATA_ROOT}/images/val"
 VAL_GT_DIR="${DATA_ROOT}/annotations/val"
 
-OUT_BASE="outputs/plantseg_wsss_26_cam_multiclass"
-LABEL_FILE="${OUT_BASE}/labels/plantseg_wsss_train.npy"
+OUT_BASE="outputs/plantseg_binary"
+COMBINED_LABEL_FILE="${OUT_BASE}/labels/plantseg_binary_all_train.npy"
+LABEL_FILE="${OUT_BASE}/labels/plantseg_binary_train.npy"
 CLASS_NAMES="${OUT_BASE}/labels/class_names.txt"
+BINARY_GT_DIR="${OUT_BASE}/gt_binary_train"
+BINARY_GT_VAL_DIR="${OUT_BASE}/gt_binary_val"
 
-NUM_FG=115          # foreground disease classes
-NUM_CLS=116         # total including background
+NUM_FG=1            # foreground classes (disease only)
+NUM_CLS=2           # total including background
 IMAGE_EXT=".jpg"
 
 # MCTformer
-MCTFORMER_EXPERIMENT="mctformer_plantseg"
-MCTFORMER_CKPT="${MCTFORMER_CKPT:-}"   # set externally to skip training
+MCTFORMER_EXPERIMENT="mctformer_plantseg_binary"
+MCTFORMER_CKPT="${MCTFORMER_CKPT:-}"
 
 # CAMs
 CAM_DIR="${OUT_BASE}/cams/cam_npy"
@@ -56,16 +67,18 @@ PSA_CKPT="${OUT_BASE}/psa/psa_aff.pth"
 PSEUDO_MASK_DIR="${OUT_BASE}/pseudo_masks"
 
 # WeakCLIP
-WEAKCLIP_EXPERIMENT="weakclip-plantseg"
+WEAKCLIP_EXPERIMENT="weakclip-plantseg-binary"
 CLIP_PRETRAINED="pretrained/ViT-B-16.pt"
 WEAKCLIP_MASK_DIR="${OUT_BASE}/weakclip_masks"
 
 NUM_WORKERS=16
+SWEEP_SAMPLES=500
 
 # WeakCLIP inference quality: "fast" for quick trial, "full" for best results
+# fast  -> scales=[1.0], flip=false              (~12x faster)
+# full  -> scales=[0.5,0.75,1.0,1.25,1.5,1.75], flip=true
 WEAKCLIP_QUALITY="${WEAKCLIP_QUALITY:-full}"
 
-# Parse SKIP_STEPS as comma-separated list
 SKIP_STEPS="${SKIP_STEPS:-}"
 
 should_skip() {
@@ -73,34 +86,71 @@ should_skip() {
 }
 
 echo "============================================"
-echo "  PlantSeg WSSS Pipeline"
+echo "  PlantSeg Binary WSSS Pipeline"
 echo "  Classes: ${NUM_FG} fg + 1 bg = ${NUM_CLS}"
-echo "  Data: ${DATA_ROOT}"
+echo "  Data: ${DATA_ROOT} + ${PV_ROOT}"
 echo "  Output: ${OUT_BASE}"
 echo "============================================"
 echo ""
 
-# ─── Step 0: Export Labels ────────────────────────────────────
+# ─── Step 0a: Export combined labels (MCTformer training) ─────
 if ! should_skip 0; then
-    echo "=== Step 0: Export image-level labels (plantseg_wsss) ==="
+    echo "=== Step 0a: Export combined labels (PlantSeg + PlantVillage) ==="
     python src/export_labels.py \
-        mode=plantseg_wsss \
+        mode=plantseg_binary \
+        root="${DATA_ROOT}" \
+        pv_root="${PV_ROOT}" \
+        pv_split=train \
+        include_plantvillage=true \
+        output="${COMBINED_LABEL_FILE}"
+    echo "Combined labels: ${COMBINED_LABEL_FILE}"
+    echo ""
+
+    # ─── Step 0b: Export PlantSeg-only labels ─────────────────
+    echo "=== Step 0b: Export PlantSeg-only labels ==="
+    python src/export_labels.py \
+        mode=plantseg_binary \
         root="${DATA_ROOT}" \
         pv_split=train \
+        include_plantvillage=false \
         output="${LABEL_FILE}"
-    echo "Labels: ${LABEL_FILE}"
-    echo "Class names: ${CLASS_NAMES}"
+    echo "PlantSeg-only labels: ${LABEL_FILE}"
+    echo ""
+
+    # ─── Step 0c: Generate binary GT masks ────────────────────
+    echo "=== Step 0c: Generate binary GT masks ==="
+    python -c "
+from pathlib import Path
+import numpy as np
+from PIL import Image
+
+for split, src_name, dst_name in [
+    ('train', '${GT_DIR}', '${BINARY_GT_DIR}'),
+    ('val', '${VAL_GT_DIR}', '${BINARY_GT_VAL_DIR}'),
+]:
+    src = Path(src_name)
+    dst = Path(dst_name)
+    dst.mkdir(parents=True, exist_ok=True)
+    count = 0
+    for f in sorted(src.glob('*.png')):
+        m = np.array(Image.open(f))
+        m[(m > 0) & (m < 255)] = 1
+        Image.fromarray(m.astype(np.uint8)).save(dst / f.name)
+        count += 1
+    print(f'{split}: converted {count} masks -> {dst}')
+"
+    echo "Binary GT: ${BINARY_GT_DIR}, ${BINARY_GT_VAL_DIR}"
     echo ""
 fi
 
-# ─── Step 1: Train MCTformer ─────────────────────────────────
+# ─── Step 1: Train Binary MCTformer ──────────────────────────
 if ! should_skip 1; then
     if [ -n "${MCTFORMER_CKPT}" ] && [ -f "${MCTFORMER_CKPT}" ]; then
         echo "=== Step 1: Skipping MCTformer training (using ${MCTFORMER_CKPT}) ==="
     else
-        echo "=== Step 1: Train MCTformer-V2 on PlantSeg ==="
+        echo "=== Step 1: Train binary MCTformer-V2 (PlantSeg + PlantVillage) ==="
         python src/train_mctformer.py \
-            dataset=plantseg \
+            dataset=plantseg_binary \
             experiment_name="${MCTFORMER_EXPERIMENT}" \
             seed=0 \
             model.name=mctformer_v2 \
@@ -111,6 +161,7 @@ if ! should_skip 1; then
             model.label_smoothing=0.1 \
             model.input_size=512 \
             plantseg_data.root="${DATA_ROOT}" \
+            plantseg_data.pv_root="${PV_ROOT}" \
             plantseg_data.image_size=512 \
             plantseg_data.batch_size=32 \
             plantseg_data.num_workers=${NUM_WORKERS} \
@@ -137,9 +188,9 @@ if [ -z "${MCTFORMER_CKPT}" ]; then
 fi
 echo "Using MCTformer checkpoint: ${MCTFORMER_CKPT}"
 
-# ─── Step 2: Generate CAMs ───────────────────────────────────
+# ─── Step 2: Generate CAMs (PlantSeg only) ───────────────────
 if ! should_skip 2; then
-    echo "=== Step 2: Generate CAMs ==="
+    echo "=== Step 2: Generate CAMs (PlantSeg only, binary) ==="
     python src/generate_cams.py \
         "checkpoint='${MCTFORMER_CKPT}'" \
         image_dir="${IMAGE_DIR}" \
@@ -153,8 +204,9 @@ if ! should_skip 2; then
         n_layers=3 \
         attention_type=fused \
         patch_attn_refine=true \
-        gt_dir="${GT_DIR}" \
-        eval_threshold_sweep=false
+        gt_dir="${BINARY_GT_DIR}" \
+        eval_threshold_sweep=true \
+        eval_sweep_samples=${SWEEP_SAMPLES}
     echo "CAMs: ${CAM_DIR}"
     echo ""
 fi
@@ -178,12 +230,12 @@ if ! should_skip 3; then
     echo ""
 fi
 
-# ─── Step 4: Evaluate CRF masks vs GT ────────────────────────
+# ─── Step 4: Evaluate CRF masks vs binary GT ─────────────────
 if ! should_skip 4; then
     echo "=== Step 4: Evaluate la_crf masks ==="
     python src/evaluate_masks.py \
         pred_dir="${LA_CRF_DIR}" \
-        gt_dir="${GT_DIR}" \
+        gt_dir="${BINARY_GT_DIR}" \
         num_cls=${NUM_CLS} \
         class_names_file="${CLASS_NAMES}"
 
@@ -191,7 +243,7 @@ if ! should_skip 4; then
     echo "=== Step 4: Evaluate ha_crf masks ==="
     python src/evaluate_masks.py \
         pred_dir="${HA_CRF_DIR}" \
-        gt_dir="${GT_DIR}" \
+        gt_dir="${BINARY_GT_DIR}" \
         num_cls=${NUM_CLS} \
         class_names_file="${CLASS_NAMES}"
     echo ""
@@ -235,12 +287,12 @@ if ! should_skip 6; then
     echo ""
 fi
 
-# ─── Step 7: Evaluate pseudo masks vs GT ─────────────────────
+# ─── Step 7: Evaluate pseudo masks vs binary GT ──────────────
 if ! should_skip 7; then
     echo "=== Step 7: Evaluate pseudo masks (MCTformer + PSA + RW) ==="
     python src/evaluate_masks.py \
         pred_dir="${PSEUDO_MASK_DIR}" \
-        gt_dir="${GT_DIR}" \
+        gt_dir="${BINARY_GT_DIR}" \
         num_cls=${NUM_CLS} \
         class_names_file="${CLASS_NAMES}"
     echo ""
@@ -248,22 +300,22 @@ fi
 
 # ─── Step 8: Train WeakCLIP ──────────────────────────────────
 if ! should_skip 8; then
-    echo "=== Step 8: Train WeakCLIP on pseudo masks ==="
+    echo "=== Step 8: Train WeakCLIP on pseudo masks (binary) ==="
     python src/train_weakclip.py \
         class_names_file="${CLASS_NAMES}" \
         num_classes=${NUM_CLS} \
         train_image_dir="${IMAGE_DIR}" \
         train_mask_dir="${PSEUDO_MASK_DIR}" \
         val_image_dir="${VAL_IMAGE_DIR}" \
-        val_mask_dir="${VAL_GT_DIR}" \
+        val_mask_dir="${BINARY_GT_VAL_DIR}" \
         val_names_file="" \
         image_ext="${IMAGE_EXT}" \
         clip_pretrained="${CLIP_PRETRAINED}" \
         image_size=512 \
         batch_size=16 \
-        max_epochs=50 \
-        learning_rate=4e-4 \
-        min_lr=3e-6 \
+        max_epochs=31 \
+        learning_rate=1e-4 \
+        min_lr=1e-6 \
         warmup_iters=1500 \
         weight_decay=3e-5 \
         identity_loss_weight=0.4 \
@@ -320,19 +372,19 @@ if ! should_skip 9; then
     echo ""
 fi
 
-# ─── Step 10: Evaluate WeakCLIP masks vs GT ──────────────────
+# ─── Step 10: Evaluate WeakCLIP masks vs binary GT ───────────
 if ! should_skip 10; then
     echo "=== Step 10: Evaluate WeakCLIP refined masks ==="
     python src/evaluate_masks.py \
         pred_dir="${WEAKCLIP_MASK_DIR}" \
-        gt_dir="${GT_DIR}" \
+        gt_dir="${BINARY_GT_DIR}" \
         num_cls=${NUM_CLS} \
         class_names_file="${CLASS_NAMES}"
     echo ""
 fi
 
 echo "============================================"
-echo "  Pipeline complete!"
+echo "  Binary Pipeline complete!"
 echo "  Pseudo masks (MCTformer): ${PSEUDO_MASK_DIR}"
 echo "  WeakCLIP masks:          ${WEAKCLIP_MASK_DIR}"
 echo "============================================"

@@ -1,0 +1,6 @@
+outs:
+- md5: fac8672878c31150a72be1c3d23ff99c.dir
+  size: 528054116
+  nfiles: 3
+  hash: md5
+  path: mctformer_plantseg_binary

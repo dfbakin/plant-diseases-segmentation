@@ -67,6 +67,7 @@ class StreamMasksConfig:
     flip: bool = True
     crop_size: int = 512
     stride: int = 341
+    max_long_edge: int = 0
 
     # Model params
     clip_pretrained: str = "pretrained/ViT-B-16.pt"
@@ -88,6 +89,33 @@ cs = ConfigStore.instance()
 cs.store(name="stream_masks_config", node=StreamMasksConfig)
 
 
+def _resize_if_needed(
+    img_np: np.ndarray,
+    img_tensor: torch.Tensor,
+    max_long_edge: int,
+) -> tuple[np.ndarray, torch.Tensor, tuple[int, int] | None]:
+    """Downscale image if its longest edge exceeds *max_long_edge*.
+
+    Returns the (possibly resized) numpy/tensor pair and the original (H, W)
+    if a resize was performed, or None if the image was kept as-is.
+    """
+    h, w = img_np.shape[:2]
+    long_edge = max(h, w)
+    if max_long_edge <= 0 or long_edge <= max_long_edge:
+        return img_np, img_tensor, None
+
+    scale = max_long_edge / long_edge
+    new_h, new_w = int(round(h * scale)), int(round(w * scale))
+
+    img_np = np.array(
+        Image.fromarray(img_np).resize((new_w, new_h), Image.BILINEAR)
+    )
+    img_tensor = torch.nn.functional.interpolate(
+        img_tensor, size=(new_h, new_w), mode="bilinear", align_corners=False,
+    )
+    return img_np, img_tensor, (h, w)
+
+
 def _process_single(
     name: str,
     model: torch.nn.Module,
@@ -101,6 +129,7 @@ def _process_single(
     flip: bool,
     crop_size: int,
     stride: int,
+    max_long_edge: int,
     crf_t: int,
     crf_sxy_gauss: float,
     crf_compat_gauss: float,
@@ -115,6 +144,9 @@ def _process_single(
         return False
 
     img_np, img_tensor = _load_image(img_path)
+    img_np, img_tensor, orig_size = _resize_if_needed(
+        img_np, img_tensor, max_long_edge
+    )
     img_tensor = img_tensor.to(device)
 
     prob = multiscale_flip_inference(
@@ -124,13 +156,11 @@ def _process_single(
     )
     probs = prob.cpu().numpy()  # (C, H, W)
 
-    orig_h, orig_w = img_np.shape[:2]
-    if probs.shape[1] != orig_h or probs.shape[2] != orig_w:
-        import torch.nn.functional as F_t
-
+    crf_h, crf_w = img_np.shape[:2]
+    if probs.shape[1] != crf_h or probs.shape[2] != crf_w:
         probs_t = torch.from_numpy(probs).unsqueeze(0).float()
-        probs_t = F_t.interpolate(
-            probs_t, size=(orig_h, orig_w), mode="bilinear", align_corners=False,
+        probs_t = torch.nn.functional.interpolate(
+            probs_t, size=(crf_h, crf_w), mode="bilinear", align_corners=False,
         )
         probs = probs_t.squeeze(0).numpy()
         probs = np.clip(probs, 1e-7, None)
@@ -147,6 +177,13 @@ def _process_single(
 
     valid_classes = get_valid_seg_classes(labels_dict, name)
     pred = filter_by_image_labels(pred, valid_classes)
+
+    if orig_size is not None:
+        pred = np.array(
+            Image.fromarray(pred.astype(np.uint8)).resize(
+                (orig_size[1], orig_size[0]), Image.NEAREST,
+            )
+        )
 
     out_path = output_dir / f"{name}.png"
     Image.fromarray(pred.astype(np.uint8)).save(str(out_path))
@@ -207,9 +244,11 @@ def generate_refine_masks(cfg: StreamMasksConfig) -> None:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    max_le = cfg.max_long_edge
     log.info(
         f"Streaming generate+refine for {len(names)} images, "
-        f"num_classes={cfg.num_classes}, scales={cfg.scales}, flip={cfg.flip}"
+        f"num_classes={cfg.num_classes}, scales={cfg.scales}, flip={cfg.flip}, "
+        f"max_long_edge={max_le if max_le > 0 else 'unlimited'}"
     )
 
     success = 0
@@ -217,7 +256,7 @@ def generate_refine_masks(cfg: StreamMasksConfig) -> None:
         ok = _process_single(
             name, model, device, image_dir, cfg.image_ext,
             labels_dict, output_dir, cfg.num_classes,
-            cfg.scales, cfg.flip, cfg.crop_size, cfg.stride,
+            cfg.scales, cfg.flip, cfg.crop_size, cfg.stride, max_le,
             cfg.crf_t, cfg.crf_sxy_gauss, cfg.crf_compat_gauss,
             cfg.crf_sxy_bilat, cfg.crf_srgb_bilat, cfg.crf_compat_bilat,
         )

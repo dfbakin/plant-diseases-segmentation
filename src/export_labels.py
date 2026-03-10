@@ -39,7 +39,11 @@ class ExportLabelsConfig:
 
     # PlantSeg / PlantVillage mode
     root: str = ""
+    pv_root: str = "data/plant-village"
     pv_split: str = "train"
+
+    # plantseg_binary mode
+    include_plantvillage: bool = True
 
 
 cs = ConfigStore.instance()
@@ -152,10 +156,60 @@ def export_plantvillage(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray],
     return labels, CLASSIFICATION_CLASSES
 
 
+def export_plantseg_binary(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Export binary labels: disease (1) vs healthy (0).
+
+    PlantSeg images are always labeled as diseased (all contain disease).
+    When ``include_plantvillage`` is True, PlantVillage samples are added:
+    healthy folders get label 0, diseased folders get label 1.
+    """
+    from PIL import Image as PILImage
+
+    from src.data.plantseg import PlantSegMulticlassDataset
+
+    labels: dict[str, np.ndarray] = {}
+
+    ds = PlantSegMulticlassDataset(root=cfg.root, split=cfg.pv_split, transform=None)
+    skipped = 0
+    for sample in tqdm(ds.samples, desc="PlantSeg (binary)"):
+        mask = np.array(PILImage.open(sample["mask_path"]))
+        present = set(np.unique(mask)) - {0, 255}
+        if not present:
+            skipped += 1
+            continue
+        labels[sample["name"]] = np.array([1.0], dtype=np.float32)
+    log.info(f"PlantSeg: {len(labels)} diseased, {skipped} healthy-only skipped")
+
+    if cfg.include_plantvillage:
+        from src.data.plantvillage import PlantVillageDataset
+
+        pv_ds = PlantVillageDataset(root=cfg.pv_root, split=cfg.pv_split)
+        n_healthy, n_diseased, n_collision = 0, 0, 0
+        for sample in tqdm(pv_ds.samples, desc="PlantVillage (binary)"):
+            name = sample["name"]
+            if name in labels:
+                n_collision += 1
+                name = f"pv_{name}"
+            lbl = 0.0 if sample["label"] == 0 else 1.0
+            labels[name] = np.array([lbl], dtype=np.float32)
+            if lbl == 0.0:
+                n_healthy += 1
+            else:
+                n_diseased += 1
+        log.info(
+            f"PlantVillage: {n_healthy} healthy, {n_diseased} diseased, "
+            f"{n_collision} name collisions (prefixed with pv_)"
+        )
+
+    log.info(f"Total: {len(labels)} binary labels")
+    return labels, ["disease"]
+
+
 EXPORTERS = {
     "voc_masks": export_voc_masks,
     "plantseg": export_plantseg,
     "plantseg_wsss": export_plantseg_wsss,
+    "plantseg_binary": export_plantseg_binary,
     "plantvillage": export_plantvillage,
 }
 

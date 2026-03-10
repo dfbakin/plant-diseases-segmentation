@@ -84,8 +84,15 @@ def evaluate_cam_miou(
 
         gt_file = gt_dir / f"{name}.png"
         gt = np.array(Image.open(gt_file))
-        cal = gt < 255
 
+        if predict.shape != gt.shape:
+            predict = np.array(
+                Image.fromarray(predict).resize(
+                    (gt.shape[1], gt.shape[0]), Image.NEAREST
+                )
+            )
+
+        cal = gt < 255
         mask = (predict == gt) * cal
 
         for i in range(num_cls):
@@ -110,6 +117,8 @@ def evaluate_cam_threshold_sweep(
     num_cls: int = 21,
     start: int = 0,
     end: int = 60,
+    max_samples: int = 0,
+    seed: int = 42,
 ) -> dict[str, float]:
     """Sweep background thresholds to find best mIoU for CAM predictions.
 
@@ -120,22 +129,33 @@ def evaluate_cam_threshold_sweep(
         num_cls: Number of classes including background
         start: Start of threshold range (threshold = start/100)
         end: End of threshold range
+        max_samples: When > 0, randomly subsample name_list before sweep.
+        seed: RNG seed for reproducible subsampling.
 
     Returns:
         Dict with 'best_miou', 'best_threshold', and 'miou_curve'
     """
+    if max_samples > 0 and len(name_list) > max_samples:
+        rng = np.random.default_rng(seed)
+        total = len(name_list)
+        name_list = list(rng.choice(name_list, max_samples, replace=False))
+        log.info(f"Subsampled {max_samples}/{total} images for threshold sweep")
+
     best_miou = 0.0
     best_thr = 0.0
     miou_curve = []
+    n_thresholds = end - start
 
-    for i in range(start, end):
+    from tqdm import trange
+
+    for i in trange(start, end, desc="Threshold sweep", unit="thr"):
         t = i / 100.0
         result = evaluate_cam_miou(
             predict_dir, gt_dir, name_list, num_cls, input_type="npy", threshold=t
         )
         miou = result["mIoU"]
         miou_curve.append(miou)
-        log.info(f"threshold={t:.2f}  mIoU={miou:.3f}%")
+        log.info(f"threshold={t:.2f}  mIoU={miou:.3f}%  [{i - start + 1}/{n_thresholds}]")
 
         if miou > best_miou:
             best_miou = miou
