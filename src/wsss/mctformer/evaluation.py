@@ -116,7 +116,7 @@ def evaluate_cam_threshold_sweep(
     name_list: list[str],
     num_cls: int = 21,
     start: int = 0,
-    end: int = 60,
+    end: int = 100,
     max_samples: int = 0,
     seed: int = 42,
 ) -> dict[str, float]:
@@ -144,7 +144,7 @@ def evaluate_cam_threshold_sweep(
     best_miou = 0.0
     best_thr = 0.0
     miou_curve = []
-    n_thresholds = end - start
+    # n_thresholds = end - start
 
     from tqdm import trange
 
@@ -155,7 +155,7 @@ def evaluate_cam_threshold_sweep(
         )
         miou = result["mIoU"]
         miou_curve.append(miou)
-        log.info(f"threshold={t:.2f}  mIoU={miou:.3f}%  [{i - start + 1}/{n_thresholds}]")
+        # log.info(f"threshold={t:.2f}  mIoU={miou:.3f}%  [{i - start + 1}/{n_thresholds}]")
 
         if miou > best_miou:
             best_miou = miou

@@ -1,6 +1,6 @@
 outs:
-- md5: 87bb8597056d5635688de1d1d3608299.dir
-  size: 17378179861
-  nfiles: 23748
+- md5: 062ce4058addb44069f19d6b58f8f27f.dir
+  size: 23171308061
+  nfiles: 39580
   hash: md5
   path: cams

@@ -1,0 +1,6 @@
+outs:
+- md5: 7fae9434c95c07a7237318026ed09613.dir
+  size: 59245668
+  nfiles: 7916
+  hash: md5
+  path: weakclip_masks_t_0.64

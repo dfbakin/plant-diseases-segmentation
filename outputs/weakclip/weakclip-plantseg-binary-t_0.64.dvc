@@ -1,0 +1,6 @@
+outs:
+- md5: 32272ee7e689a029a91683ab806e0360.dir
+  size: 4592660243
+  nfiles: 7
+  hash: md5
+  path: weakclip-plantseg-binary-t_0.64

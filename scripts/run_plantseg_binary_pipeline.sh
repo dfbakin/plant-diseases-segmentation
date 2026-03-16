@@ -56,20 +56,20 @@ MCTFORMER_CKPT="${MCTFORMER_CKPT:-}"
 
 # CAMs
 CAM_DIR="${OUT_BASE}/cams/cam_npy"
-LA_CRF_DIR="${OUT_BASE}/cams/la_crf"
-HA_CRF_DIR="${OUT_BASE}/cams/ha_crf"
+LA_CRF_DIR="${OUT_BASE}/cams/la_crf_t_0.64"
+HA_CRF_DIR="${OUT_BASE}/cams/ha_crf_t_0.64"
 
 # PSA
 PSA_BACKBONE="pretrained/res38_cls.pth"
-PSA_CKPT="${OUT_BASE}/psa/psa_aff.pth"
+PSA_CKPT="${OUT_BASE}/psa/psa_aff_t_0.64.pth"
 
 # Pseudo masks
-PSEUDO_MASK_DIR="${OUT_BASE}/pseudo_masks"
+PSEUDO_MASK_DIR="${OUT_BASE}/pseudo_masks_t_0.64"
 
 # WeakCLIP
-WEAKCLIP_EXPERIMENT="weakclip-plantseg-binary"
+WEAKCLIP_EXPERIMENT="weakclip-plantseg-binary-t_0.64"
 CLIP_PRETRAINED="pretrained/ViT-B-16.pt"
-WEAKCLIP_MASK_DIR="${OUT_BASE}/weakclip_masks"
+WEAKCLIP_MASK_DIR="${OUT_BASE}/weakclip_masks_t_0.64"
 
 NUM_WORKERS=16
 SWEEP_SAMPLES=500
@@ -220,7 +220,7 @@ if ! should_skip 3; then
         image_ext="${IMAGE_EXT}" \
         la_crf_dir="${LA_CRF_DIR}" \
         ha_crf_dir="${HA_CRF_DIR}" \
-        bg_threshold=0.3 \
+        bg_threshold=0.64 \
         la_scale_factor=1.0 \
         ha_scale_factor=12.0 \
         crf_iters=10 \
@@ -260,7 +260,7 @@ if ! should_skip 5; then
         backbone_weights="${PSA_BACKBONE}" \
         output_path="${PSA_CKPT}" \
         batch_size=8 \
-        max_epochs=10 \
+        max_epochs=20 \
         lr=0.01 \
         num_workers=${NUM_WORKERS} \
         cropsize=512

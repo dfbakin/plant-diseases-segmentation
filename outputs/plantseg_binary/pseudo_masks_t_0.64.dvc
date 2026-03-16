@@ -1,0 +1,6 @@
+outs:
+- md5: 13732a82c6aa2d80ddb66113ac79172d.dir
+  size: 23778988
+  nfiles: 7916
+  hash: md5
+  path: pseudo_masks_t_0.64
