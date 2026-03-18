@@ -1,0 +1,6 @@
+outs:
+- md5: d51500131b77bba06555586db6978f76.dir
+  size: 37350405
+  nfiles: 7916
+  hash: md5
+  path: gt_binary_train

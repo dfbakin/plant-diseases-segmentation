@@ -1,0 +1,6 @@
+outs:
+- md5: 3a3612e2ecef504c72baec719b218e2e.dir
+  size: 17438374475
+  nfiles: 23942
+  hash: md5
+  path: cams

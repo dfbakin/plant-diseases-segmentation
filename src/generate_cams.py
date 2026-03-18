@@ -48,6 +48,8 @@ class GenCAMConfig:
     attention_type: str = "fused"
     patch_attn_refine: bool = True
 
+    binary_aggregate: str = ""
+
     gt_dir: str = ""
     eval_threshold_sweep: bool = False
     eval_sweep_samples: int = 0
@@ -85,7 +87,13 @@ def generate_cam_single(
     cfg: GenCAMConfig,
     device: torch.device,
 ) -> dict[int, np.ndarray]:
-    """Generate fused multi-scale CAM for one image."""
+    """Generate fused multi-scale CAM for one image.
+
+    When ``cfg.binary_aggregate`` is set (``"max"`` or ``"mean"``), all class
+    CAMs are computed without GT masking and aggregated into a single binary
+    CAM stored as ``{0: cam}``.
+    """
+    aggregate = cfg.binary_aggregate
     w_orig = image_list[0].shape[2]
     h_orig = image_list[0].shape[3]
 
@@ -111,13 +119,27 @@ def generate_cam_single(
         cls_att = F.interpolate(
             cls_att, size=(w_orig, h_orig), mode="bilinear", align_corners=False
         )
-        cls_att = cls_att[0].cpu().numpy() * target.view(cfg.num_classes, 1, 1).cpu().numpy()
+        cls_att = cls_att[0].cpu().numpy()
+
+        if not aggregate:
+            cls_att = cls_att * target.view(cfg.num_classes, 1, 1).cpu().numpy()
 
         if s % 2 == 1:
             cls_att = np.flip(cls_att, axis=-1)
         cam_list.append(cls_att)
 
     sum_cam = np.sum(cam_list, axis=0)
+
+    if aggregate:
+        if aggregate == "max":
+            merged = np.max(sum_cam, axis=0)
+        elif aggregate == "mean":
+            merged = np.mean(sum_cam, axis=0)
+        else:
+            raise ValueError(f"Unknown binary_aggregate: {aggregate!r}. Use 'max' or 'mean'.")
+        merged = (merged - merged.min()) / (merged.max() - merged.min() + 1e-8)
+        return {0: merged.astype(np.float32)}
+
     cam_dict: dict[int, np.ndarray] = {}
     for c in range(cfg.num_classes):
         if target[c] > 0:
@@ -133,9 +155,13 @@ def generate_cams(cfg: GenCAMConfig) -> None:
     model = load_model(cfg.checkpoint, cfg.num_classes, cfg.input_size).to(device)
     model.eval()
 
+    if cfg.binary_aggregate and cfg.binary_aggregate not in ("max", "mean"):
+        raise ValueError(f"binary_aggregate must be 'max', 'mean', or '' (disabled), got {cfg.binary_aggregate!r}")
+
     labels = np.load(cfg.label_file, allow_pickle=True).item()
     names = list(labels.keys())
-    log.info(f"Generating CAMs for {len(names)} images, scales={cfg.scales}")
+    agg_msg = f", binary_aggregate={cfg.binary_aggregate}" if cfg.binary_aggregate else ""
+    log.info(f"Generating CAMs for {len(names)} images, scales={cfg.scales}{agg_msg}")
 
     image_dir = Path(cfg.image_dir)
     output_dir = Path(cfg.output_dir)
@@ -181,12 +207,15 @@ def generate_cams(cfg: GenCAMConfig) -> None:
     log.info(f"Saved CAMs to {output_dir}")
 
     if cfg.eval_threshold_sweep and cfg.gt_dir:
-        log.info("Running threshold sweep for mIoU evaluation...")
+        eval_num_cls = 2 if cfg.binary_aggregate else cfg.num_classes + 1
+        log.info(
+            f"Running threshold sweep for mIoU evaluation (num_cls={eval_num_cls})..."
+        )
         result = evaluate_cam_threshold_sweep(
             predict_dir=str(output_dir),
             gt_dir=cfg.gt_dir,
             name_list=names,
-            num_cls=cfg.num_classes + 1,
+            num_cls=eval_num_cls,
             max_samples=cfg.eval_sweep_samples,
         )
         log.info(

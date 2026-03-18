@@ -156,6 +156,61 @@ def export_plantvillage(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray],
     return labels, CLASSIFICATION_CLASSES
 
 
+def export_plantseg_wsss_with_pv(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
+    """Export 115-class WSSS labels from PlantSeg + PlantVillage.
+
+    PlantSeg images: labels from GT segmentation masks (same as plantseg_wsss).
+    PlantVillage images: mapped to PlantSeg disease indices 1-115 via
+    PLANTVILLAGE_FOLDER_TO_CLASS.  Healthy (index 0) and PV-only diseases
+    (indices 116-119) are skipped.
+    """
+    from PIL import Image as PILImage
+
+    from src.data.plantseg import DISEASE_CLASSES, PlantSegMulticlassDataset
+    from src.data.plantvillage import PlantVillageDataset
+    from src.data.plantvillage_mappings import PLANTVILLAGE_FOLDER_TO_CLASS
+
+    num_fg = len(DISEASE_CLASSES) - 1
+    class_names = DISEASE_CLASSES[1:]
+
+    labels: dict[str, np.ndarray] = {}
+
+    ds = PlantSegMulticlassDataset(root=cfg.root, split=cfg.pv_split, transform=None)
+    skipped = 0
+    for sample in tqdm(ds.samples, desc="PlantSeg WSSS"):
+        mask = np.array(PILImage.open(sample["mask_path"]))
+        present = set(np.unique(mask)) - {0, 255}
+        if not present:
+            skipped += 1
+            continue
+        label = np.zeros(num_fg, dtype=np.float32)
+        for cls_idx in present:
+            if 1 <= cls_idx <= num_fg:
+                label[cls_idx - 1] = 1.0
+        labels[sample["name"]] = label
+
+    log.info(f"PlantSeg WSSS: {len(labels)} images with diseases, {skipped} healthy-only skipped")
+
+    pv_ds = PlantVillageDataset(root=cfg.pv_root, split=cfg.pv_split)
+    n_added, n_skipped = 0, 0
+    for sample in tqdm(pv_ds.samples, desc="PlantVillage (multiclass)"):
+        cls_idx = sample["label"]
+        if not (1 <= cls_idx <= num_fg):
+            n_skipped += 1
+            continue
+        name = sample["name"]
+        if name in labels:
+            name = f"pv_{name}"
+        label = np.zeros(num_fg, dtype=np.float32)
+        label[cls_idx - 1] = 1.0
+        labels[name] = label
+        n_added += 1
+
+    log.info(f"PlantVillage: {n_added} disease images added, {n_skipped} healthy/PV-only skipped")
+    log.info(f"Total: {len(labels)} multiclass labels")
+    return labels, class_names
+
+
 def export_plantseg_binary(cfg: ExportLabelsConfig) -> tuple[dict[str, np.ndarray], list[str]]:
     """Export binary labels: disease (1) vs healthy (0).
 
@@ -209,6 +264,7 @@ EXPORTERS = {
     "voc_masks": export_voc_masks,
     "plantseg": export_plantseg,
     "plantseg_wsss": export_plantseg_wsss,
+    "plantseg_wsss_with_pv": export_plantseg_wsss_with_pv,
     "plantseg_binary": export_plantseg_binary,
     "plantvillage": export_plantvillage,
 }

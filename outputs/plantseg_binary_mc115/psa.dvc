@@ -1,0 +1,6 @@
+outs:
+- md5: 6e4ee083e2f42a6798009356fc9c1716.dir
+  size: 426206193
+  nfiles: 1
+  hash: md5
+  path: psa

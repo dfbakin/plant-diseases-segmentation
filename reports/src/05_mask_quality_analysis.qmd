@@ -1,0 +1,332 @@
+---
+title: "Pseudomask Quality Analysis"
+subtitle: "Plant Disease Segmentation --- Binary vs MC115 pipeline comparison"
+format: beamer
+---
+
+```{python}
+#| echo: false
+
+from pathlib import Path
+import json
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+from IPython.display import Markdown, display
+
+ANALYSIS_ROOT = Path("../resources/mask_quality_binary_plantseg")
+
+methods = {}
+for p in sorted(ANALYSIS_ROOT.glob("*_summary.json")):
+    with open(p) as f:
+        s = json.load(f)
+    methods[s["label"]] = s
+
+method_labels = list(methods.keys())
+```
+
+## Pipeline comparison: Binary vs MC115 (2-class eval)
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+rows = [
+    {"Pipeline": "Binary",  "Stage": "LA-CRF",  "mIoU": "45.01%", "BG IoU": "77.37%", "Disease IoU": "12.64%"},
+    {"Pipeline": "MC115",   "Stage": "LA-CRF",  "mIoU": "51.94%", "BG IoU": "76.10%", "Disease IoU": "27.77%"},
+    {"Pipeline": "Binary",  "Stage": "HA-CRF",  "mIoU": "45.44%", "BG IoU": "76.52%", "Disease IoU": "14.36%"},
+    {"Pipeline": "MC115",   "Stage": "HA-CRF",  "mIoU": "53.49%", "BG IoU": "75.81%", "Disease IoU": "31.16%"},
+    {"Pipeline": "Binary",  "Stage": "PSA+RW",  "mIoU": "43.01%", "BG IoU": "65.80%", "Disease IoU": "20.21%"},
+    {"Pipeline": "MC115",   "Stage": "PSA+RW",  "mIoU": "42.29%", "BG IoU": "54.17%", "Disease IoU": "30.42%"},
+    {"Pipeline": "Binary",  "Stage": "WeakCLIP","mIoU": "46.22%", "BG IoU": "66.93%", "Disease IoU": "25.52%"},
+    {"Pipeline": "MC115",   "Stage": "WeakCLIP","mIoU": "46.36%", "BG IoU": "59.40%", "Disease IoU": "33.31%"},
+]
+
+pdf = pd.DataFrame(rows)
+display(Markdown(pdf.to_markdown(index=False)))
+display(Markdown(
+    r"""
+**MC115 hypothesis confirmed:** multiclass (115 disease) MCTformer produces
+more localized CAM activations. Disease IoU improves at every stage
+(e.g.\ WeakCLIP: 25.52% $\to$ 33.31%, $+$31% relative). Background IoU
+drops due to increased recall, with overall mIoU comparable or better.
+"""
+))
+```
+
+---
+
+## Aggregate metrics (per-image, disease-only)
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+rows = []
+for label, s in methods.items():
+    rows.append({
+        "Method": label,
+        "n": s["n_images"],
+        r"mIoU $\uparrow$": f"{s['mIoU']:.1f}%",
+        r"Med. IoU": f"{s['median_iou']:.1f}%",
+        r"Prec. $\uparrow$": f"{s['mean_precision']:.3f}",
+        r"Recall $\uparrow$": f"{s['mean_recall']:.3f}",
+        r"Overseg $\downarrow$": f"{s['mean_overseg_ratio']:.3f}",
+        r"Underseg $\downarrow$": f"{s['mean_underseg_ratio']:.3f}",
+    })
+
+display(Markdown(pd.DataFrame(rows).to_markdown(index=False)))
+```
+
+---
+
+## Sparsity summary
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+rows = []
+for label, s in methods.items():
+    rows.append({
+        "Method": label,
+        "Mean GT fg%": f"{s['mean_gt_fg_frac']:.1%}",
+        "Median GT fg%": f"{s['median_gt_fg_frac']:.1%}",
+        "Mean Pred fg%": f"{s['mean_pred_fg_frac']:.1%}",
+        "Median Pred fg%": f"{s['median_pred_fg_frac']:.1%}",
+        "Pred/GT ratio": f"{s['mean_pred_fg_frac']/max(s['mean_gt_fg_frac'],1e-9):.2f}x",
+    })
+
+display(Markdown(pd.DataFrame(rows).to_markdown(index=False)))
+```
+
+Key: Pred/GT ratio > 1 means systematic oversegmentation.
+
+---
+
+## IoU distribution
+
+```{python}
+#| echo: false
+#| fig-cap: "Per-image foreground IoU distribution"
+#| output-location: slide
+
+colors = ["#2176AE", "#D7263D", "#57A773", "#F49D37"]
+fig, ax = plt.subplots(figsize=(9, 4))
+for i, label in enumerate(method_labels):
+    csv_path = ANALYSIS_ROOT / f"{label.replace('/', '_').replace(' ', '_')}_per_image.csv"
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        ax.hist(df["iou"], bins=50, alpha=0.55, label=label,
+                color=colors[i % len(colors)], edgecolor="white", linewidth=0.5)
+ax.set_xlabel("Per-image foreground IoU")
+ax.set_ylabel("Count")
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## GT sparsity vs Pred sparsity
+
+```{python}
+#| echo: false
+#| fig-cap: "Points above the diagonal = oversegmentation"
+#| output-location: slide
+
+colors = ["#2176AE", "#D7263D", "#57A773", "#F49D37"]
+n = len(method_labels)
+fig, axes = plt.subplots(1, n, figsize=(5*n, 4.5), squeeze=False)
+for i, label in enumerate(method_labels):
+    csv_path = ANALYSIS_ROOT / f"{label.replace('/', '_').replace(' ', '_')}_per_image.csv"
+    ax = axes[0, i]
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        ax.scatter(df["gt_fg_frac"], df["pred_fg_frac"],
+                   s=4, alpha=0.3, color=colors[i % len(colors)], rasterized=True)
+        lim = max(df["gt_fg_frac"].max(), df["pred_fg_frac"].max()) * 1.05
+        ax.plot([0, lim], [0, lim], "k--", alpha=0.4, linewidth=1)
+        ax.set_xlim(0, lim); ax.set_ylim(0, lim)
+        ax.set_aspect("equal")
+    ax.set_xlabel("GT fg fraction")
+    ax.set_ylabel("Pred fg fraction")
+    ax.set_title(label)
+    ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Oversegmentation vs Undersegmentation
+
+```{python}
+#| echo: false
+#| fig-cap: "Each point is one image. Mean shown with dashed lines."
+#| output-location: slide
+
+colors = ["#2176AE", "#D7263D", "#57A773", "#F49D37"]
+n = len(method_labels)
+fig, axes = plt.subplots(1, n, figsize=(5*n, 4.5), squeeze=False)
+for i, label in enumerate(method_labels):
+    csv_path = ANALYSIS_ROOT / f"{label.replace('/', '_').replace(' ', '_')}_per_image.csv"
+    ax = axes[0, i]
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        ax.scatter(df["overseg_ratio"], df["underseg_ratio"],
+                   s=4, alpha=0.3, color=colors[i % len(colors)], rasterized=True)
+        mo = df["overseg_ratio"].mean()
+        mu = df["underseg_ratio"].mean()
+        ax.axvline(mo, color="red", ls="--", alpha=0.6, label=f"mean overseg={mo:.2f}")
+        ax.axhline(mu, color="blue", ls="--", alpha=0.6, label=f"mean underseg={mu:.2f}")
+        ax.legend(fontsize=7, loc="upper right")
+    ax.set_xlabel("Overseg ratio (FP / pred)")
+    ax.set_ylabel("Underseg ratio (FN / GT)")
+    ax.set_title(label)
+    ax.set_xlim(-0.02, 1.02); ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## IoU vs GT sparsity
+
+```{python}
+#| echo: false
+#| fig-cap: "Colored by oversegmentation ratio (red = high overseg)"
+#| output-location: slide
+
+n = len(method_labels)
+fig, axes = plt.subplots(1, n, figsize=(5*n, 4.5), squeeze=False)
+for i, label in enumerate(method_labels):
+    csv_path = ANALYSIS_ROOT / f"{label.replace('/', '_').replace(' ', '_')}_per_image.csv"
+    ax = axes[0, i]
+    if csv_path.exists():
+        df = pd.read_csv(csv_path)
+        sc = ax.scatter(df["gt_fg_frac"], df["iou"],
+                        c=df["overseg_ratio"], cmap="RdYlGn_r",
+                        s=4, alpha=0.4, vmin=0, vmax=1, rasterized=True)
+        fig.colorbar(sc, ax=ax, label="Overseg ratio", shrink=0.8)
+    ax.set_xlabel("GT fg fraction")
+    ax.set_ylabel("IoU")
+    ax.set_title(label)
+    ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+```
+
+---
+
+## Per-disease breakdown (worst + best)
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+for label in method_labels:
+    safe = label.replace("/", "_").replace(" ", "_")
+    csv_path = ANALYSIS_ROOT / f"{safe}_per_disease.csv"
+    if not csv_path.exists():
+        continue
+    ddf = pd.read_csv(csv_path)
+    worst5 = ddf.head(5)[["disease", "count", "mean_iou", "mean_overseg", "mean_underseg"]].copy()
+    best5 = ddf.tail(5)[["disease", "count", "mean_iou", "mean_overseg", "mean_underseg"]].copy()
+    worst5["mean_iou"] = worst5["mean_iou"].map(lambda x: f"{x*100:.1f}%")
+    best5["mean_iou"] = best5["mean_iou"].map(lambda x: f"{x*100:.1f}%")
+    worst5["mean_overseg"] = worst5["mean_overseg"].map(lambda x: f"{x:.2f}")
+    best5["mean_overseg"] = best5["mean_overseg"].map(lambda x: f"{x:.2f}")
+    worst5["mean_underseg"] = worst5["mean_underseg"].map(lambda x: f"{x:.2f}")
+    best5["mean_underseg"] = best5["mean_underseg"].map(lambda x: f"{x:.2f}")
+    display(Markdown(f"**{label} -- worst 5 diseases:**"))
+    display(Markdown(worst5.to_markdown(index=False)))
+    display(Markdown(f"\n**{label} -- best 5 diseases:**"))
+    display(Markdown(best5.to_markdown(index=False)))
+```
+
+---
+
+## Worst examples (lowest IoU)
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+from IPython.display import Image as IPImage
+
+for label in method_labels:
+    safe = label.replace("/", "_").replace(" ", "_")
+    fig_path = ANALYSIS_ROOT / "figures" / f"worst_examples_{safe}.png"
+    if fig_path.exists():
+        display(Markdown(f"**{label}**"))
+        display(IPImage(filename=str(fig_path), width=700))
+```
+
+---
+
+## Best examples (highest IoU)
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+for label in method_labels:
+    safe = label.replace("/", "_").replace(" ", "_")
+    fig_path = ANALYSIS_ROOT / "figures" / f"best_examples_{safe}.png"
+    if fig_path.exists():
+        display(Markdown(f"**{label}**"))
+        display(IPImage(filename=str(fig_path), width=700))
+```
+
+---
+
+## Side-by-side: Binary vs MC115
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+from IPython.display import Image as IPImage
+
+sbs_dir = ANALYSIS_ROOT / "figures" / "side_by_side"
+if sbs_dir.exists():
+    samples = sorted(sbs_dir.glob("*.png"))[:4]
+    for p in samples:
+        display(IPImage(filename=str(p), width=750))
+```
+
+---
+
+## Takeaways
+
+```{python}
+#| echo: false
+#| output-location: slide
+
+binary = {k: v for k, v in methods.items() if k.startswith("Binary")}
+mc115 = {k: v for k, v in methods.items() if k.startswith("MC115")}
+
+lines = ["**Binary vs MC115 comparison (per-image disease IoU):**\n"]
+for bkey, mkey in [("Binary PSA+RW", "MC115 PSA+RW"), ("Binary WeakCLIP", "MC115 WeakCLIP")]:
+    if bkey in methods and mkey in methods:
+        b, m = methods[bkey], methods[mkey]
+        delta_iou = m["mIoU"] - b["mIoU"]
+        lines.append(f"**{bkey.split()[-1]}**: disease IoU {b['mIoU']:.1f}% → {m['mIoU']:.1f}% "
+                     f"(+{delta_iou:.1f}pp)")
+        lines.append(f"  - Recall: {b['mean_recall']:.3f} → {m['mean_recall']:.3f}, "
+                     f"Underseg: {b['mean_underseg_ratio']:.3f} → {m['mean_underseg_ratio']:.3f}")
+display(Markdown("\n".join(lines)))
+
+display(Markdown(
+    r"""
+**Key finding:** MC115 multiclass training dramatically improves disease
+detection (recall $+$0.3 for PSA+RW, $+$0.09 for WeakCLIP) and reduces
+undersegmentation. The remaining bottleneck is oversegmentation
+(overseg $\approx$ 0.62), suggesting that mask refinement (SAM with
+``smallest\_area`` selection) could still help at this stage.
+"""
+))
+```

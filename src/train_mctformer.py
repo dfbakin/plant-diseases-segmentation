@@ -143,20 +143,25 @@ def _build_datasets(
             include_plantvillage=True,
         )
         return train_ds, val_ds, 1
-    elif cfg.dataset == "plantseg":
+    elif cfg.dataset in ("plantseg", "plantseg_with_pv"):
         dcfg = cfg.plantseg_data
         image_size = dcfg.image_size
+        include_pv = cfg.dataset == "plantseg_with_pv"
         train_ds = PlantSegMCTformerDataset(
             root=dcfg.root,
             split=dcfg.train_split,
             image_size=image_size,
             transform=build_train_transform(image_size),
+            plantvillage_root=dcfg.pv_root,
+            include_plantvillage=include_pv,
         )
         val_ds = PlantSegMCTformerDataset(
             root=dcfg.root,
             split=dcfg.val_split,
             image_size=image_size,
             transform=build_val_transform(image_size),
+            plantvillage_root=dcfg.pv_root,
+            include_plantvillage=include_pv,
         )
         return train_ds, val_ds, NUM_PLANTSEG_FG_CLASSES
     else:
@@ -192,7 +197,7 @@ def train_mctformer(cfg: MCTformerConfig) -> float:
     log.info(f"Dataset: {cfg.dataset}, num_classes: {num_classes}")
     log.info(f"Train: {len(train_ds)} images, Val: {len(val_ds)} images")
 
-    dcfg = cfg.plantseg_data if cfg.dataset in ("plantseg", "plantseg_binary") else cfg.data
+    dcfg = cfg.plantseg_data if cfg.dataset in ("plantseg", "plantseg_with_pv", "plantseg_binary") else cfg.data
     train_loader = DataLoader(
         train_ds,
         batch_size=dcfg.batch_size,

@@ -104,6 +104,11 @@ class PlantSegMCTformerDataset(Dataset):
     CAM foreground index i maps to segmentation class i+1, matching the
     GT annotation indices directly.  Healthy-only images are skipped.
 
+    When ``include_plantvillage`` is True, PlantVillage diseased images are
+    appended using the PLANTVILLAGE_FOLDER_TO_CLASS mapping.  Only PV images
+    that map to PlantSeg disease indices 1-115 are included (healthy and
+    PV-only diseases are skipped).
+
     Expected structure:
         {root}/images/{split}/*.jpg
         {root}/annotations/{split}/*.png   (multiclass, values 0-115)
@@ -115,6 +120,8 @@ class PlantSegMCTformerDataset(Dataset):
         split: Literal["train", "val", "test"] = "train",
         image_size: int = 448,
         transform: A.Compose | Callable | None = None,
+        plantvillage_root: str | Path = "",
+        include_plantvillage: bool = False,
     ) -> None:
         self.root = Path(root)
         self.image_dir = self.root / "images" / split
@@ -127,6 +134,10 @@ class PlantSegMCTformerDataset(Dataset):
             raise FileNotFoundError(f"Masks not found: {self.mask_dir}")
 
         self.names = self._collect_names()
+
+        self._pv_samples: list[tuple[Path, torch.Tensor]] = []
+        if include_plantvillage and plantvillage_root:
+            self._load_plantvillage(plantvillage_root, split)
 
         if transform is not None:
             self.transform = transform
@@ -152,18 +163,35 @@ class PlantSegMCTformerDataset(Dataset):
             names.append(img_path.stem)
         return names
 
+    def _load_plantvillage(self, pv_root: str | Path, split: str) -> None:
+        from src.data.plantvillage_mappings import PLANTVILLAGE_FOLDER_TO_CLASS
+
+        pv_ds = PlantVillageDataset(root=pv_root, split=split)
+        for sample in pv_ds.samples:
+            cls_idx = sample["label"]  # CLASSIFICATION_CLASSES index
+            if not (1 <= cls_idx <= self.num_classes):
+                continue
+            label = torch.zeros(self.num_classes, dtype=torch.float32)
+            label[cls_idx - 1] = 1.0
+            self._pv_samples.append((sample["image_path"], label))
+
     def __len__(self) -> int:
-        return len(self.names)
+        return len(self.names) + len(self._pv_samples)
 
     def __getitem__(self, idx: int) -> dict:
-        name = self.names[idx]
-        pil_img = Image.open(self.image_dir / f"{name}.jpg").convert("RGB")
-        mask = np.array(Image.open(self.mask_dir / f"{name}.png"))
+        if idx < len(self.names):
+            name = self.names[idx]
+            pil_img = Image.open(self.image_dir / f"{name}.jpg").convert("RGB")
+            mask = np.array(Image.open(self.mask_dir / f"{name}.png"))
 
-        label = torch.zeros(self.num_classes, dtype=torch.float32)
-        for cls_idx in np.unique(mask):
-            if 1 <= cls_idx <= self.num_classes:
-                label[cls_idx - 1] = 1.0
+            label = torch.zeros(self.num_classes, dtype=torch.float32)
+            for cls_idx in np.unique(mask):
+                if 1 <= cls_idx <= self.num_classes:
+                    label[cls_idx - 1] = 1.0
+        else:
+            pv_path, label = self._pv_samples[idx - len(self.names)]
+            name = pv_path.stem
+            pil_img = Image.open(pv_path).convert("RGB")
 
         if isinstance(self.transform, A.Compose):
             augmented = self.transform(image=np.array(pil_img))
