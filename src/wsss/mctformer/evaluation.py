@@ -110,6 +110,38 @@ def evaluate_cam_miou(
     return result
 
 
+def _resolve_optimize_key(
+    optimize_metric: str,
+    result: dict[str, float],
+    num_cls: int,
+) -> str:
+    """Map ``optimize_metric`` to the actual key in an ``evaluate_cam_miou`` result dict.
+
+    Accepted values:
+        ``"mIoU"``        – overall mean IoU (default, legacy behaviour)
+        ``"disease_iou"`` – foreground IoU (last class when num_cls==2, else raises)
+        any key present in *result* (e.g. a category name like ``"disease"``)
+    """
+    if optimize_metric == "mIoU":
+        return "mIoU"
+    if optimize_metric == "disease_iou":
+        fg_keys = [k for k in result if k not in ("mIoU", "background")]
+        if len(fg_keys) == 1:
+            return fg_keys[0]
+        if num_cls == 2:
+            return fg_keys[0] if fg_keys else "mIoU"
+        raise ValueError(
+            f"optimize_metric='disease_iou' is ambiguous for num_cls={num_cls} "
+            f"(foreground keys: {fg_keys}). Pass an explicit class name instead."
+        )
+    if optimize_metric in result:
+        return optimize_metric
+    raise ValueError(
+        f"optimize_metric={optimize_metric!r} not found in evaluation result keys: "
+        f"{list(result.keys())}"
+    )
+
+
 def evaluate_cam_threshold_sweep(
     predict_dir: str | Path,
     gt_dir: str | Path,
@@ -119,21 +151,30 @@ def evaluate_cam_threshold_sweep(
     end: int = 100,
     max_samples: int = 0,
     seed: int = 42,
-) -> dict[str, float]:
-    """Sweep background thresholds to find best mIoU for CAM predictions.
+    optimize_metric: str = "mIoU",
+    patience: int = 0,
+) -> dict[str, float | list]:
+    """Sweep background thresholds and find the best one for a chosen metric.
 
     Args:
-        predict_dir: Directory with .npy CAM files
-        gt_dir: Directory with GT masks
-        name_list: Image name list
-        num_cls: Number of classes including background
-        start: Start of threshold range (threshold = start/100)
-        end: End of threshold range
+        predict_dir: Directory with .npy CAM files.
+        gt_dir: Directory with GT masks.
+        name_list: Image name list.
+        num_cls: Number of classes including background.
+        start: Start of threshold range (threshold = start/100).
+        end: End of threshold range.
         max_samples: When > 0, randomly subsample name_list before sweep.
         seed: RNG seed for reproducible subsampling.
+        optimize_metric: Which metric to maximize.
+            ``"mIoU"`` (default), ``"disease_iou"`` (foreground class for
+            binary), or any per-class name returned by ``evaluate_cam_miou``.
+        patience: Stop after *patience* consecutive non-improving thresholds.
+            0 means run the full sweep (recommended).
 
     Returns:
-        Dict with 'best_miou', 'best_threshold', and 'miou_curve'
+        Dict with ``best_<metric>``, ``best_threshold``, per-threshold curves
+        for mIoU and per-class IoUs, and full ``result_at_best`` with all
+        per-class IoUs at the selected threshold.
     """
     if max_samples > 0 and len(name_list) > max_samples:
         rng = np.random.default_rng(seed)
@@ -141,31 +182,54 @@ def evaluate_cam_threshold_sweep(
         name_list = list(rng.choice(name_list, max_samples, replace=False))
         log.info(f"Subsampled {max_samples}/{total} images for threshold sweep")
 
-    best_miou = 0.0
-    best_thr = 0.0
-    miou_curve = []
-    # n_thresholds = end - start
-
     from tqdm import trange
+
+    best_score = -1.0
+    best_thr = 0.0
+    best_result: dict[str, float] = {}
+    no_improve_count = 0
+
+    curves: dict[str, list[float]] = {"threshold": [], "mIoU": []}
+    opt_key: str | None = None
 
     for i in trange(start, end, desc="Threshold sweep", unit="thr"):
         t = i / 100.0
         result = evaluate_cam_miou(
             predict_dir, gt_dir, name_list, num_cls, input_type="npy", threshold=t
         )
-        miou = result["mIoU"]
-        miou_curve.append(miou)
-        # log.info(f"threshold={t:.2f}  mIoU={miou:.3f}%  [{i - start + 1}/{n_thresholds}]")
 
-        if miou > best_miou:
-            best_miou = miou
+        if opt_key is None:
+            opt_key = _resolve_optimize_key(optimize_metric, result, num_cls)
+            for k in result:
+                if k not in curves:
+                    curves[k] = []
+            log.info(f"Optimizing threshold for: {opt_key}")
+
+        curves["threshold"].append(t)
+        for k in result:
+            curves.setdefault(k, []).append(result[k])
+
+        score = result[opt_key]
+        if score > best_score:
+            best_score = score
             best_thr = t
+            best_result = result
+            no_improve_count = 0
         else:
-            break
+            no_improve_count += 1
+            if patience > 0 and no_improve_count >= patience:
+                log.info(f"Early stop at threshold={t:.2f} (patience={patience})")
+                break
 
-    log.info(f"Best threshold={best_thr:.2f}  mIoU={best_miou:.3f}%")
+    log.info(
+        f"Best threshold={best_thr:.2f}  {opt_key}={best_score:.2f}%  "
+        f"mIoU={best_result.get('mIoU', 0.0):.2f}%"
+    )
     return {
-        "best_miou": best_miou,
         "best_threshold": best_thr,
-        "miou_curve": miou_curve,
+        f"best_{opt_key}": best_score,
+        "best_miou": best_result.get("mIoU", 0.0),
+        "result_at_best": best_result,
+        "curves": curves,
+        "optimize_metric": opt_key,
     }

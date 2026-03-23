@@ -53,6 +53,7 @@ class GenCAMConfig:
     gt_dir: str = ""
     eval_threshold_sweep: bool = False
     eval_sweep_samples: int = 0
+    eval_optimize_metric: str = "disease_iou"
 
 
 cs = ConfigStore.instance()
@@ -209,7 +210,8 @@ def generate_cams(cfg: GenCAMConfig) -> None:
     if cfg.eval_threshold_sweep and cfg.gt_dir:
         eval_num_cls = 2 if cfg.binary_aggregate else cfg.num_classes + 1
         log.info(
-            f"Running threshold sweep for mIoU evaluation (num_cls={eval_num_cls})..."
+            f"Running threshold sweep (optimize={cfg.eval_optimize_metric}, "
+            f"num_cls={eval_num_cls})..."
         )
         result = evaluate_cam_threshold_sweep(
             predict_dir=str(output_dir),
@@ -217,9 +219,13 @@ def generate_cams(cfg: GenCAMConfig) -> None:
             name_list=names,
             num_cls=eval_num_cls,
             max_samples=cfg.eval_sweep_samples,
+            optimize_metric=cfg.eval_optimize_metric,
         )
+        best_all = result.get("result_at_best", {})
+        parts = [f"{k}={v:.2f}%" for k, v in best_all.items()]
         log.info(
-            f"Best mIoU: {result['best_miou']:.2f}% at threshold={result['best_threshold']:.2f}"
+            f"Best threshold={result['best_threshold']:.2f}  "
+            + "  ".join(parts)
         )
 
 

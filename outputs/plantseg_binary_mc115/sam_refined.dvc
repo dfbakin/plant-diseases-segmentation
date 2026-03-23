@@ -1,0 +1,6 @@
+outs:
+- md5: 2e79d60f4f8c844a7f89391e9507244f.dir
+  size: 180381524
+  nfiles: 39580
+  hash: md5
+  path: sam_refined

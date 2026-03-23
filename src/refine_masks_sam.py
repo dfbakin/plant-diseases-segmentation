@@ -4,11 +4,13 @@ Prompts SAM1 with existing pseudomasks (and optionally CAM-derived points)
 to produce boundary-refined segmentation masks.
 
 Prompt modes:
-    mask_only       - feed pseudomask as dense prompt
-    mask_and_points - pseudomask + positive/negative points from CAM
-    box_only        - bounding box from mask (SAM segments freely inside)
-    box_and_points  - bounding box from mask + points from CAM
-    points_only     - positive/negative points from CAM only
+    mask_only            - feed pseudomask as dense prompt (binary -> ±6.0 logits)
+    mask_and_points      - pseudomask + positive/negative points from CAM
+    box_only             - bounding box from mask (SAM segments freely inside)
+    box_and_points       - bounding box from mask + points from CAM
+    points_only          - positive/negative points from CAM only
+    soft_mask            - continuous probability map -> graded logits
+    soft_mask_and_points - soft mask + CAM-derived points
 
 Mask selection strategies (when multimask_output=True, SAM returns 3 masks):
     best_iou        - pick mask with highest predicted IoU score (default)
@@ -23,6 +25,15 @@ Example:
         mask_dir=outputs/plantseg_binary/pseudo_masks \
         output_dir=outputs/plantseg_binary/sam_refined/A1 \
         num_classes=2 prompt_mode=mask_only mask_selection=smallest_area
+
+    # Soft-mask prompting from continuous CAMs:
+    python src/refine_masks_sam.py \
+        image_dir=data/plantsegv3/images/train \
+        mask_dir=outputs/.../cams/cam_npy \
+        mask_ext=.npy \
+        prob_dir=outputs/.../cams/cam_npy \
+        output_dir=outputs/.../sam_refined/H \
+        prompt_mode=soft_mask logit_scale=3.0 confidence_threshold=0.3
 """
 
 import logging
@@ -69,6 +80,10 @@ class SAMRefineConfig:
     pos_quantile: float = 0.95
     neg_quantile: float = 0.05
     point_min_distance: int = 16
+
+    prob_dir: str = ""
+    logit_scale: float = 6.0
+    confidence_threshold: float = 0.0
 
     num_classes: int = 2
     batch_size: int = 8
@@ -191,6 +206,30 @@ def mask_to_logits(mask: np.ndarray, target_size: int = 256) -> torch.Tensor:
     return torch.from_numpy(logits).unsqueeze(0)
 
 
+def prob_to_logits(
+    prob: np.ndarray,
+    threshold: float = 0.0,
+    logit_scale: float = 3.0,
+    target_size: int = 256,
+) -> torch.Tensor:
+    """Convert a continuous probability map [0, 1] to graded SAM logits.
+
+    Pixels below *threshold* are clamped to 0 (mapped to ``-logit_scale``).
+    Above-threshold pixels retain their graded confidence.
+    Uses bilinear interpolation (not nearest) to preserve gradient information.
+
+    Returns tensor of shape (1, target_size, target_size).
+    """
+    p = np.clip(prob.astype(np.float32), 0.0, 1.0)
+    if threshold > 0:
+        p = np.where(p > threshold, p, 0.0)
+    resized = np.array(
+        Image.fromarray(p).resize((target_size, target_size), Image.BILINEAR)
+    )
+    logits = (resized * 2.0 - 1.0) * logit_scale
+    return torch.from_numpy(logits).unsqueeze(0)
+
+
 # ---------------------------------------------------------------------------
 # Helper: mask → bounding box
 # ---------------------------------------------------------------------------
@@ -231,6 +270,7 @@ def _build_prompts_for_class(
     cam: np.ndarray | None,
     prompt_mode: str,
     cfg: SAMRefineConfig,
+    soft_prob: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Assemble SAM prompts for a single foreground class.
 
@@ -242,15 +282,38 @@ def _build_prompts_for_class(
     if prompt_mode in ("mask_only", "mask_and_points"):
         prompts["input_masks"] = mask_to_logits(binary_mask)
 
+    if prompt_mode in ("soft_mask", "soft_mask_and_points"):
+        if soft_prob is not None:
+            prompts["input_masks"] = prob_to_logits(
+                soft_prob,
+                threshold=cfg.confidence_threshold,
+                logit_scale=cfg.logit_scale,
+            )
+        else:
+            log.warning("soft_mask mode but no probability map available; falling back to binary")
+            prompts["input_masks"] = mask_to_logits(binary_mask)
+
     if prompt_mode in ("box_only", "box_and_points"):
         bbox = mask_to_bbox(binary_mask, padding_frac=0.03)
         if bbox is not None:
             prompts["input_boxes"] = [[bbox]]
 
-    if prompt_mode in ("mask_and_points", "box_and_points", "points_only"):
-        if cam is not None:
+    _point_modes = ("mask_and_points", "box_and_points", "points_only", "soft_mask_and_points")
+    if prompt_mode in _point_modes:
+        point_cam = cam if cam is not None else soft_prob
+        point_mask = binary_mask if binary_mask.any() else (
+            (soft_prob > cfg.confidence_threshold).astype(np.uint8)
+            if soft_prob is not None else binary_mask
+        )
+        if point_cam is not None:
+            if point_cam.shape != point_mask.shape:
+                point_cam = np.array(
+                    Image.fromarray(point_cam).resize(
+                        (point_mask.shape[1], point_mask.shape[0]), Image.BILINEAR
+                    )
+                )
             pts, lbls = sample_points_from_cam(
-                cam, binary_mask,
+                point_cam, point_mask,
                 num_pos=cfg.num_pos_points,
                 num_neg=cfg.num_neg_points,
                 pos_quantile=cfg.pos_quantile,
@@ -307,9 +370,10 @@ def _refine_single_class(
     prompt_mode: str,
     cfg: SAMRefineConfig,
     device: torch.device,
+    soft_prob: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float] | None:
     """Run SAM on a single class, return (refined_binary_mask, iou_score) or None."""
-    prompts = _build_prompts_for_class(binary_mask, cam, prompt_mode, cfg)
+    prompts = _build_prompts_for_class(binary_mask, cam, prompt_mode, cfg, soft_prob=soft_prob)
     if not prompts:
         return None
 
@@ -363,7 +427,10 @@ def _refine_single_class(
 
 @torch.no_grad()
 def refine_masks_sam(cfg: SAMRefineConfig) -> None:
-    _VALID_MODES = ("mask_only", "mask_and_points", "box_only", "box_and_points", "points_only")
+    _VALID_MODES = (
+        "mask_only", "mask_and_points", "box_only", "box_and_points", "points_only",
+        "soft_mask", "soft_mask_and_points",
+    )
     _VALID_SELECTIONS = ("best_iou", "smallest_area")
 
     if not cfg.image_dir:
@@ -374,8 +441,11 @@ def refine_masks_sam(cfg: SAMRefineConfig) -> None:
         raise ValueError(f"Unknown prompt_mode: {cfg.prompt_mode}. Must be one of {_VALID_MODES}")
     if cfg.mask_selection not in _VALID_SELECTIONS:
         raise ValueError(f"Unknown mask_selection: {cfg.mask_selection}. Must be one of {_VALID_SELECTIONS}")
-    if cfg.prompt_mode in ("mask_and_points", "box_and_points", "points_only") and not cfg.cam_dir:
+    _needs_cam = ("mask_and_points", "box_and_points", "points_only", "soft_mask_and_points")
+    if cfg.prompt_mode in _needs_cam and not cfg.cam_dir:
         raise ValueError(f"cam_dir is required for prompt_mode={cfg.prompt_mode}")
+    if cfg.prompt_mode in ("soft_mask", "soft_mask_and_points") and not cfg.prob_dir:
+        raise ValueError(f"prob_dir is required for prompt_mode={cfg.prompt_mode}")
 
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
 
@@ -386,6 +456,7 @@ def refine_masks_sam(cfg: SAMRefineConfig) -> None:
     image_dir = Path(cfg.image_dir)
     mask_dir = Path(cfg.mask_dir)
     cam_dir = Path(cfg.cam_dir) if cfg.cam_dir else None
+    prob_dir = Path(cfg.prob_dir) if cfg.prob_dir else None
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -400,11 +471,14 @@ def refine_masks_sam(cfg: SAMRefineConfig) -> None:
         labels_dict = np.load(cfg.labels_file, allow_pickle=True).item()
         log.info(f"Loaded image-level labels for {len(labels_dict)} images")
 
+    soft_info = ""
+    if prob_dir:
+        soft_info = f", prob_dir={prob_dir}, logit_scale={cfg.logit_scale}, conf_thr={cfg.confidence_threshold}"
     log.info(
         f"SAM refinement: {len(names)} images, model={cfg.model_name}, "
         f"mode={cfg.prompt_mode}, selection={cfg.mask_selection}, "
         f"num_classes={cfg.num_classes}, batch_size={cfg.batch_size}, "
-        f"min_component_size={cfg.min_component_size}"
+        f"min_component_size={cfg.min_component_size}{soft_info}"
     )
 
     success = 0
@@ -440,17 +514,46 @@ def refine_masks_sam(cfg: SAMRefineConfig) -> None:
 
             pred_mask_path = mask_dir / f"{name}{mask_ext}"
             if mask_ext == ".npy":
-                pred_mask = np.load(str(pred_mask_path))
+                raw = np.load(str(pred_mask_path), allow_pickle=True)
+                if isinstance(raw, np.ndarray) and raw.shape == ():
+                    raw = raw.item()
+                if isinstance(raw, dict):
+                    pred_mask = raw.get(0, next(iter(raw.values())))
+                else:
+                    pred_mask = raw
             else:
                 pred_mask = np.array(Image.open(pred_mask_path))
 
             if cfg.num_classes == 2:
                 # Binary: single foreground class
-                fg_mask = (pred_mask == 1).astype(np.uint8)
+                if cfg.prompt_mode in ("soft_mask", "soft_mask_and_points"):
+                    thr = max(cfg.confidence_threshold, 0.01)
+                    fg_mask = (pred_mask > thr).astype(np.uint8)
+                elif pred_mask.dtype in (np.float32, np.float64):
+                    fg_mask = (pred_mask > 0.5).astype(np.uint8)
+                else:
+                    fg_mask = (pred_mask == 1).astype(np.uint8)
                 fg_mask = filter_small_components(fg_mask, cfg.min_component_size)
 
+                soft_prob = None
+                if prob_dir is not None:
+                    prob_path = prob_dir / f"{name}.npy"
+                    if prob_path.exists():
+                        prob_data = np.load(str(prob_path), allow_pickle=True)
+                        if isinstance(prob_data, np.ndarray) and prob_data.shape == ():
+                            prob_data = prob_data.item()
+                        if isinstance(prob_data, dict):
+                            soft_prob = prob_data.get(0)
+                        else:
+                            soft_prob = prob_data
+                    if soft_prob is not None and not fg_mask.any():
+                        fg_mask = (soft_prob > cfg.confidence_threshold).astype(np.uint8)
+                        fg_mask = filter_small_components(fg_mask, cfg.min_component_size)
+
                 if not fg_mask.any():
-                    Image.fromarray(np.zeros_like(pred_mask)).save(
+                    h_out = pil_img.height
+                    w_out = pil_img.width
+                    Image.fromarray(np.zeros((h_out, w_out), dtype=np.uint8)).save(
                         str(output_dir / f"{name}.png")
                     )
                     success += 1
@@ -466,6 +569,7 @@ def refine_masks_sam(cfg: SAMRefineConfig) -> None:
                 result = _refine_single_class(
                     model, processor, img_emb, orig_size, reshaped_size,
                     pil_img, fg_mask, cam, cfg.prompt_mode, cfg, device,
+                    soft_prob=soft_prob,
                 )
 
                 if result is not None:
