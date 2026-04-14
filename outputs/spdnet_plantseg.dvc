@@ -1,0 +1,6 @@
+outs:
+- md5: b4d63037871de722a5db14cbf25788a3.dir
+  size: 12428711746
+  nfiles: 7497
+  hash: md5
+  path: spdnet_plantseg
