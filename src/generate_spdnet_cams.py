@@ -23,7 +23,11 @@ from hydra.core.config_store import ConfigStore
 from omegaconf import DictConfig
 
 from src.wsss.mctformer.evaluation import evaluate_cam_threshold_sweep
-from src.wsss.spdnet.cam_generator import generate_all_cams, load_spdnet_from_checkpoint
+from src.wsss.spdnet.cam_generator import (
+    generate_all_cams,
+    generate_all_seeds,
+    load_spdnet_from_checkpoint,
+)
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +50,7 @@ class GenSPDNetCAMConfig:
     scales: list[float] = field(default_factory=lambda: [1.0, 0.75, 1.25])
     num_ref_images: int = 1
     binary_aggregate: str = "max"
+    seed_mode: str = ""
 
     gt_dir: str = "outputs/plantseg_binary_mc115/gt_binary_val"
     eval_threshold_sweep: bool = True
@@ -67,21 +72,36 @@ def generate_cams(cfg: GenSPDNetCAMConfig) -> None:
     model.eval()
 
     labels = np.load(cfg.label_file, allow_pickle=True).item()
-    log.info(f"Generating CAMs for {len(labels)} images")
+    log.info(f"Generating {'seeds (' + cfg.seed_mode + ')' if cfg.seed_mode else 'CAMs'} for {len(labels)} images")
 
-    processed = generate_all_cams(
-        model=model,
-        label_dict=labels,
-        image_dir=Path(cfg.image_dir),
-        output_dir=Path(cfg.output_dir),
-        image_ext=cfg.image_ext,
-        scales=list(cfg.scales),
-        max_size=cfg.max_size,
-        input_size=cfg.input_size,
-        num_ref_images=cfg.num_ref_images,
-        binary_aggregate=cfg.binary_aggregate,
-        device=device,
-    )
+    if cfg.seed_mode:
+        processed = generate_all_seeds(
+            model=model,
+            label_dict=labels,
+            image_dir=Path(cfg.image_dir),
+            output_dir=Path(cfg.output_dir),
+            image_ext=cfg.image_ext,
+            scales=list(cfg.scales),
+            max_size=cfg.max_size,
+            input_size=cfg.input_size,
+            num_ref_images=cfg.num_ref_images,
+            seed_mode=cfg.seed_mode,
+            device=device,
+        )
+    else:
+        processed = generate_all_cams(
+            model=model,
+            label_dict=labels,
+            image_dir=Path(cfg.image_dir),
+            output_dir=Path(cfg.output_dir),
+            image_ext=cfg.image_ext,
+            scales=list(cfg.scales),
+            max_size=cfg.max_size,
+            input_size=cfg.input_size,
+            num_ref_images=cfg.num_ref_images,
+            binary_aggregate=cfg.binary_aggregate,
+            device=device,
+        )
 
     if cfg.eval_threshold_sweep and cfg.gt_dir:
         eval_num_cls = 2 if cfg.binary_aggregate else cfg.num_classes + 1

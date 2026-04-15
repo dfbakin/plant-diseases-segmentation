@@ -7,6 +7,7 @@ import random
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -221,3 +222,122 @@ class TestCAMQuality:
         assert not torch.allclose(cam_with_ref, cam_no_ref), (
             "Token fusion should change CAM output"
         )
+
+
+class TestFeatureSeeds:
+    """Tests for extract_merged_features and generate_spdnet_seed."""
+
+    @pytest.fixture
+    def model(self):
+        return SPDNet(num_classes=NUM_CLASSES, pretrained=False).to(DEVICE).eval()
+
+    def test_feature_seed_output_format(self, model):
+        """generate_spdnet_seed returns {0: ndarray} with correct shape and [0,1] range."""
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        result = generate_spdnet_seed(
+            model, [q], [[r]], DEVICE, seed_mode="feat_chmean"
+        )
+        assert isinstance(result, dict)
+        assert 0 in result
+        arr = result[0]
+        assert arr.dtype == np.float32
+        assert arr.shape == (IMAGE_SIZE, IMAGE_SIZE)
+        assert arr.min() >= 0.0 and arr.max() <= 1.0 + 1e-6
+
+    def test_feature_seed_modes(self, model):
+        """All seed_mode values produce valid output."""
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        for mode in ["feat_chmean", "feat_chmax", "spatial_proto"]:
+            result = generate_spdnet_seed(
+                model, [q], [[r]], DEVICE, seed_mode=mode
+            )
+            assert 0 in result, f"Mode {mode} failed to produce output"
+            assert result[0].shape == (IMAGE_SIZE, IMAGE_SIZE), f"Mode {mode} wrong shape"
+
+    def test_spatial_proto_nonzero(self, model):
+        """Spatial prototype produces non-constant maps (different from channel-mean)."""
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        torch.manual_seed(42)
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+
+        proto = generate_spdnet_seed(model, [q], [[r]], DEVICE, "spatial_proto")
+        chmean = generate_spdnet_seed(model, [q], [[r]], DEVICE, "feat_chmean")
+
+        assert proto[0].std() > 1e-6, "Spatial proto should not be constant"
+        assert not np.allclose(proto[0], chmean[0], atol=1e-4), (
+            "Spatial proto should differ from channel-mean"
+        )
+
+    def test_spatial_proto_reference_sensitive(self, model):
+        """Spatial prototype output changes with different references."""
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        torch.manual_seed(123)
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r1 = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r2 = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE) * 3 + 1
+
+        proto1 = generate_spdnet_seed(model, [q], [[r1]], DEVICE, "spatial_proto")
+        proto2 = generate_spdnet_seed(model, [q], [[r2]], DEVICE, "spatial_proto")
+
+        assert not np.allclose(proto1[0], proto2[0], atol=1e-3), (
+            "Different references must produce different spatial proto maps"
+        )
+
+
+class TestCRFSrgb:
+    def test_crf_srgb_parameter(self):
+        """srgb parameter is accepted and affects CRF unary-bilateral interaction."""
+        from src.wsss.refinement.crf import apply_crf
+
+        np.random.seed(42)
+        h, w = 128, 128
+        image = np.random.randint(0, 255, (h, w, 3), dtype=np.uint8)
+
+        cam = np.full((h, w), 0.35, dtype=np.float32)
+        cam[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4] = 0.45
+        cam_dict = {0: cam}
+
+        q_low = apply_crf(image, cam_dict, bg_threshold=0.4, num_cls=2, srgb=3.0,
+                          scale_factor=1.0, t=10)
+        q_high = apply_crf(image, cam_dict, bg_threshold=0.4, num_cls=2, srgb=100.0,
+                           scale_factor=1.0, t=10)
+
+        assert q_low.shape == (2, h, w)
+        assert q_high.shape == (2, h, w)
+        label_low = np.argmax(q_low, axis=0)
+        label_high = np.argmax(q_high, axis=0)
+        assert not np.array_equal(label_low, label_high), (
+            "srgb=3 vs srgb=100 should produce different label maps"
+        )
+
+
+class TestExtractMergedFeatures:
+    @pytest.fixture
+    def model(self):
+        return SPDNet(num_classes=NUM_CLASSES, pretrained=False).to(DEVICE).eval()
+
+    def test_query_only(self, model):
+        q = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        result = model.extract_merged_features(q)
+        assert "query_merged" in result
+        assert result["query_merged"].shape[0] == BATCH_SIZE
+        assert result["query_merged"].shape[1] == FPN_CHANNELS
+        assert "fused" not in result
+
+    def test_with_reference(self, model):
+        q = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        r = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        result = model.extract_merged_features(q, r)
+        assert "query_merged" in result
+        assert "fused" in result
+        assert "ref_merged" in result
+        assert result["fused"].shape == result["query_merged"].shape

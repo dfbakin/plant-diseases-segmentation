@@ -147,30 +147,71 @@ class SPDNet(nn.Module):
         q_fpn: list[torch.Tensor],
         all_r_fpn: list[list[torch.Tensor]],
     ) -> torch.Tensor:
-        """Merge query FPN levels, tokenize reference(s), and fuse (Eq 16-18).
-
-        Args:
-            q_fpn: query FPN levels, list of (B, C, Hi, Wi)
-            all_r_fpn: list of reference FPN outputs; each element is a
-                       list of 4 tensors (one per FPN level).  When N=1 this
-                       is a single-element outer list.
-        """
-        target_size = q_fpn[0].shape[2:]
-        query_merged = torch.zeros_like(q_fpn[0])
-        for level in q_fpn:
-            query_merged = query_merged + F.interpolate(
-                level, size=target_size, mode="bilinear", align_corners=False
-            )
-        query_merged = query_merged / len(q_fpn)
+        """Merge query FPN levels, tokenize reference(s), and fuse (Eq 16-18)."""
+        query_merged = self._merge_fpn(q_fpn)
 
         n_refs = len(all_r_fpn)
-        num_levels = len(q_fpn)
         avg_tokens: list[torch.Tensor] = []
-        for lvl in range(num_levels):
+        for lvl in range(len(q_fpn)):
             lvl_tokens = [self.adpl_cam.tokenize([r[lvl]])[0] for r in all_r_fpn]
             avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
 
         return self.adpl_cam.fuse(query_merged, avg_tokens)
+
+    def _get_fpn_features(
+        self, x: torch.Tensor
+    ) -> list[torch.Tensor]:
+        """Run backbone + FPN + MSE on an image batch."""
+        feats = self.extract_features(x)
+        fpn_out = self.fpn(feats)
+        return [self.mse(p) for p in fpn_out]
+
+    def _merge_fpn(self, fpn_levels: list[torch.Tensor]) -> torch.Tensor:
+        """Average-merge FPN levels to finest resolution.
+
+        Returns:
+            Merged feature map (B, C, H0, W0) at the resolution of level 0.
+        """
+        target_size = fpn_levels[0].shape[2:]
+        merged = torch.zeros_like(fpn_levels[0])
+        for level in fpn_levels:
+            merged = merged + F.interpolate(
+                level, size=target_size, mode="bilinear", align_corners=False
+            )
+        return merged / len(fpn_levels)
+
+    def extract_merged_features(
+        self,
+        query: torch.Tensor,
+        reference: torch.Tensor | list[torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Extract intermediate feature maps for seed generation.
+
+        Returns dict with:
+            query_merged: (B, C, Hf, Wf) merged FPN features before fusion
+            ref_merged:   (B, C, Hf, Wf) merged reference FPN features (if ref given)
+            fused:        (B, C, Hf, Wf) features after token fusion (if ref given)
+        """
+        q_fpn = self._get_fpn_features(query)
+        query_merged = self._merge_fpn(q_fpn)
+        result = {"query_merged": query_merged}
+
+        if reference is not None:
+            refs = [reference] if isinstance(reference, torch.Tensor) else reference
+            all_r_fpn = [self._get_fpn_features(r) for r in refs]
+
+            n_refs = len(all_r_fpn)
+            avg_tokens: list[torch.Tensor] = []
+            for lvl in range(len(q_fpn)):
+                lvl_tokens = [self.adpl_cam.tokenize([r[lvl]])[0] for r in all_r_fpn]
+                avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
+            fused = self.adpl_cam.fuse(query_merged, avg_tokens)
+            result["fused"] = fused
+
+            r_fpn_all = [self._merge_fpn(r) for r in all_r_fpn]
+            result["ref_merged"] = sum(r_fpn_all) / n_refs  # type: ignore[arg-type]
+
+        return result
 
     def forward(
         self,
@@ -194,16 +235,8 @@ class SPDNet(nn.Module):
         else:
             references = reference
 
-        q_feats = self.extract_features(query)
-        q_fpn = self.fpn(q_feats)
-        q_fpn = [self.mse(p) for p in q_fpn]
-
-        all_r_fpn: list[list[torch.Tensor]] = []
-        for ref in references:
-            r_feats = self.extract_features(ref)
-            r_fpn = self.fpn(r_feats)
-            r_fpn = [self.mse(p) for p in r_fpn]
-            all_r_fpn.append(r_fpn)
+        q_fpn = self._get_fpn_features(query)
+        all_r_fpn = [self._get_fpn_features(ref) for ref in references]
 
         fused = self._merge_and_fuse(q_fpn, all_r_fpn)
 

@@ -133,6 +133,174 @@ def generate_spdnet_cam(
     return cam_dict
 
 
+@torch.no_grad()
+def generate_spdnet_seed(
+    model: SPDNet,
+    query_images: list[torch.Tensor],
+    ref_image_lists: list[list[torch.Tensor]],
+    device: torch.device,
+    seed_mode: str = "feat_chmean",
+) -> dict[int, np.ndarray]:
+    """Generate a feature-based seed map (no classifier projection).
+
+    Args:
+        query_images: list of (1, 3, H_s, W_s) tensors at different scales/flips
+        ref_image_lists: for each scale/flip, list of N reference tensors
+        device: computation device
+        seed_mode: one of "feat_chmean", "feat_chmax", "spatial_proto"
+
+    Returns:
+        {0: float32_2d_array} min-max normalized to [0, 1]
+    """
+    h_orig = query_images[0].shape[2]
+    w_orig = query_images[0].shape[3]
+    seed_2d_list = []
+
+    for s, (q_img, r_imgs) in enumerate(zip(query_images, ref_image_lists)):
+        q_img = q_img.to(device)
+        refs = [r.to(device) for r in r_imgs]
+
+        feats = model.extract_merged_features(q_img, refs if len(refs) > 1 else refs[0])
+
+        if seed_mode == "feat_chmean":
+            feat_map = feats["query_merged"].mean(dim=1, keepdim=True)
+        elif seed_mode == "feat_chmax":
+            feat_map = feats["query_merged"].amax(dim=1, keepdim=True)
+        elif seed_mode == "spatial_proto":
+            ref_merged = feats["ref_merged"]
+            proto = F.normalize(ref_merged.mean(dim=[2, 3]), dim=1)  # (B, C)
+            query_norm = F.normalize(feats["query_merged"], dim=1)   # (B, C, H, W)
+            sim = (query_norm * proto[:, :, None, None]).sum(dim=1, keepdim=True)
+            feat_map = sim
+        else:
+            raise ValueError(f"Unknown seed_mode: {seed_mode!r}")
+
+        feat_2d = F.interpolate(
+            feat_map, size=(h_orig, w_orig), mode="bilinear", align_corners=False
+        )
+        seed = feat_2d[0, 0].cpu().numpy()  # (H, W)
+
+        if s % 2 == 1:
+            seed = np.flip(seed, axis=-1)
+        seed_2d_list.append(seed)
+
+    merged = np.mean(seed_2d_list, axis=0)
+    vmin, vmax = merged.min(), merged.max()
+    if vmax - vmin > 1e-8:
+        merged = (merged - vmin) / (vmax - vmin)
+    else:
+        merged = np.zeros_like(merged)
+    return {0: merged.astype(np.float32).copy()}
+
+
+def generate_all_seeds(
+    model: SPDNet,
+    label_dict: dict[str, np.ndarray],
+    image_dir: Path,
+    output_dir: Path,
+    image_ext: str = ".jpg",
+    scales: list[float] = [1.0, 0.75, 1.25],
+    max_size: int = 0,
+    input_size: int = 448,
+    num_ref_images: int = 1,
+    seed_mode: str = "feat_chmean",
+    device: torch.device = torch.device("cpu"),
+) -> list[str]:
+    """Generate feature-based seed maps for all images.
+
+    Same image preparation as generate_all_cams but dispatches to
+    generate_spdnet_seed instead of generate_spdnet_cam.
+    """
+    random.seed(SEED)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ref_pool = build_reference_pool(label_dict, image_dir, image_ext)
+    max_long = max_size if max_size > 0 else int(input_size * 1.75)
+
+    tfm = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD),
+    ])
+
+    processed = []
+
+    for name in tqdm(list(label_dict.keys()), desc=f"Generating seeds ({seed_mode})"):
+        img_path = image_dir / f"{name}{image_ext}"
+        if not img_path.exists():
+            continue
+
+        label = label_dict[name]
+        active_classes = np.where(label > 0)[0].tolist()
+        if not active_classes:
+            continue
+
+        query_pil = PIL.Image.open(img_path).convert("RGB")
+        long_side = max(query_pil.size)
+        if long_side > max_long:
+            ratio = max_long / long_side
+            query_pil = query_pil.resize(
+                (round(query_pil.width * ratio), round(query_pil.height * ratio)),
+                resample=PIL.Image.BICUBIC,
+            )
+
+        ref_cls = active_classes[0]
+        ref_names = ref_pool.get(ref_cls, [])
+        ref_names = [n for n in ref_names if n != name]
+        if not ref_names:
+            ref_names = [name]
+        ref_picks = random.choices(ref_names, k=num_ref_images)
+
+        ref_pils = []
+        for rn in ref_picks:
+            rpil = PIL.Image.open(image_dir / f"{rn}{image_ext}").convert("RGB")
+            ls = max(rpil.size)
+            if ls > max_long:
+                r = max_long / ls
+                rpil = rpil.resize(
+                    (round(rpil.width * r), round(rpil.height * r)),
+                    resample=PIL.Image.BICUBIC,
+                )
+            ref_pils.append(rpil)
+
+        query_imgs: list[torch.Tensor] = []
+        ref_img_lists: list[list[torch.Tensor]] = []
+
+        for sc in scales:
+            tw = round(query_pil.size[0] * sc)
+            th = round(query_pil.size[1] * sc)
+            scaled_long = max(tw, th)
+            if scaled_long > max_long:
+                r = max_long / scaled_long
+                tw, th = round(tw * r), round(th * r)
+
+            q_scaled = query_pil.resize((tw, th), resample=PIL.Image.BICUBIC)
+            q_t = tfm(q_scaled).unsqueeze(0)
+
+            r_tensors = []
+            for rpil in ref_pils:
+                r_sc = rpil.resize((tw, th), resample=PIL.Image.BICUBIC)
+                r_tensors.append(tfm(r_sc).unsqueeze(0))
+
+            query_imgs.append(q_t)
+            ref_img_lists.append(r_tensors)
+
+            query_imgs.append(torch.flip(q_t, [-1]))
+            ref_img_lists.append([torch.flip(rt, [-1]) for rt in r_tensors])
+
+        seed_dict = generate_spdnet_seed(
+            model, query_imgs, ref_img_lists, device, seed_mode
+        )
+
+        if seed_dict:
+            np.save(str(output_dir / f"{name}.npy"), seed_dict)
+            processed.append(name)
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    log.info(f"Saved {len(processed)} seeds ({seed_mode}) to {output_dir}")
+    return processed
+
+
 def generate_all_cams(
     model: SPDNet,
     label_dict: dict[str, np.ndarray],

@@ -42,6 +42,7 @@ class CRFConfig:
     ha_scale_factor: float = 12.0
     crf_iters: int = 10
     num_cls: int = 21
+    srgb: float = 13.0
     num_workers: int = 8
 
 
@@ -61,6 +62,7 @@ def _process_one(
     ha_scale_factor: float,
     crf_iters: int,
     num_cls: int,
+    srgb: float = 13.0,
 ) -> str:
     la_path = Path(la_dir) / f"{name}.npy"
     ha_path = Path(ha_dir) / f"{name}.npy"
@@ -79,11 +81,11 @@ def _process_one(
 
     la_probs = apply_crf(
         img, cam_dict, bg_threshold, t=crf_iters, num_cls=num_cls,
-        scale_factor=la_scale_factor,
+        scale_factor=la_scale_factor, srgb=srgb,
     )
     ha_probs = apply_crf(
         img, cam_dict, bg_threshold, t=crf_iters, num_cls=num_cls,
-        scale_factor=ha_scale_factor,
+        scale_factor=ha_scale_factor, srgb=srgb,
     )
 
     np.save(str(la_path), np.argmax(la_probs, axis=0).astype(np.uint8))
@@ -118,6 +120,7 @@ def run_crf(cfg: CRFConfig) -> None:
         ha_scale_factor=cfg.ha_scale_factor,
         crf_iters=cfg.crf_iters,
         num_cls=cfg.num_cls,
+        srgb=cfg.srgb,
     )
 
     if cfg.num_workers > 1:

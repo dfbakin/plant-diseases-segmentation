@@ -15,6 +15,7 @@ def apply_crf(
     t: int = 10,
     num_cls: int = NUM_CLS_VOC,
     scale_factor: float = 1.0,
+    srgb: float = 13.0,
 ) -> np.ndarray:
     """Apply DenseCRF to refine raw CAMs into a segmentation mask.
 
@@ -35,6 +36,9 @@ def apply_crf(
         num_cls: Total classes including background.
         scale_factor: PSA scale factor; controls both Gaussian and
             Bilateral sxy.  Paper defaults: la=1, ha=12.
+        srgb: Bilateral color kernel bandwidth (RGB).  Lower values
+            make CRF more sensitive to color differences.  VOC default=13;
+            plant disease spots may benefit from 3-8.
 
     Returns:
         Probability map (num_cls, H, W) float32, summing to 1 along axis 0.
@@ -59,7 +63,7 @@ def apply_crf(
 
     d.addPairwiseGaussian(sxy=gauss_sxy, compat=3)
     d.addPairwiseBilateral(
-        sxy=bilat_sxy, srgb=13, rgbim=np.ascontiguousarray(image), compat=10,
+        sxy=bilat_sxy, srgb=srgb, rgbim=np.ascontiguousarray(image), compat=10,
     )
 
     q = d.inference(t)
@@ -75,11 +79,12 @@ def cam_to_label(
     t: int = 10,
     num_cls: int = NUM_CLS_VOC,
     scale_factor: float = 1.0,
+    srgb: float = 13.0,
 ) -> np.ndarray:
     """Apply CRF and return argmax label map.
 
     Returns:
         Label map (H, W) uint8, values in [0, num_cls-1].
     """
-    q = apply_crf(image, cam_dict, bg_threshold, alpha, t, num_cls, scale_factor)
+    q = apply_crf(image, cam_dict, bg_threshold, alpha, t, num_cls, scale_factor, srgb=srgb)
     return np.argmax(q, axis=0).astype(np.uint8)

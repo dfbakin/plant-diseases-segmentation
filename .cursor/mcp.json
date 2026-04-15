@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mlflow-experiments": {
+      "command": "/venv/main/bin/python",
+      "args": ["-u", "/workspace/plant-diseases-segmentation/.mcp-servers/mlflow_server.py"],
+      "env": {
+        "MLFLOW_TRACKING_URI": "file:///workspace/plant-diseases-segmentation/mlruns",
+        "PYTHONUNBUFFERED": "1",
+        "LOG_LEVEL": "INFO"
+      }
+    }
+  }
+}
