@@ -14,6 +14,7 @@ class SPDNetModelConfig:
     learning_rate: float = 5e-4
     weight_decay: float = 0.05
     mse_reduction: int = 4
+    fusion_mode: str = "token"
 
 
 @dataclass

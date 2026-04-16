@@ -11,7 +11,9 @@ import numpy as np
 import pytest
 import torch
 
-from src.wsss.spdnet.model import ADPL_CAM_LEVELS, MSE, FPN, ADPLCam, SPDNet
+from src.wsss.spdnet.model import (
+    ADPL_CAM_LEVELS, MSE, FPN, ADPLCam, SPDNet, SpatialCrossAttention,
+)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_CLASSES = 10
@@ -341,3 +343,129 @@ class TestExtractMergedFeatures:
         assert "fused" in result
         assert "ref_merged" in result
         assert result["fused"].shape == result["query_merged"].shape
+
+
+class TestSpatialCrossAttention:
+    """Unit tests for the SpatialCrossAttention module."""
+
+    def test_output_shape(self):
+        sca = SpatialCrossAttention(channels=FPN_CHANNELS).to(DEVICE)
+        q = torch.randn(BATCH_SIZE, FPN_CHANNELS, 16, 16, device=DEVICE)
+        r = torch.randn(BATCH_SIZE, FPN_CHANNELS, 16, 16, device=DEVICE)
+        out = sca(q, r)
+        assert out.shape == q.shape
+
+    def test_output_shape_different_ref_size(self):
+        """Reference can have a different spatial size from query."""
+        sca = SpatialCrossAttention(channels=FPN_CHANNELS).to(DEVICE)
+        q = torch.randn(BATCH_SIZE, FPN_CHANNELS, 16, 16, device=DEVICE)
+        r = torch.randn(BATCH_SIZE, FPN_CHANNELS, 32, 32, device=DEVICE)
+        out = sca(q, r)
+        assert out.shape == q.shape
+
+    def test_gate_initialization(self):
+        sca = SpatialCrossAttention(channels=FPN_CHANNELS)
+        assert sca.gate.item() == pytest.approx(0.1, abs=1e-6)
+
+    def test_modifies_input(self):
+        sca = SpatialCrossAttention(channels=FPN_CHANNELS).to(DEVICE)
+        q = torch.randn(BATCH_SIZE, FPN_CHANNELS, 8, 8, device=DEVICE)
+        r = torch.randn(BATCH_SIZE, FPN_CHANNELS, 8, 8, device=DEVICE)
+        out = sca(q, r)
+        assert not torch.allclose(q, out, atol=1e-6), (
+            "Cross-attention should modify the query features"
+        )
+
+    def test_gradients_flow(self):
+        sca = SpatialCrossAttention(channels=FPN_CHANNELS).to(DEVICE)
+        q = torch.randn(BATCH_SIZE, FPN_CHANNELS, 8, 8, device=DEVICE, requires_grad=True)
+        r = torch.randn(BATCH_SIZE, FPN_CHANNELS, 8, 8, device=DEVICE, requires_grad=True)
+        out = sca(q, r)
+        out.sum().backward()
+        assert q.grad is not None
+        assert r.grad is not None
+        assert sca.gate.grad is not None
+
+
+class TestSPDNetFusionModes:
+    """Test SPDNet with both fusion_mode='token' and 'spatial'."""
+
+    @pytest.fixture(params=["token", "spatial"])
+    def model(self, request):
+        return SPDNet(
+            num_classes=NUM_CLASSES, pretrained=False, fusion_mode=request.param
+        ).to(DEVICE)
+
+    @pytest.fixture
+    def pair(self):
+        q = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        r = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        return q, r
+
+    def test_forward_logits(self, model, pair):
+        model.eval()
+        logits = model(*pair, return_cam=False)
+        assert logits.shape == (BATCH_SIZE, NUM_CLASSES)
+
+    def test_forward_with_cam(self, model, pair):
+        model.eval()
+        logits, cam = model(*pair, return_cam=True)
+        assert logits.shape == (BATCH_SIZE, NUM_CLASSES)
+        assert cam.shape[0] == BATCH_SIZE
+        assert cam.shape[1] == NUM_CLASSES
+
+    def test_backward(self, model, pair):
+        model.train()
+        logits = model(*pair, return_cam=False)
+        logits.sum().backward()
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                assert p.grad is not None, f"No gradient for {name}"
+
+    def test_multi_reference(self, model, pair):
+        model.eval()
+        q, r = pair
+        logits = model(q, [r, torch.randn_like(r)], return_cam=False)
+        assert logits.shape == (BATCH_SIZE, NUM_CLASSES)
+
+    def test_extract_merged_features(self, model, pair):
+        model.eval()
+        q, r = pair
+        result = model.extract_merged_features(q, r)
+        assert "query_merged" in result
+        assert "fused" in result
+        assert "ref_merged" in result
+        assert result["fused"].shape == result["query_merged"].shape
+
+    def test_invalid_fusion_mode_raises(self):
+        with pytest.raises(ValueError, match="Unknown fusion_mode"):
+            SPDNet(num_classes=NUM_CLASSES, pretrained=False, fusion_mode="invalid")
+
+
+class TestSpatialFusionSpatiallyAware:
+    """Verify spatial cross-attention produces location-dependent outputs."""
+
+    def test_different_references_different_spatial_pattern(self):
+        """Spatial fusion output must change spatially when reference changes."""
+        model = SPDNet(
+            num_classes=NUM_CLASSES, pretrained=False, fusion_mode="spatial"
+        ).to(DEVICE).eval()
+
+        torch.manual_seed(99)
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        r1 = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        r2 = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE) * 3 + 1
+
+        feats1 = model.extract_merged_features(q, r1)
+        feats2 = model.extract_merged_features(q, r2)
+
+        diff = (feats1["fused"] - feats2["fused"]).abs()
+        h = diff.shape[2]
+        top_half = diff[:, :, : h // 2, :].mean().item()
+        bottom_half = diff[:, :, h // 2 :, :].mean().item()
+
+        assert diff.mean() > 1e-4, "Spatial fusion output must differ for different refs"
+        assert top_half != pytest.approx(bottom_half, abs=1e-5), (
+            "Spatial difference should not be uniform -- attention should produce "
+            "location-dependent differences (unlike token fusion which is uniform)"
+        )

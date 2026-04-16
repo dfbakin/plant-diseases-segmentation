@@ -32,19 +32,29 @@ def load_spdnet_from_checkpoint(
     num_classes: int,
     fpn_channels: int = 256,
     mse_reduction: int = 4,
+    fusion_mode: str | None = None,
 ) -> SPDNet:
-    """Load SPDNet from a Lightning checkpoint."""
+    """Load SPDNet from a Lightning checkpoint.
+
+    If *fusion_mode* is ``None``, it is auto-detected from saved
+    hyperparameters (falls back to ``"token"`` for old checkpoints).
+    """
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if "state_dict" in ckpt:
         sd = {k.replace("model.", "", 1): v for k, v in ckpt["state_dict"].items()}
     else:
         sd = ckpt.get("model", ckpt)
 
+    if fusion_mode is None:
+        hp = ckpt.get("hyper_parameters", {})
+        fusion_mode = hp.get("fusion_mode", "token")
+
     model = SPDNet(
         num_classes=num_classes,
         fpn_channels=fpn_channels,
         mse_reduction=mse_reduction,
         pretrained=False,
+        fusion_mode=fusion_mode,
     )
     model.load_state_dict(sd, strict=False)
     return model
@@ -162,11 +172,20 @@ def generate_spdnet_seed(
 
         feats = model.extract_merged_features(q_img, refs if len(refs) > 1 else refs[0])
 
-        if seed_mode == "feat_chmean":
-            feat_map = feats["query_merged"].mean(dim=1, keepdim=True)
-        elif seed_mode == "feat_chmax":
-            feat_map = feats["query_merged"].amax(dim=1, keepdim=True)
-        elif seed_mode == "spatial_proto":
+        feat_src = feats.get("fused", feats["query_merged"]) if seed_mode.startswith("fused_") else feats["query_merged"]
+        mode_key = seed_mode.removeprefix("fused_")
+
+        if mode_key == "feat_chmean":
+            feat_map = feat_src.mean(dim=1, keepdim=True)
+        elif mode_key == "feat_neg_chmean":
+            feat_map = -feat_src.mean(dim=1, keepdim=True)
+        elif mode_key == "feat_chvar":
+            feat_map = feat_src.var(dim=1, keepdim=True)
+        elif mode_key == "feat_chmax":
+            feat_map = feat_src.amax(dim=1, keepdim=True)
+        elif mode_key == "feat_l2norm":
+            feat_map = feat_src.norm(dim=1, keepdim=True)
+        elif mode_key == "spatial_proto":
             ref_merged = feats["ref_merged"]
             proto = F.normalize(ref_merged.mean(dim=[2, 3]), dim=1)  # (B, C)
             query_norm = F.normalize(feats["query_merged"], dim=1)   # (B, C, H, W)

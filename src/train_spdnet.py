@@ -145,6 +145,7 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
     scaled_lr = cfg.model.learning_rate * dcfg.batch_size / 256.0
     log.info(f"LR scaling: {cfg.model.learning_rate} * {dcfg.batch_size}/256 = {scaled_lr}")
 
+    fusion_mode = getattr(cfg.model, "fusion_mode", "token")
     module = SPDNetModule(
         num_classes=num_classes,
         fpn_channels=cfg.model.fpn_channels,
@@ -154,10 +155,12 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         weight_decay=cfg.model.weight_decay,
         warmup_epochs=cfg.trainer.warmup_epochs,
         min_lr=cfg.trainer.min_lr,
+        fusion_mode=fusion_mode,
     )
     total_params = sum(p.numel() for p in module.parameters())
-    log.info(f"Model parameters: {total_params:,}")
+    log.info(f"Model parameters: {total_params:,}  fusion_mode={fusion_mode}")
 
+    include_pv = getattr(dcfg, "include_plantvillage", False)
     run_name = cfg.run_name or f"spdnet_{image_size}_{cfg.seed}"
     mlflow_logger = MLFlowLogger(
         experiment_name=cfg.mlflow_experiment_name,
@@ -169,6 +172,8 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
             "num_classes": str(num_classes),
             "num_references": str(num_refs),
             "augmentation": aug_variant,
+            "fusion_mode": fusion_mode,
+            "include_plantvillage": str(include_pv),
         },
     )
 

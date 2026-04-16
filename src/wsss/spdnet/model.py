@@ -4,7 +4,11 @@ Architecture:
   - Shared ResNet50 backbone extracts multi-scale features (layer1-4)
   - FPN merges them into a common 256-ch representation
   - MSE (Multi-Scale Excitation) applies channel attention
-  - ADPL-CAM fuses reference tokens into query features for CAM generation
+  - Reference fusion: either token-based (ADPL-CAM) or spatial cross-attention
+
+Fusion modes:
+  - "token": original ADPL-CAM with GlobalMaxPool tokenisation (spatially blind)
+  - "spatial": multi-head cross-attention preserving spatial structure
 """
 
 from __future__ import annotations
@@ -98,12 +102,67 @@ class ADPLCam(nn.Module):
         return out
 
 
+class SpatialCrossAttention(nn.Module):
+    """Spatial cross-attention fusion: query locations attend to reference locations.
+
+    Instead of collapsing reference features to a single vector (GlobalMaxPool),
+    this module preserves spatial structure by pooling the reference to a small
+    grid and applying multi-head cross-attention from query to reference.
+    """
+
+    def __init__(
+        self,
+        channels: int = 256,
+        num_heads: int = 4,
+        ref_pool_size: int = 14,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.ref_pool_size = ref_pool_size
+        self.pool = nn.AdaptiveAvgPool2d((ref_pool_size, ref_pool_size))
+        self.cross_attn = nn.MultiheadAttention(
+            channels, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.norm_q = nn.LayerNorm(channels)
+        self.norm_kv = nn.LayerNorm(channels)
+        self.gate = nn.Parameter(torch.tensor(0.1))
+
+    def forward(
+        self, query_feat: torch.Tensor, ref_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fuse reference spatial features into query via cross-attention.
+
+        Args:
+            query_feat: (B, C, H, W) merged query FPN features.
+            ref_feat:   (B, C, Hr, Wr) merged reference FPN features.
+
+        Returns:
+            (B, C, H, W) query features enriched with spatially-attended reference info.
+        """
+        B, C, H, W = query_feat.shape
+
+        ref_pooled = self.pool(ref_feat)  # (B, C, h, w)
+
+        q = query_feat.flatten(2).permute(0, 2, 1)         # (B, HW, C)
+        kv = ref_pooled.flatten(2).permute(0, 2, 1)        # (B, h*w, C)
+
+        q = self.norm_q(q)
+        kv = self.norm_kv(kv)
+
+        attended, _ = self.cross_attn(q, kv, kv)           # (B, HW, C)
+        attended = attended.permute(0, 2, 1).view(B, C, H, W)
+
+        return query_feat + self.gate * attended
+
+
 class SPDNet(nn.Module):
     """Siamese Plant Disease Network.
 
-    Shared ResNet50 backbone + FPN + MSE + ADPL-CAM.
-    Reference tokens are fused into query features BEFORE classification,
-    so the reference image influences both training logits and inference CAMs.
+    Shared ResNet50 backbone + FPN + MSE + configurable reference fusion.
+
+    Args:
+        fusion_mode: ``"token"`` for original ADPL-CAM (GlobalMaxPool),
+            ``"spatial"`` for multi-head cross-attention.
     """
 
     def __init__(
@@ -112,10 +171,12 @@ class SPDNet(nn.Module):
         fpn_channels: int = 256,
         mse_reduction: int = 4,
         pretrained: bool = True,
+        fusion_mode: str = "token",
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.fpn_channels = fpn_channels
+        self.fusion_mode = fusion_mode
 
         backbone = models.resnet50(
             weights=ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
@@ -131,7 +192,13 @@ class SPDNet(nn.Module):
         self.fpn = FPN(in_channels=[256, 512, 1024, 2048], out_channels=fpn_channels)
         self.mse = MSE(channels=fpn_channels, reduction=mse_reduction)
         self.classifier = nn.Linear(fpn_channels, num_classes)
-        self.adpl_cam = ADPLCam(num_levels=ADPL_CAM_LEVELS)
+
+        if fusion_mode == "token":
+            self.adpl_cam = ADPLCam(num_levels=ADPL_CAM_LEVELS)
+        elif fusion_mode == "spatial":
+            self.spatial_attn = SpatialCrossAttention(channels=fpn_channels)
+        else:
+            raise ValueError(f"Unknown fusion_mode: {fusion_mode!r}")
 
     def extract_features(self, x: torch.Tensor) -> list[torch.Tensor]:
         """Extract multi-scale features from shared backbone."""
@@ -147,16 +214,21 @@ class SPDNet(nn.Module):
         q_fpn: list[torch.Tensor],
         all_r_fpn: list[list[torch.Tensor]],
     ) -> torch.Tensor:
-        """Merge query FPN levels, tokenize reference(s), and fuse (Eq 16-18)."""
+        """Merge query FPN levels and fuse with reference features."""
         query_merged = self._merge_fpn(q_fpn)
 
-        n_refs = len(all_r_fpn)
-        avg_tokens: list[torch.Tensor] = []
-        for lvl in range(len(q_fpn)):
-            lvl_tokens = [self.adpl_cam.tokenize([r[lvl]])[0] for r in all_r_fpn]
-            avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
+        if self.fusion_mode == "token":
+            n_refs = len(all_r_fpn)
+            avg_tokens: list[torch.Tensor] = []
+            for lvl in range(len(q_fpn)):
+                lvl_tokens = [self.adpl_cam.tokenize([r[lvl]])[0] for r in all_r_fpn]
+                avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
+            return self.adpl_cam.fuse(query_merged, avg_tokens)
 
-        return self.adpl_cam.fuse(query_merged, avg_tokens)
+        # spatial: merge ref FPN levels, average across references
+        ref_merged_list = [self._merge_fpn(r) for r in all_r_fpn]
+        ref_merged = sum(ref_merged_list) / len(ref_merged_list)  # type: ignore[arg-type]
+        return self.spatial_attn(query_merged, ref_merged)
 
     def _get_fpn_features(
         self, x: torch.Tensor
@@ -190,7 +262,7 @@ class SPDNet(nn.Module):
         Returns dict with:
             query_merged: (B, C, Hf, Wf) merged FPN features before fusion
             ref_merged:   (B, C, Hf, Wf) merged reference FPN features (if ref given)
-            fused:        (B, C, Hf, Wf) features after token fusion (if ref given)
+            fused:        (B, C, Hf, Wf) features after fusion (if ref given)
         """
         q_fpn = self._get_fpn_features(query)
         query_merged = self._merge_fpn(q_fpn)
@@ -199,17 +271,22 @@ class SPDNet(nn.Module):
         if reference is not None:
             refs = [reference] if isinstance(reference, torch.Tensor) else reference
             all_r_fpn = [self._get_fpn_features(r) for r in refs]
-
             n_refs = len(all_r_fpn)
-            avg_tokens: list[torch.Tensor] = []
-            for lvl in range(len(q_fpn)):
-                lvl_tokens = [self.adpl_cam.tokenize([r[lvl]])[0] for r in all_r_fpn]
-                avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
-            fused = self.adpl_cam.fuse(query_merged, avg_tokens)
-            result["fused"] = fused
 
             r_fpn_all = [self._merge_fpn(r) for r in all_r_fpn]
-            result["ref_merged"] = sum(r_fpn_all) / n_refs  # type: ignore[arg-type]
+            ref_merged = sum(r_fpn_all) / n_refs  # type: ignore[arg-type]
+            result["ref_merged"] = ref_merged
+
+            if self.fusion_mode == "token":
+                avg_tokens: list[torch.Tensor] = []
+                for lvl in range(len(q_fpn)):
+                    lvl_tokens = [self.adpl_cam.tokenize([r[lvl]])[0] for r in all_r_fpn]
+                    avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
+                fused = self.adpl_cam.fuse(query_merged, avg_tokens)
+            else:
+                fused = self.spatial_attn(query_merged, ref_merged)
+
+            result["fused"] = fused
 
         return result
 

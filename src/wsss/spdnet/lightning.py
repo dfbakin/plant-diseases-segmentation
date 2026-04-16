@@ -29,6 +29,7 @@ class SPDNetModule(L.LightningModule):
         weight_decay: float = 0.05,
         warmup_epochs: int = 5,
         min_lr: float = 1e-5,
+        fusion_mode: str = "token",
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -37,6 +38,7 @@ class SPDNetModule(L.LightningModule):
             fpn_channels=fpn_channels,
             mse_reduction=mse_reduction,
             pretrained=pretrained,
+            fusion_mode=fusion_mode,
         )
         self.criterion = nn.MultiLabelSoftMarginLoss()
 
