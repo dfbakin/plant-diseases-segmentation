@@ -224,15 +224,36 @@ def generate_all_seeds(
     num_ref_images: int = 1,
     seed_mode: str = "feat_chmean",
     device: torch.device = torch.device("cpu"),
+    ref_pool: dict[int, list[str]] | None = None,
+    ref_image_dir: Path | None = None,
+    query_class_resolver=None,
 ) -> list[str]:
     """Generate feature-based seed maps for all images.
 
     Same image preparation as generate_all_cams but dispatches to
     generate_spdnet_seed instead of generate_spdnet_cam.
+
+    Args:
+        ref_pool: Pre-built {class_idx: [ref_image_names]} mapping. If
+            ``None``, built from ``label_dict`` + ``image_dir`` (legacy
+            behaviour, only correct when ``label_dict`` truly contains
+            multi-class labels for the query images).
+        ref_image_dir: Directory holding reference images. Defaults to
+            ``image_dir`` (queries and refs share a directory). Pass a
+            different directory to draw refs from a separate set
+            (e.g. queries from val, refs from train).
+        query_class_resolver: Optional callable ``(name) -> int`` that
+            returns the class index used for reference selection. Useful
+            when the query labels are a binary fallback (label[0]=1) but
+            the true class can be parsed from the filename. If ``None``,
+            falls back to ``label_dict[name].argmax()``.
     """
     random.seed(SEED)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ref_pool = build_reference_pool(label_dict, image_dir, image_ext)
+    if ref_pool is None:
+        ref_pool = build_reference_pool(label_dict, image_dir, image_ext)
+    if ref_image_dir is None:
+        ref_image_dir = image_dir
     max_long = max_size if max_size > 0 else int(input_size * 1.75)
 
     tfm = transforms.Compose([
@@ -261,7 +282,11 @@ def generate_all_seeds(
                 resample=PIL.Image.BICUBIC,
             )
 
-        ref_cls = active_classes[0]
+        if query_class_resolver is not None:
+            resolved = query_class_resolver(name)
+            ref_cls = resolved if resolved is not None else active_classes[0]
+        else:
+            ref_cls = active_classes[0]
         ref_names = ref_pool.get(ref_cls, [])
         ref_names = [n for n in ref_names if n != name]
         if not ref_names:
@@ -270,7 +295,7 @@ def generate_all_seeds(
 
         ref_pils = []
         for rn in ref_picks:
-            rpil = PIL.Image.open(image_dir / f"{rn}{image_ext}").convert("RGB")
+            rpil = PIL.Image.open(ref_image_dir / f"{rn}{image_ext}").convert("RGB")
             ls = max(rpil.size)
             if ls > max_long:
                 r = max_long / ls
@@ -332,17 +357,29 @@ def generate_all_cams(
     num_ref_images: int = 1,
     binary_aggregate: str = "max",
     device: torch.device = torch.device("cpu"),
+    ref_pool: dict[int, list[str]] | None = None,
+    ref_image_dir: Path | None = None,
+    query_class_resolver=None,
 ) -> list[str]:
     """Generate CAMs for all images and save as .npy files.
 
     All references are passed to the model simultaneously so that token
     averaging happens inside the model, consistent with training.
 
+    Args:
+        ref_pool, ref_image_dir, query_class_resolver: see
+            ``generate_all_seeds``. Pass these to draw references from a
+            different set than the queries (e.g. queries from val,
+            references from train).
+
     Returns the list of processed image names.
     """
     random.seed(SEED)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ref_pool = build_reference_pool(label_dict, image_dir, image_ext)
+    if ref_pool is None:
+        ref_pool = build_reference_pool(label_dict, image_dir, image_ext)
+    if ref_image_dir is None:
+        ref_image_dir = image_dir
     max_long = max_size if max_size > 0 else int(input_size * 1.75)
 
     tfm = transforms.Compose([
@@ -372,7 +409,11 @@ def generate_all_cams(
                 resample=PIL.Image.BICUBIC,
             )
 
-        ref_cls = active_classes[0]
+        if query_class_resolver is not None:
+            resolved = query_class_resolver(name)
+            ref_cls = resolved if resolved is not None else active_classes[0]
+        else:
+            ref_cls = active_classes[0]
         ref_names = ref_pool.get(ref_cls, [])
         ref_names = [n for n in ref_names if n != name]
         if not ref_names:
@@ -382,7 +423,7 @@ def generate_all_cams(
 
         ref_pils = []
         for rn in ref_picks:
-            rpil = PIL.Image.open(image_dir / f"{rn}{image_ext}").convert("RGB")
+            rpil = PIL.Image.open(ref_image_dir / f"{rn}{image_ext}").convert("RGB")
             ls = max(rpil.size)
             if ls > max_long:
                 r = max_long / ls
