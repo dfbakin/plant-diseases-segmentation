@@ -39,16 +39,28 @@ class SiamesePlantSegDataset(Dataset):
         self._build_index()
 
     def _build_index(self) -> None:
-        """Build class -> [sample indices] mapping from labels only (no images)."""
+        """Build class -> [sample indices] mapping from labels only (no images).
+
+        Fast path: if ``self.base`` already produced ``_cached_class_to_indices``
+        (e.g. ``_PlantSegBase`` populated it via the on-disk split-index cache),
+        we copy it directly -- no PNG decode. Otherwise we fall back to the
+        original per-mask scan so non-cached datasets (e.g. legacy callers of
+        ``PlantSegMCTformerDataset``) keep working unchanged.
+        """
         num_classes = self.base.num_classes
         n_plantseg = len(self.base.names)
 
-        for idx, name in enumerate(self.base.names):
-            mask_path = self.base.mask_dir / f"{name}.png"
-            mask = np.array(Image.open(mask_path))
-            for cls_idx in np.unique(mask):
-                if 1 <= cls_idx <= num_classes:
-                    self.class_to_indices[cls_idx - 1].append(idx)
+        cached = getattr(self.base, "_cached_class_to_indices", None)
+        if cached is not None:
+            for cls, idxs in cached.items():
+                self.class_to_indices[cls].extend(idxs)
+        else:
+            for idx, name in enumerate(self.base.names):
+                mask_path = self.base.mask_dir / f"{name}.png"
+                mask = np.array(Image.open(mask_path))
+                for cls_idx in np.unique(mask):
+                    if 1 <= cls_idx <= num_classes:
+                        self.class_to_indices[cls_idx - 1].append(idx)
 
         for pv_idx, (_path, label) in enumerate(self.base._pv_samples):
             idx = n_plantseg + pv_idx

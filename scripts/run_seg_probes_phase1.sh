@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+###############################################################################
+# Phase 1 — Frozen seg-probes.
+#
+# Trains one ProbeHead per (ckpt, position) over PlantSeg with the host
+# SPDNet completely frozen, then evaluates each probe (and three
+# non-trainable baselines) with threshold sweep + per-distribution CRF
+# tuning + visualizations.
+#
+# 11 runs total (5 token + 6 spatial; P6_attn_map only on spatial).
+# Each run is skip-if-exists guarded -- safe to re-launch.
+#
+# Modes:
+#   bash scripts/run_seg_probes_phase1.sh
+#       Full Phase 1 -- ~14-16 h on a single 5090.
+#       (11 probes x 20 epochs at ~94 s/epoch + ~10 min eval each on a
+#        300-image val subset; see EVAL_FLAGS below.)
+#       The 300-image subset (deterministic, seed=1234) is used for ranking
+#       only -- the Phase 4 ceiling re-evaluates winners on full val.
+#
+#   SMOKE=1 bash scripts/run_seg_probes_phase1.sh
+#       Tiny dataset, 1 epoch, 30-image CRF subset, 5-image viz.
+#       Writes to outputs/spdnet_plantseg/_smoke/seg_probe_phase1/.
+#       Should finish in ~5 min.
+###############################################################################
+
+set -euo pipefail
+
+cd /workspace/plant-diseases-segmentation
+export PATH="/venv/main/bin:$PATH"
+
+# ----------------------------------------------------------------------------
+# Config
+# ----------------------------------------------------------------------------
+
+CKPT_TOKEN="outputs/spdnet_plantseg/spdnet_fix_n1_heavy/checkpoints/best.ckpt"
+CKPT_SPATIAL="outputs/spdnet_plantseg/spdnet_spatial_n1_ps_pv/checkpoints/epoch=epoch=76-val_mAP=val/mAP=0.8882.ckpt"
+
+TOKEN_TAG="token_n1_heavy"
+SPATIAL_TAG="spatial_n1_ps_pv"
+
+ALL_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier P6_attn_map)
+TOKEN_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier)
+SPATIAL_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier P6_attn_map)
+
+# ----------------------------------------------------------------------------
+# Smoke vs full
+# ----------------------------------------------------------------------------
+
+SMOKE="${SMOKE:-0}"
+
+if [[ "$SMOKE" == "1" ]]; then
+    OUT_ROOT="outputs/spdnet_plantseg/_smoke/seg_probe_phase1"
+    EXTRA_TRAIN_OVERRIDES=(
+        "data.limit_train=50"
+        "data.limit_val=25"
+        "trainer.max_epochs=1"
+        "data.num_workers=0"
+        "data.batch_size=4"
+    )
+    EVAL_FLAGS=(--smoke --crf-sweep-images 30 --viz-count 5 --crf-workers 4)
+    echo "[phase1] SMOKE mode -- writing under $OUT_ROOT"
+else
+    OUT_ROOT="outputs/spdnet_plantseg/seg_probe_phase1"
+    EXTRA_TRAIN_OVERRIDES=()
+    # --cleanup-seeds drops the ~4.5 GB / probe of *_seeds/ npy files after
+    # eval.json + viz/ are written. Seeds are fully reproducible from
+    # head.pt + the source SPDNet ckpt; keeping them would push Phase 1
+    # alone past 50 GB, well over the 41 GB free-disk budget.
+    #
+    # --limit-val 300 + --crf-sweep-images 50 are the *screen-mode* settings:
+    # eval runs in ~10 min/baseline instead of ~65 min, ~5x faster, with
+    # rankings stable on a 300-image subset (random sample, seed=1234,
+    # same subset across all probes). Two probes from the previous launch
+    # (P1_layer4 and P2_fpn_p2 under token_n1_heavy) were eval'd on full
+    # val before this change and act as full-val reference points; they
+    # are skipped via eval.json. The Phase 4 winner re-eval re-runs
+    # without --limit-val for the final headline number.
+    EVAL_FLAGS=(--crf-sweep-images 50 --viz-count 25 --crf-workers 8 --cleanup-seeds --limit-val 300)
+fi
+
+mkdir -p "$OUT_ROOT" logs
+
+LOG_FILE="logs/seg_probe_phase1_$(date +%Y%m%d_%H%M%S).log"
+DONE_MARKER="$OUT_ROOT/.DONE"
+
+# ----------------------------------------------------------------------------
+# Pre-flight
+# ----------------------------------------------------------------------------
+
+echo "============================================================"
+echo "  SPDNet Phase 1 — Frozen Probes"
+echo "  Started:  $(date)"
+echo "  Out root: $OUT_ROOT"
+echo "  Logfile:  $LOG_FILE"
+echo "  GPU:      $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo unknown)"
+free_gb=$(df -BG --output=avail "$OUT_ROOT" 2>/dev/null | tail -n1 | tr -dc '0-9' || echo 0)
+echo "  Disk free: ${free_gb}G"
+free_mib=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -n1 || echo 0)
+echo "  GPU free:  ${free_mib} MiB"
+echo "============================================================"
+
+if [[ -f "$DONE_MARKER" ]]; then
+    echo "[phase1] $DONE_MARKER already exists -- nothing to do."
+    exit 0
+fi
+
+if [[ ! -f "$CKPT_TOKEN" ]]; then
+    echo "ERROR: token checkpoint missing: $CKPT_TOKEN" >&2
+    exit 1
+fi
+if [[ ! -f "$CKPT_SPATIAL" ]]; then
+    echo "ERROR: spatial checkpoint missing: $CKPT_SPATIAL" >&2
+    exit 1
+fi
+
+# ----------------------------------------------------------------------------
+# Train + eval one (ckpt_tag, ckpt_path, position)
+# ----------------------------------------------------------------------------
+
+run_one_probe() {
+    local tag="$1"; local ckpt="$2"; local pos="$3"
+
+    local out_dir="$OUT_ROOT/$tag/$pos"
+    local head_path="$out_dir/head.pt"
+    local eval_path="$out_dir/eval.json"
+
+    echo ""
+    echo "=== [$tag/$pos] ============================================"
+    echo "  out_dir: $out_dir"
+
+    if [[ -f "$eval_path" ]]; then
+        echo "  $eval_path exists -- skipping training and eval."
+        return 0
+    fi
+
+    if [[ ! -f "$head_path" ]]; then
+        echo "  Training probe head..."
+        # Hydra needs the checkpoint value single-quoted because Lightning
+        # ModelCheckpoint produced filenames with multiple "=" signs.
+        python src/train_spdnet_probe.py \
+            ckpt_tag="$tag" \
+            "checkpoint='$ckpt'" \
+            phase="phase1" \
+            output_dir="$OUT_ROOT/\${ckpt_tag}/\${model.position}" \
+            model.position="$pos" \
+            model.freeze_backbone=true \
+            model.seg_loss_weight=1.0 \
+            model.cls_loss_weight=0.0 \
+            "${EXTRA_TRAIN_OVERRIDES[@]}"
+    else
+        echo "  $head_path exists -- skipping training."
+    fi
+
+    echo "  Evaluating probe + baselines..."
+    python scripts/eval_seg_probes.py \
+        --probe-dir "$out_dir" \
+        --checkpoint "$ckpt" \
+        "${EVAL_FLAGS[@]}"
+}
+
+# ----------------------------------------------------------------------------
+# Execute all 11 (or 5+6) probes sequentially
+# ----------------------------------------------------------------------------
+
+t0=$(date +%s)
+
+echo ""
+echo "============================================================"
+echo "  Token checkpoint -- 5 positions"
+echo "============================================================"
+for pos in "${TOKEN_POSITIONS[@]}"; do
+    run_one_probe "$TOKEN_TAG" "$CKPT_TOKEN" "$pos" 2>&1 | tee -a "$LOG_FILE"
+done
+
+echo ""
+echo "============================================================"
+echo "  Spatial checkpoint -- 6 positions"
+echo "============================================================"
+for pos in "${SPATIAL_POSITIONS[@]}"; do
+    run_one_probe "$SPATIAL_TAG" "$CKPT_SPATIAL" "$pos" 2>&1 | tee -a "$LOG_FILE"
+done
+
+# ----------------------------------------------------------------------------
+# Decision gate
+# ----------------------------------------------------------------------------
+
+echo ""
+echo "============================================================"
+echo "  Phase 1 decision gate"
+echo "============================================================"
+python scripts/seg_probe_decisions.py phase1 --root "$OUT_ROOT" 2>&1 | tee -a "$LOG_FILE"
+
+touch "$DONE_MARKER"
+
+t1=$(date +%s)
+echo ""
+echo "============================================================"
+echo "  Phase 1 complete in $((t1 - t0))s -- $(date)"
+echo "  Marker:  $DONE_MARKER"
+echo "  Summary: $OUT_ROOT/SUMMARY.md"
+echo "============================================================"

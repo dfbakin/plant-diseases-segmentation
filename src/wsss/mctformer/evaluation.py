@@ -142,6 +142,19 @@ def _resolve_optimize_key(
     )
 
 
+# Module-level worker for the parallel branch of `evaluate_cam_threshold_sweep`.
+# MUST stay top-level so multiprocessing can pickle it on Linux fork-mode.
+# Returns (threshold, result_dict) so the parent can reassemble the curves
+# in deterministic threshold order regardless of completion order.
+def _threshold_sweep_one_worker(args):
+    """Compute the per-class IoU dict for ONE threshold. Picklable / pool-safe."""
+    t, predict_dir, gt_dir, name_list, num_cls = args
+    result = evaluate_cam_miou(
+        predict_dir, gt_dir, name_list, num_cls, input_type="npy", threshold=t,
+    )
+    return t, result
+
+
 def evaluate_cam_threshold_sweep(
     predict_dir: str | Path,
     gt_dir: str | Path,
@@ -153,6 +166,7 @@ def evaluate_cam_threshold_sweep(
     seed: int = 42,
     optimize_metric: str = "mIoU",
     patience: int = 0,
+    num_workers: int = 1,
 ) -> dict[str, float | list]:
     """Sweep background thresholds and find the best one for a chosen metric.
 
@@ -169,7 +183,14 @@ def evaluate_cam_threshold_sweep(
             ``"mIoU"`` (default), ``"disease_iou"`` (foreground class for
             binary), or any per-class name returned by ``evaluate_cam_miou``.
         patience: Stop after *patience* consecutive non-improving thresholds.
-            0 means run the full sweep (recommended).
+            0 means run the full sweep (recommended). **Ignored** when
+            ``num_workers > 1`` -- early-stop is meaningless once tasks are
+            already dispatched in parallel.
+        num_workers: Parallelism for the threshold loop. ``1`` (default)
+            runs the historical serial path -- bit-identical to pre-2026-04-19
+            behaviour, supports ``patience``. ``> 1`` distributes thresholds
+            across a multiprocessing.Pool; ~Wx speedup since each threshold's
+            evaluate_cam_miou call is independent.
 
     Returns:
         Dict with ``best_<metric>``, ``best_threshold``, per-threshold curves
@@ -182,14 +203,93 @@ def evaluate_cam_threshold_sweep(
         name_list = list(rng.choice(name_list, max_samples, replace=False))
         log.info(f"Subsampled {max_samples}/{total} images for threshold sweep")
 
+    n_thr = end - start
+    use_pool = num_workers > 1 and n_thr > 1
+
+    if use_pool:
+        # ------------------------------------------------------------------
+        # Parallel path. Each threshold is independent; we dispatch all of
+        # them via apply_async, then collect results in submission order so
+        # the curves dict stays sorted by threshold. ``patience`` is a no-op
+        # here because all tasks are already in flight by the time the parent
+        # could decide to stop -- the cost has already been paid.
+        # ------------------------------------------------------------------
+        if patience > 0:
+            log.warning(
+                f"patience={patience} is ignored when num_workers>1 "
+                f"(all thresholds dispatched up-front)."
+            )
+        from multiprocessing import Pool
+        from tqdm import tqdm as _tqdm
+
+        tasks = [
+            (i / 100.0, predict_dir, gt_dir, name_list, num_cls)
+            for i in range(start, end)
+        ]
+        results: list[tuple[float, dict]] = []
+        with Pool(num_workers) as pool:
+            asyncs = [
+                pool.apply_async(_threshold_sweep_one_worker, (t,)) for t in tasks
+            ]
+            for ar in _tqdm(
+                asyncs, total=len(asyncs), desc="Threshold sweep", unit="thr",
+            ):
+                # Pure NumPy / PIL inside the worker -- can't hang, no need
+                # for the per-image timeout we gave the CRF parallel pool.
+                t, res = ar.get()
+                results.append((t, res))
+
+        # Reassemble in threshold order (already in order via apply_async,
+        # but be explicit so subsequent diff vs serial is bit-identical).
+        results.sort(key=lambda x: x[0])
+
+        opt_key = _resolve_optimize_key(optimize_metric, results[0][1], num_cls)
+        log.info(f"Optimizing threshold for: {opt_key}")
+
+        curves: dict[str, list[float]] = {"threshold": [], "mIoU": []}
+        for k in results[0][1]:
+            curves.setdefault(k, [])
+
+        best_score = -1.0
+        best_thr = 0.0
+        best_result: dict[str, float] = {}
+        for t, res in results:
+            curves["threshold"].append(t)
+            for k in res:
+                curves.setdefault(k, []).append(res[k])
+            score = res[opt_key]
+            if score > best_score:
+                best_score = score
+                best_thr = t
+                best_result = res
+
+        log.info(
+            f"Best threshold={best_thr:.2f}  {opt_key}={best_score:.2f}%  "
+            f"mIoU={best_result.get('mIoU', 0.0):.2f}%  "
+            f"(parallel, num_workers={num_workers})"
+        )
+        return {
+            "best_threshold": best_thr,
+            f"best_{opt_key}": best_score,
+            "best_miou": best_result.get("mIoU", 0.0),
+            "result_at_best": best_result,
+            "curves": curves,
+            "optimize_metric": opt_key,
+        }
+
+    # ----------------------------------------------------------------------
+    # Serial path -- preserved verbatim so num_workers=1 (default) is
+    # bit-identical to pre-patch behaviour and the `patience` early-stop
+    # short-circuit still works.
+    # ----------------------------------------------------------------------
     from tqdm import trange
 
     best_score = -1.0
     best_thr = 0.0
-    best_result: dict[str, float] = {}
+    best_result = {}
     no_improve_count = 0
 
-    curves: dict[str, list[float]] = {"threshold": [], "mIoU": []}
+    curves = {"threshold": [], "mIoU": []}
     opt_key: str | None = None
 
     for i in trange(start, end, desc="Threshold sweep", unit="thr"):

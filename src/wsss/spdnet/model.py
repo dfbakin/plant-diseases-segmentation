@@ -209,6 +209,95 @@ class SPDNet(nn.Module):
         c5 = self.layer4(c4)
         return [c2, c3, c4, c5]
 
+    def extract_probe_features(
+        self,
+        query: torch.Tensor,
+        reference: torch.Tensor | list[torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return intermediate activations at the six SPDNet probe positions.
+
+        Used by the seg-probe diagnostic only. Mirrors ``extract_merged_features``
+        but additionally exposes the C5 backbone output (P1) and the high-res
+        FPN-P2 level (P2) and, for the spatial fusion, the head-averaged
+        attention map (P6) and the classifier-projected fused CAM (P5).
+
+        Returns dict with keys (some absent for token mode / when no reference):
+            P1_layer4:      (B, 2048, H/32, W/32)  -- C5 of ResNet50 backbone
+            P2_fpn_p2:      (B, C_fpn, H/8, W/8)   -- highest-res FPN level *after MSE*
+            P3_query_merged:(B, C_fpn, H/8, W/8)   -- "Point A" pre-fusion
+            P4_fused:       (B, C_fpn, H/8, W/8)   -- "Point B" post-fusion (refs needed)
+            P5_cam_classifier:(B, num_classes, H/8, W/8) -- "Point C" classifier@fused
+            P6_attn_map:    (B, 1, H/8, W/8)       -- head-avg cross-attn map (spatial+ref)
+        """
+        feats = self.extract_features(query)
+        c5 = feats[-1]
+        fpn_out = self.fpn(feats)
+        mse_out = [self.mse(p) for p in fpn_out]
+        query_merged = self._merge_fpn(mse_out)
+
+        result: dict[str, torch.Tensor] = {
+            "P1_layer4": c5,
+            "P2_fpn_p2": mse_out[0],
+            "P3_query_merged": query_merged,
+        }
+
+        if reference is None:
+            return result
+
+        refs = [reference] if isinstance(reference, torch.Tensor) else reference
+        all_r_fpn = [self._get_fpn_features(r) for r in refs]
+        n_refs = len(all_r_fpn)
+
+        if self.fusion_mode == "token":
+            avg_tokens: list[torch.Tensor] = []
+            for lvl in range(len(mse_out)):
+                lvl_tokens = [self.adpl_cam.tokenize([r[lvl]])[0] for r in all_r_fpn]
+                avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
+            fused = self.adpl_cam.fuse(query_merged, avg_tokens)
+            attn_map = None
+        else:
+            ref_merged_list = [self._merge_fpn(r) for r in all_r_fpn]
+            ref_merged = sum(ref_merged_list) / n_refs  # type: ignore[arg-type]
+            fused, attn_map = self._spatial_attn_with_map(query_merged, ref_merged)
+
+        result["P4_fused"] = fused
+        cam_cls = F.relu(
+            torch.einsum("nc,bchw->bnhw", self.classifier.weight, fused)
+        )
+        result["P5_cam_classifier"] = cam_cls
+        if attn_map is not None:
+            result["P6_attn_map"] = attn_map
+        return result
+
+    def _spatial_attn_with_map(
+        self, query_feat: torch.Tensor, ref_feat: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run spatial cross-attention and return (fused, head-avg attn map).
+
+        The attention weights are averaged across heads and across the
+        reference grid, then reshaped to ``(B, 1, H, W)`` so they form a
+        single-channel "where the query attended" heatmap usable as a probe
+        input.
+        """
+        B, C, H, W = query_feat.shape
+        sca = self.spatial_attn
+
+        ref_pooled = sca.pool(ref_feat)
+        q = query_feat.flatten(2).permute(0, 2, 1)
+        kv = ref_pooled.flatten(2).permute(0, 2, 1)
+        q = sca.norm_q(q)
+        kv = sca.norm_kv(kv)
+
+        attended, attn_w = sca.cross_attn(
+            q, kv, kv, need_weights=True, average_attn_weights=True,
+        )
+        attended = attended.permute(0, 2, 1).view(B, C, H, W)
+        fused = query_feat + sca.gate * attended
+
+        # attn_w: (B, H*W, h_ref*w_ref) -- average across reference grid -> (B, H*W, 1)
+        attn_collapsed = attn_w.mean(dim=-1).view(B, 1, H, W)
+        return fused, attn_collapsed
+
     def _merge_and_fuse(
         self,
         q_fpn: list[torch.Tensor],

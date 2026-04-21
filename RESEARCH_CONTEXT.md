@@ -76,8 +76,15 @@ plant-diseases-segmentation/
 │   │   │   ├── lightning.py      # SPDNetModule: Lightning training/validation
 │   │   │   ├── cam_generator.py  # ADPL-CAM + feat_chmean/chvar/.../cam_classifier seed
 │   │   │   │                     #   generation (accepts external ref_pool + class resolver)
-│   │   │   └── class_resolver.py # Build same-class reference pool from train labels +
-│   │   │                         #   resolve val image classes from filenames (REF BUG FIX)
+│   │   │   ├── class_resolver.py # Build same-class reference pool from train labels +
+│   │   │   │                     #   resolve val image classes from filenames (REF BUG FIX)
+│   │   │   ├── seg_probe.py      # SPDNet Localization Capacity Probe (April 2026):
+│   │   │   │                     #   wrapper exposing 6 probe positions (P1..P6) +
+│   │   │   │                     #   Conv1x1 seg head + cls head fall-through
+│   │   │   ├── seg_dataset.py    # Binary seg dataset for probe training (image + binary mask)
+│   │   │   ├── _atomic_io.py     # Atomic NumPy I/O for seed dumps (atomic_save_npy,
+│   │   │   │                     #   is_corrupt_npy, prune_corrupt_seeds)
+│   │   │   └── _split_index_cache.py # Cached val-split index (skips ~6 min startup per run)
 │   │   ├── refinement/           # Mask refinement modules
 │   │   │   ├── crf.py            # DenseCRF wrapper (la_crf + ha_crf)
 │   │   │   ├── affinity_net.py   # PSA (Pixel Semantic Affinity) network
@@ -103,6 +110,7 @@ plant-diseases-segmentation/
 │   ├── train_classifier.py       # timm classifier training (CAM benchmark)
 │   ├── train_mctformer.py        # MCTformer-V2 training
 │   ├── train_spdnet.py           # SPDNet Siamese training (Hydra entrypoint)
+│   ├── train_spdnet_probe.py     # SPDNet seg-probe training (Lightning, BCE+Dice + cls)
 │   ├── train_psa.py              # PSA affinity net training
 │   ├── train_weakclip.py         # WeakCLIP training
 │   ├── train_deeplab_wsss.py     # DeepLabV3+ on pseudo-masks (VOC)
@@ -160,14 +168,27 @@ plant-diseases-segmentation/
 │   ├── smoke_test_ref_fix.py           # Smoke test: same-class refs picked correctly
 │   ├── smoke_test_eval_pipeline.py     # Smoke test: feat_chmean/chvar pipeline end-to-end
 │   ├── smoke_test_cam_classifier.py    # Smoke test: cam_classifier sensitive to fusion
+│   ├── smoke_test_seg_probe.py         # Smoke test: 1-step probe forward/backward
+│   ├── eval_seg_probes.py              # Per-probe evaluation: seed dump → threshold sweep
+│   │                                   #   → CRF param sweep → full-val CRF eval (parallel)
+│   ├── seg_probe_decisions.py          # Phase 1/2 selection logic (composite score S,
+│   │                                   #   force-include, top-K) + chosen.json writer
+│   ├── prelaunch_seg_probes.sh         # Pre-flight checklist (76 unit tests + smoke)
+│   ├── run_seg_probes_phase1.sh        # Phase 1 orchestrator: frozen probes screening
+│   ├── run_seg_probes_phase2.sh        # Phase 2 orchestrator: unfrozen fine-tune of selected
+│   ├── run_seg_probes_phase3.sh        # Phase 3 orchestrator: from-scratch ceiling
+│   ├── run_seg_probes_overnight.sh     # Master orchestrator (fail-fast chaining + heartbeats)
 │   └── overnight_eval_and_train.sh     # SPDNet overnight eval + training pipeline
 │
 ├── tests/
-│   ├── test_binary_pipeline.py    # Binary label/GT/CAM integration tests
+│   ├── test_binary_pipeline.py    # Binary label/GT/CAM tests + TestThresholdSweepParallel
 │   ├── test_mctformer_model.py    # MCTformer forward-pass tests
 │   ├── test_sam_refinement.py     # SAM refinement unit tests
-│   └── test_spdnet.py            # SPDNet: 22 tests (forward, backward, grad flow,
-│                                  #   multi-ref, reference sensitivity, CAM shapes)
+│   ├── test_spdnet.py            # SPDNet: forward, backward, grad flow, multi-ref,
+│   │                              #   reference sensitivity, CAM shapes (46 tests)
+│   ├── test_seg_probe.py         # SPDNet seg-probe: probe heads, atomic I/O,
+│   │                              #   parallel CRF eval, threshold sweep (24 tests)
+│   └── test_overnight_orchestrator.py  # Bash exit-code propagation + fail-fast chaining
 │
 ├── reports/
 │   ├── src/
@@ -223,7 +244,21 @@ plant-diseases-segmentation/
 │   │   ├── spdnet_spatial_n1_ps_pv_eval/     # Same structure for spatial PS+PV
 │   │   ├── eval_summary_corrected_refs.json  # Aggregate summary (feat_chmean/chvar)
 │   │   ├── eval_summary_cam_classifier.json  # Aggregate summary (cam_classifier)
-│   │   └── spatial_eval_summary.json         # Earlier (buggy refs) summary, kept for record
+│   │   ├── spatial_eval_summary.json         # Earlier (buggy refs) summary, kept for record
+│   │   ├── seg_probe_phase1/                 # Probe Phase 1 (frozen, April 2026)
+│   │   │   ├── {ckpt}/{P1..P6}/              #   per-position eval.json + head.pt + viz/
+│   │   │   ├── selected.json                 #   positions advancing to Phase 2
+│   │   │   └── SUMMARY.md                    #   human-readable rollup
+│   │   ├── seg_probe_phase2/                 # Probe Phase 2 (unfrozen fine-tune)
+│   │   │   ├── {ckpt}/{pos}/seg{λ}_cls{λ}/   #   per-config eval.json + head.pt +
+│   │   │   │                                 #   spdnet_finetuned.pt + viz/
+│   │   │   ├── chosen.json                   #   single best (ckpt, pos, λ) for Phase 3
+│   │   │   └── SUMMARY.md
+│   │   └── seg_probe_phase3/                 # Probe Phase 3 (from-scratch ceiling)
+│   │       ├── from_scratch_spatial/         #   single config: spatial / P3_query_merged
+│   │       │   └── P3_query_merged/eval.json #   full-val (1247) IoUs, CRF params, top-5 sweeps
+│   │       ├── scratch_init.pt               #   random-init checkpoint (Phase-3 starting point)
+│   │       └── SUMMARY.md
 │   ├── visualizations/            # Activation grid PNGs (DVC: visualizations.dvc, ~1.5 GB)
 │   │   ├── val_cam_exploration/   #   MCTformer MC115 baseline (25 images)
 │   │   ├── spdnet_val_cam_exploration/ # SPDNet initial run (broken model)
@@ -1049,7 +1084,13 @@ dvc pull outputs/spdnet_plantseg.dvc outputs/visualizations.dvc mlruns.dvc
 
 18. **SPDNet on PlantSeg + PlantVillage (DONE — April 2026)**: All previous token-fusion SPDNet training used PlantSeg only. The two spatial fusion runs include both a PS-only and a PS+PV variant. The PS+PV spatial run reaches val mAP 0.888 (best of any SPDNet config), but its localization metrics are not better than the token PS-only baseline (Section 5.10).
 
-19. **Add explicit spatial supervision to SPDNet (THOUGHT — April 2026)**: Given the negative result above, the natural next step is to add an auxiliary loss (contrastive, equivariance, or self-distillation) so that the cross-attention is forced to be spatially discriminative rather than acting as a content-free bias. Detailed sketch in Section 5.11. Not yet planned for implementation.
+19. **Add explicit spatial supervision to SPDNet (THOUGHT — April 2026, re-prioritized)**: Three candidate auxiliary losses were sketched (contrastive, equivariance, self-distillation) so that the cross-attention is forced to be spatially discriminative rather than acting as a content-free bias. Detailed sketch in Section 5.11. After the SPDNet Localization Capacity Probe (Section 5.12) confirmed the localization signal exists in the features, the **equivariance loss is the most attractive starting point** (cheap, no extra labels, directly attacks the failure mode); contrastive becomes Phase B; self-distillation last. Still **not yet planned for implementation**.
+
+20. **SPDNet Localization Capacity Probe (DONE — April 2026)**: 3-phase probe pipeline (frozen / unfrozen / from-scratch) with a small learnable seg head at six different SPDNet positions. Lifts SPDNet's localization upper bound from 32 % (current production cam_classifier+CRF) to **~62 % disease IoU** (88 % of the fully-supervised SegNeXt 70.1 % ceiling). Confirms three things that were previously hypotheses: (a) the localization signal is present in SPDNet features, (b) the choice of probe position becomes nearly irrelevant after a few epochs of joint fine-tuning (4 pp spread for Ph2 vs 24 pp for Ph1), (c) the spatial cross-attention checkpoint is statistically indistinguishable from token fusion after fine-tuning. Detailed analysis in Section 5.12.
+
+21. **Promote probe head to production seed source (HIGH PRIORITY, NOT DONE)**: The Phase-2 winner (`spatial_n1_ps_pv` ckpt + `P3_query_merged` probe + retuned CRF) achieves ~60 % disease IoU and is a drop-in replacement for the current `cam_classifier + CRF` seed source. Promoting it to the production WSSS pipeline (Steps 1-2) should lift downstream PSA → RW → WeakCLIP by a similar margin. Single highest-leverage next experiment.
+
+22. **CRF re-tuning on strong seeds (LOW EFFORT)**: With Phase-2/3-quality seeds, the existing CRF parameters (tuned in March on classifier-only seeds) over-smooth and *hurt* the result by ~3 pp (Phase 3: raw 64.9 % → CRF 61.8 %). A fresh CRF param sweep on a 200–300 image subset of the new seed distribution should recover those points. ~2 h of compute.
 
 ---
 
@@ -1253,7 +1294,145 @@ with `λ_3 = 0` for the first warm-up phase to avoid the self-reinforcing degene
 - How to weight the auxiliary losses against classification — too strong and classification suffers; too weak and the attention reverts to the lazy bias pattern observed in Section 5.10.6.
 - Whether an equivariance loss alone is sufficient (it is the cheapest and least invasive of the three).
 
+**Post-probe re-prioritization (April 2026)**: The SPDNet Localization Capacity Probe (Section 5.12) gives us new evidence on the relative importance of each idea. In particular:
+- A learned 2-layer probe head on `P3_query_merged` (frozen backbone) already extracts **45–47% disease IoU** — i.e. the localization signal is provably present in the SPDNet features. The architectural bottleneck is not "missing signal" but "the gradient does not push the spatial path".
+- Therefore the **equivariance loss is the most attractive starting point**: it is the only one of the three that does not need extra labels or pseudo-masks, costs only 1 extra forward pass, and directly attacks the failure mode ("classification does not need equivariant attention, so the model never learns it").
+- **Contrastive** becomes the natural Phase B if equivariance alone moves the cross-attention pattern.
+- **Self-distillation** stays last — highest risk of the degenerate fixed-point and hardest to debug.
+
+A complementary direction also opened up by the probe: **promote the probe head + Phase-2 fine-tune recipe to production**. That alone gives ~60% disease IoU today, with no new losses. The spatial-loss work is then "research" — chasing the remaining ~8 pp gap to the fully-supervised ceiling. None of this changes the loss list above; it only re-orders the priority.
+
 This is the most natural next experiment after the current "spatial fusion does not learn spatial signal" finding. It is **not yet planned for implementation**.
+
+---
+
+### 5.12 SPDNet Localization Capacity Probe (April 2026)
+
+**Motivation**: After Section 5.10 confirmed that classification-only training does not produce a useful spatial signal, the open question became: *is the localization signal even present in the SPDNet features at all?* If a small learned probe head can recover disease masks from a frozen SPDNet, then the architecture is fine and the bottleneck is purely the training objective. If not, we need a different architecture entirely.
+
+**Design**: Three sequential phases of increasing training freedom, all using the same 2-class binary disease segmentation as the supervised target.
+
+| Phase | What is trained | Backbone | Goal |
+|-------|-----------------|----------|------|
+| 1 | Probe head only (2-layer 1×1 conv, 64 hidden) | **Frozen** SPDNet | Cheap screening of which probe positions carry signal (20 epochs each, --limit-val 300) |
+| 2 | Probe head + entire SPDNet (joint loss) | **Unfrozen** | Targeted fine-tune of the most promising positions (15 epochs, λ_seg=λ_cls=1.0) |
+| 3 | Probe head + entire SPDNet from random init | **Unfrozen, no pretrain** | From-scratch ceiling — what is the best this architecture can do for binary localization? (full 1247 val) |
+
+**Probe positions** (six tap points inside SPDNet):
+- `P1_layer4` — backbone C5 output (2048 channels, post-ResNet50-stage4)
+- `P2_fpn_p2` — finest FPN level (256 ch, post-MSE)
+- `P3_query_merged` — pre-fusion merged query feature (256 ch) — this is where the existing `feat_chmean`/`feat_chvar` baselines tap
+- `P4_fused` — post-fusion feature (256 ch, with reference contribution)
+- `P5_cam_classifier` — classifier weights projected on the fused feature (115 ch)
+- `P6_attn_map` — spatial cross-attention map (1 ch, spatial-only)
+
+**Composite score `S`**: For each row `S = max(probe_iou, chmean_iou, chvar_iou, cam_cls_iou)` after CRF refinement. Used by the orchestrator to pick top-3 positions for Phase 2 (with a force-include rule for any S ≥ 30 % and 1 fused position for the spatial checkpoint).
+
+**Implementation**:
+- `src/wsss/spdnet/seg_probe.py` — wrapper that exposes the 6 probe positions via `extract_probe_features`
+- `src/train_spdnet_probe.py` — Lightning module (BCE+Dice for seg, MultilabelSoftMargin for cls)
+- `scripts/eval_seg_probes.py` — evaluation: seed dump → threshold sweep → CRF param sweep → full-val CRF eval (parallel CRF + parallel threshold sweep)
+- `scripts/run_seg_probes_phase{1,2,3}.sh` — phase orchestrators
+- `scripts/run_seg_probes_overnight.sh` — master orchestrator with fail-fast chaining and atomic seed I/O
+- `tests/test_seg_probe.py`, `tests/test_overnight_orchestrator.py` — regression suite (76 tests total)
+
+**Total compute**: ~14 h on RTX 5090 for Phases 2+3 (Phase 1 ran earlier and was reused from cache).
+
+#### 5.12.1 Phase 1 — Frozen probe screening
+
+Each row uses the deterministic 300-image val subset (`--limit-val 300`). "Probe IoU" is the CRF-refined disease IoU after a per-position threshold sweep + CRF param sweep. The composite score `S` decides which positions advance to Phase 2.
+
+| Ckpt | Position | Probe IoU | chmean | chvar | cam_cls | **S** | Selected |
+|---|---|---:|---:|---:|---:|---:|:---:|
+| spatial_n1_ps_pv | P1_layer4 | 45.46 | 36.37 | 35.80 | — | **45.46** | YES |
+| spatial_n1_ps_pv | P2_fpn_p2 | 44.51 | 21.95 | 34.48 | 26.20 | **44.51** | YES |
+| spatial_n1_ps_pv | P3_query_merged | 42.56 | 21.95 | 36.89 | 27.63 | **42.56** | YES |
+| spatial_n1_ps_pv | P4_fused | 42.07 | 21.95 | 36.08 | 29.13 | **42.07** | YES |
+| spatial_n1_ps_pv | P5_cam_classifier | 29.05 | 28.29 | 28.81 | 29.13 | **29.13** |  |
+| spatial_n1_ps_pv | P6_attn_map | 21.95 | 0.00 | — | — | **21.95** |  |
+| token_n1_heavy | P1_layer4 | 46.16 | 35.12 | 34.64 | — | **46.16** | YES |
+| token_n1_heavy | P2_fpn_p2 | 42.11 | 29.63 | 35.77 | 22.08 | **42.11** | YES |
+| token_n1_heavy | P3_query_merged | 43.22 | 36.88 | 37.04 | 32.36 | **43.22** | YES |
+| token_n1_heavy | P4_fused | 41.63 | 36.88 | 35.01 | 30.41 | **41.63** | YES |
+| token_n1_heavy | P5_cam_classifier | 29.82 | 30.60 | 28.91 | 30.41 | **30.60** | YES |
+
+**Phase 1 takeaways**:
+- The learned probe head (even with a fully frozen backbone) **beats every handcrafted aggregation** by 5–11 pp at every position except `P6_attn_map`. The signal is in the features.
+- `P6_attn_map` is a 1-channel spatial summary — collapsing 256 channels to 1 destroys the disease information. This is a useful negative result: the cross-attention output by itself is not a useful seed.
+- Best Phase 1 result: **`token_n1_heavy / P1_layer4` = 46.16 % DisIoU** with a 2-layer probe head and a frozen ResNet50.
+
+#### 5.12.2 Phase 2 — Targeted unfrozen fine-tune
+
+Each selected position from Phase 1 is fine-tuned end-to-end with `λ_seg = λ_cls = 1.0` for 15 epochs. Same 300-image val subset.
+
+| Ckpt | Position | Probe IoU (CRF) | chmean | chvar | cam_cls | **S** |
+|---|---|---:|---:|---:|---:|---:|
+| spatial_n1_ps_pv | P1_layer4 | 55.95 | 37.62 | 37.30 | — | 55.95 |
+| spatial_n1_ps_pv | P2_fpn_p2 | 59.42 | 21.89 | 29.36 | 36.70 | 59.42 |
+| spatial_n1_ps_pv | **P3_query_merged** | **59.89** | 21.95 | 40.38 | 36.99 | **59.89** |
+| spatial_n1_ps_pv | P4_fused | 59.01 | 21.94 | 37.15 | 29.92 | 59.01 |
+| token_n1_heavy | P1_layer4 | 55.54 | 43.89 | 42.05 | — | 55.54 |
+| token_n1_heavy | P2_fpn_p2 | 59.17 | 25.21 | 35.40 | 26.51 | 59.17 |
+| token_n1_heavy | P3_query_merged | 59.78 | 33.79 | 39.79 | 38.33 | 59.78 |
+| token_n1_heavy | P4_fused | 58.79 | 29.49 | 44.49 | 32.83 | 58.79 |
+| token_n1_heavy | P5_cam_classifier | 57.59 | 37.05 | 30.32 | 31.80 | 57.59 |
+
+**Phase 2 takeaways**:
+- Every probe lands in the narrow band **55.5 – 59.9 %**. With 15 epochs of joint loss, *the choice of probe position becomes nearly irrelevant* — what matters is just having a learnable seg head with a fine-tunable backbone.
+- **Position spread shrinks 6× vs Phase 1** (from 24 pt to 4 pt). The frozen-mode inhomogeneity was an artifact of feature-alignment-with-classifier-only-training, not an architectural property.
+- **Spatial vs token are tied** (spatial avg 58.6 %, token avg 58.2 %). Yet another data point that the spatial cross-attention does nothing distinctive for localization.
+- Phase-2 winner picked for Phase 3: `spatial_n1_ps_pv / P3_query_merged` (DisIoU 59.89 %).
+
+#### 5.12.3 Phase 3 — From-scratch ceiling
+
+Train SPDNet (`fusion_mode="spatial"`, P3 probe head) from a random init on the binary disease segmentation task. Full 1247 val images.
+
+| Variant | Disease IoU |
+|---|---:|
+| **Probe (CRF)** | **61.79 %** |
+| Probe (raw threshold, no CRF) | 64.87 % |
+| chmean (CRF) | 21.88 % |
+| chvar (CRF) | 24.26 % |
+| cam_cls (CRF) | 30.78 % |
+
+**Phase 3 takeaways**:
+- The from-scratch ceiling is **61.79 %** disease IoU — only **~2 pp above Phase 2's best 59.89 %** (caveat: subset vs full eval, see below). The pretrained classifier-only SPDNet plus 15 epochs of joint loss closes most of the gap to a localization-trained-from-scratch SPDNet.
+- The handcrafted baselines (chmean/chvar/cam_cls) all collapse on the from-scratch backbone — there is no classifier projection that organized the channels yet, so naive aggregations fail. This is consistent with what we know.
+- **Raw thresholded > CRF refined** here (64.87 % vs 61.79 %). When the seeds are very good, the existing CRF parameters (tuned for weaker classifier-only seeds back in March) over-smooth and *hurt* the result. **Action item**: re-tune CRF on Phase 2/3 quality seeds with a 200–300 image sweep set; expect to recover ~3 pp in Phase 3.
+
+#### 5.12.4 Cross-phase trajectory and the new upper bound
+
+**Headline numbers (CRF disease IoU, full-val for Ph3, 300-subset for Ph1/Ph2)**:
+
+```
+Current WSSS pipeline (cam_classifier + CRF, March 2026):    32.49 %   ← starting point
+Phase 1 best frozen probe (token / P1_layer4):               46.16 %   (+13.7)
+Phase 2 best unfrozen probe (spatial / P3_query_merged):     59.89 %   (+27.4)
+Phase 3 from-scratch ceiling (spatial / P3_query_merged):    61.79 %   (+29.3)   ← new SPDNet upper bound
+Fully-supervised SegNeXt baseline:                           70.10 %   ← target
+```
+
+The probe pipeline lifts SPDNet's localization upper bound from 32 % to **~62 %** disease IoU (88 % of the fully-supervised SegNeXt ceiling). Critically, this is the **WSSS upper bound for SPDNet** — we use no pixel labels for the SPDNet pretraining stage; the probe head does see GT during the supervised fine-tune phases, so it is not pure WSSS but it is the *capacity* of the architecture. The current production pipeline is leaving roughly **30 pp of disease IoU on the table**.
+
+**Caveat on the Phase 2 vs Phase 3 comparison**: Phase 2 used a deterministic 300-image val subset, Phase 3 used the full 1247. The 2 pp gap is therefore an upper bound on the actual gap. A re-run of the Phase-2 winner on the full val set is the cleanest fix and would take ~25 min.
+
+#### 5.12.5 Auxiliary findings the probe surfaced
+
+1. **`chvar` consistently beats `chmean` for fused features**. Channel-mean gets distorted by fusion biases; channel-variance is scale-invariant and recovers more.
+2. **CRF sweep on a 50-image subset overfits to that subset by ~15–20 pp.** The Phase-2 sweep-subset CRF reads ~74–75 % but the full-eval CRF reads ~59–60 %. For production sweeps we should use ≥200 images.
+3. **Spatial vs token equivalence after fine-tuning** is now confirmed by a third independent measurement (mAP, cross-attention viz, probe IoU). Treat this as a closed question.
+4. **The 8-pp gap from Ph3 ceiling (62 %) to fully-supervised SegNeXt (70 %)** is split between the CRF over-smoothing issue (~3 pp recoverable) and what looks like an architectural floor (~5 pp). The latter would require a bigger seg head, multi-scale outputs, or a different architecture entirely.
+
+#### 5.12.6 Operational hardening (during the probe runs)
+
+Four robustness fixes were added during the run after the first overnight pass silently failed:
+
+- **Atomic NumPy I/O** (`src/wsss/spdnet/_atomic_io.py`): `np.save` is not atomic for object arrays; a previous interrupted save left a truncated `.npy` that crashed downstream loaders. The new `atomic_save_npy` writes to `*.tmp` + `os.rename`, and `is_corrupt_npy` / `prune_corrupt_seeds` defensively detect-and-regenerate corrupt files at startup.
+- **Orchestrator exit-code propagation** (`scripts/run_seg_probes_overnight.sh`): the original `if ! wait "$CHILD_PID"; then ec=$?; fi` pattern silently dropped non-zero exits. Replaced with `wait "$CHILD_PID" || ec=$?` plus explicit `|| { log; exit 1; }` fail-fast guards between phases.
+- **Per-image CRF timeouts and parallelization** (`scripts/eval_seg_probes.py`): `pydensecrf` occasionally hangs forever on pathological images. Now CRF inference runs through `multiprocessing.Pool` with an `apply_async.get(timeout=N)` per image; a hung image is abandoned after `--crf-eval-timeout-sec`.
+- **Parallel threshold sweep** (`src/wsss/mctformer/evaluation.py`): the 100-step threshold sweep was previously single-threaded. Now uses `multiprocessing.Pool` across thresholds (≈8× speedup), guarded by a `__main__` check and a `num_workers=1` serial fallback for unit tests.
+
+All four changes are covered by regression tests (`tests/test_seg_probe.py`, `tests/test_overnight_orchestrator.py`, `tests/test_binary_pipeline.py::TestThresholdSweepParallel`).
 
 ---
 
@@ -1337,6 +1516,45 @@ python scripts/smoke_test_eval_pipeline.py
 python scripts/smoke_test_cam_classifier.py
 ```
 
+### SPDNet Localization Capacity Probe (3-phase pipeline)
+```bash
+# Pre-flight checklist (76 unit tests + smoke checks; ~10 min)
+bash scripts/prelaunch_seg_probes.sh
+
+# Run all 3 phases overnight (full mode: ~14 h on RTX 5090)
+# Phase 1: frozen probes, 20 epochs each, --limit-val 300, --cleanup-seeds
+# Phase 2: unfrozen fine-tune of selected positions, 15 epochs, λ_seg=λ_cls=1.0
+# Phase 3: from-scratch ceiling on the Phase-2 winner position, full val (1247)
+bash scripts/run_seg_probes_overnight.sh \
+    2>&1 | tee logs/seg_probe_overnight_$(date +%Y%m%d_%H%M%S).log
+
+# Or background (survives ssh disconnect)
+nohup bash scripts/run_seg_probes_overnight.sh \
+    > logs/seg_probe_overnight_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+# Smoke mode: 1 epoch per phase, 20 val images, ~30 min total
+SMOKE=1 bash scripts/run_seg_probes_overnight.sh
+
+# Run individual phases
+bash scripts/run_seg_probes_phase1.sh   # frozen screening
+bash scripts/run_seg_probes_phase2.sh   # unfrozen fine-tune (reads phase1 selected.json)
+bash scripts/run_seg_probes_phase3.sh   # from-scratch (reads phase2 chosen.json)
+
+# Re-evaluate a single probe checkpoint (e.g., for CRF re-tuning)
+python scripts/eval_seg_probes.py \
+    --ckpt outputs/spdnet_plantseg/seg_probe_phase2/spatial_n1_ps_pv/P3_query_merged/seg1.0_cls1.0/checkpoints/best.ckpt \
+    --base-ckpt outputs/spdnet_plantseg/spdnet_spatial_n1_ps_pv/checkpoints/<existing>.ckpt \
+    --position P3_query_merged \
+    --out-dir outputs/spdnet_plantseg/seg_probe_phase2/spatial_n1_ps_pv/P3_query_merged/seg1.0_cls1.0 \
+    --crf-sweep-images 250 \
+    --crf-eval-timeout-sec 300
+
+# Inspect aggregated results
+cat outputs/spdnet_plantseg/seg_probe_phase1/SUMMARY.md
+cat outputs/spdnet_plantseg/seg_probe_phase2/SUMMARY.md
+cat outputs/spdnet_plantseg/seg_probe_phase3/SUMMARY.md
+```
+
 ### SPDNet CAM generation & evaluation
 ```bash
 # Generate CAMs from a checkpoint (max aggregation, N=1)
@@ -1405,6 +1623,18 @@ quarto render src/05_mask_quality_analysis.qmd
 14. **Spatial cross-attention checkpoints have nested checkpoint paths**: Lightning's `ModelCheckpoint` interaction with the `=` in the format string produced directories like `epoch=epoch=76-val_mAP=val/mAP=0.7970.ckpt`. The full evaluation/visualization scripts already encode the correct nested path. Do not blindly apply the `best.ckpt` symlink trick — for these two runs the symlinks were never created; reference the nested paths directly (see `RUNS` in `scripts/eval_spatial_full.py`).
 
 15. **`feat_chmean` collapses on the spatial backbone**: For the spatial models the channel-mean of pre-fusion features is negative-skewed, so `feat_chmean` collapses to a "predict everything as disease" failure mode (DisIoU ≈ 17.9%, BG IoU = 0%). Use `feat_chvar` instead — it's the recommended pre-fusion seed mode for spatial-trained checkpoints.
+
+16. **Seg-probe ~6 min startup per run (FIXED)**: Each seg-probe Lightning fit started by scanning the entire PlantSeg+PlantVillage train set to build the val split index — adding ~6 minutes of "wall-clock before MLflow run is created" per probe. Fixed by `src/wsss/spdnet/_split_index_cache.py` which memoizes the split index on disk (`outputs/.cache/seg_probe_split_index.json`). After the patch the startup is <30 s.
+
+17. **Atomic NumPy seed I/O is mandatory (FIXED, April 2026)**: The Phase-1 overnight run failed mid-flight because `np.save` is not atomic for object-dtype arrays — an interrupted save left a truncated `.npy` file that crashed downstream loaders with `_pickle.UnpicklingError`, and `skip_existing=True` happily reused the corrupt file. Fix: `src/wsss/spdnet/_atomic_io.py` provides `atomic_save_npy` (write to `*.tmp` + `os.rename`) and `is_corrupt_npy` / `prune_corrupt_seeds` to detect+regenerate at startup. Tests in `tests/test_seg_probe.py::TestAtomicSaveNpy`.
+
+18. **Orchestrator exit-code propagation (FIXED, April 2026)**: The original `if ! wait "$CHILD_PID"; then ec=$?; fi` pattern in `scripts/run_seg_probes_overnight.sh` silently dropped non-zero exits — phases were marked `✓ complete` even after crashes. Fixed to `wait "$CHILD_PID" || ec=$?` plus explicit fail-fast `|| { log ...; exit 1; }` guards between phases. Regression covered by `tests/test_overnight_orchestrator.py::TestBashExitCapturePattern`. **If you see this pattern in any new shell script, do not copy it — use `cmd; ec=$?` or `cmd || ec=$?` instead.**
+
+19. **CRF can hang on pathological images (MITIGATED)**: `pydensecrf` occasionally enters infinite inference loops on certain images (one such hang was traced to `zucchini_downy_mildew_Bing_0120` during Phase 2). `_full_crf_eval` in `scripts/eval_seg_probes.py` now wraps each image in `multiprocessing.Pool.apply_async(...).get(timeout=N)` (set via `--crf-eval-timeout-sec`, default 300). A hung worker is abandoned and the image is reported with a 0-IoU placeholder.
+
+20. **CRF parameters need re-tuning per seed distribution**: The CRF parameters tuned in March on classifier-only seeds *over-smooth* the new strong probe-head seeds and can *hurt* IoU by ~3 pp (Phase 3: raw 64.9 % → CRF 61.8 %). Always re-sweep CRF parameters when the seed source changes, ideally on ≥200 sweep images to avoid the +15-20 pp overfit observed when using only 50 sweep images (Phase 2: sweep-subset 74-75 % vs full-eval 59-60 %).
+
+21. **Phase-1 cached on disk after first run**: The orchestrator skips a phase if `<phase_dir>/.DONE` exists. To force a re-run delete the marker file (and the corresponding `eval.json` files for the probes you want regenerated). The `--cleanup-seeds` flag deletes large `.npy` seed files after eval to keep the per-probe footprint at ~105 MB checkpoint + small head + eval.json + viz; without it each probe consumes ~4.4 GB.
 
 ---
 
@@ -1502,7 +1732,7 @@ SPDNet replaces **Steps 1-2** of the WSSS pipeline (classifier training + CAM ge
 
 **SPDNet implementation & evaluation (Step 2)**: Full Siamese network implemented, trained (5 runs), and evaluated. Best SPDNet CAM quality (28.08% disease IoU from N=1 heavy) is **comparable but slightly below** MC115 MCTformer (~29.98% disease IoU). The Siamese reference-guidance approach did not deliver the localization improvement suggested by the paper's cherry-picked visualizations on a 42-image dataset.
 
-**Overall conclusion**: Neither MCTformer attention-based CAMs nor SPDNet reference-guided ADPL-CAMs (token *or* spatial fusion) produce sufficiently precise disease localization on PlantSeg (~28-32% disease IoU after CRF). The CAM quality ceiling appears to be a property of the classification-to-localization paradigm itself, not a specific architecture limitation — even the spatial cross-attention variant (April 2026, Sections 5.9–5.10) under classification-only training failed to improve localization despite a non-trivial learned gate. Future directions should consider: (a) explicit spatial supervision for SPDNet (Section 5.11 sketch — contrastive / equivariance / self-distillation losses), (b) the hybrid ensemble (cheap, untested), (c) fundamentally different approaches to WSSS (e.g., self-supervised pretraining, text-guided segmentation, or foundation model adaptation).
+**Overall conclusion (revised April 2026 after probe pipeline)**: The previous conclusion that "the CAM quality ceiling appears to be a property of the classification-to-localization paradigm itself" must be **partially retracted**. The SPDNet Localization Capacity Probe (Section 5.12) demonstrates that the SPDNet feature space *does* contain enough localization signal for **~62 % disease IoU** (88 % of the fully-supervised SegNeXt 70.1 % ceiling) once a small learnable seg head and a few epochs of joint fine-tune are added. The bottleneck of the previous 28–32 % production numbers was therefore **the seed-extraction recipe (raw aggregations on classifier-only-trained features)**, not the architecture itself. SPDNet — token *or* spatial fusion — is a viable WSSS backbone if combined with a learned probe head. What remains true is that under *classification-only* training the spatial cross-attention does not learn a useful spatial signal (Section 5.10). Future directions in priority order: **(a)** promote the probe head + Phase-2 fine-tune recipe to production (highest leverage, ready to go — Section 10 #21); **(b)** re-tune CRF on the new strong-seed distribution (~3 pp recoverable, low effort — Section 10 #22); **(c)** explicit spatial supervision for SPDNet (Section 5.11 — equivariance first, contrastive second, self-distillation last); **(d)** the hybrid ensemble (cheap, untested); **(e)** fundamentally different approaches to WSSS (self-supervised pretraining, text-guided segmentation, foundation model adaptation).
 
 ### 13.8 Detailed SPDNet Implementation Notes (for Agents)
 
@@ -1588,3 +1818,145 @@ After completing all SPDNet training and ADPL-CAM evaluation, a critical analysi
 **Why this matters**: The localization information *is* in the network — it's the classification projection that destroys it. This has implications for the entire WSSS pipeline: future work should explore feature-based seeds throughout (MCTformer ViT features, not just CLS token attention).
 
 **Spatial prototype result**: Inference-only cosine similarity with reference prototype did NOT outperform channel-mean (17.60% vs 36.50%). This confirms the GlobalMaxPool tokenization in ADPL-CAM loses all spatial information, and spatial reference matching requires architectural changes (e.g., cross-attention) and retraining.
+
+---
+
+## 14. DVC Artifact Inventory
+
+This section catalogues every artifact that should be DVC-tracked so that a fresh checkout can reproduce, re-evaluate, and analyze every experiment in this document. Artifacts are grouped by purpose (data → checkpoints → eval → viz → tracking → logs). For each group we list the `.dvc` pointer file, its current size on disk, and what is inside.
+
+### 14.1 Source data (read-only inputs)
+
+| `.dvc` pointer | Path | Size | Contents | Refresh cadence |
+|---|---|---:|---|---|
+| `data/plantsegv3.dvc` | `data/plantsegv3/` | ~4 GB | PlantSeg v3 (images + GT masks, train/val splits) | never (frozen) |
+| `data/plant-village.dvc` | `data/plant-village/` | ~2 GB | PlantVillage (image-level labels, folder-organized) | never (frozen) |
+| `data/VOC2012.dvc` | `data/VOC2012/` | ~3 GB | Pascal VOC 2012 (used for WSSS pipeline validation) | never (frozen) |
+| `data/plant-pathology-2020-fgvc7.dvc` | `data/plant-pathology-2020-fgvc7/` | ~2 GB | Auxiliary, unused | never (frozen) |
+| `pretrained.dvc` | `pretrained/` | ~1 GB | `ViT-B-16.pt` (CLIP), `res38_cls.pth` (PSA backbone), ResNet50 ImageNet weights (auto-downloaded) | rarely |
+
+### 14.2 Trained checkpoints (everything we'd need to re-evaluate)
+
+A single big `outputs/spdnet_plantseg.dvc` covers the entire SPDNet experiment family — including the new probe phases — because they all live under the same root directory. After every overnight run, refresh with `dvc add outputs/spdnet_plantseg`.
+
+| `.dvc` pointer | Path | Size | Contents | Last refresh |
+|---|---|---:|---|---|
+| `outputs/spdnet_plantseg.dvc` | `outputs/spdnet_plantseg/` | ~36 GB | All SPDNet artifacts (see breakdown below) | needs refresh after probe pipeline |
+| `outputs/mctformer_plantseg_binary.dvc` | `outputs/mctformer_plantseg_binary/` | ~6 GB | MCTformer binary (1-class) classifier checkpoints | stable |
+| `outputs/mctformer_plantseg_multiclass.dvc` | `outputs/mctformer_plantseg_multiclass/` | ~7 GB | MCTformer MC115 classifier checkpoints | stable |
+| `outputs/mctformer_voc_v2.dvc` | `outputs/mctformer_voc_v2/` | ~5 GB | MCTformer VOC validation runs | stable |
+| `outputs/plantseg_architecture_benchmark.dvc` | `outputs/plantseg_architecture_benchmark/` | ~4 GB | Fully-supervised baseline checkpoints (SegNeXt etc.) | stable |
+| `outputs/plantseg_augmentation_ablation_fp32_final.dvc` | `outputs/plantseg_augmentation_ablation_fp32_final/` | ~6 GB | Augmentation ablation checkpoints | stable |
+| `outputs/plantseg_multiclass_benchmark.dvc` | `outputs/plantseg_multiclass_benchmark/` | ~3 GB | 116-class supervised baseline | stable |
+| `outputs/dfbakin_classifier_cam_benchmark.dvc` | `outputs/dfbakin_classifier_cam_benchmark/` | ~2 GB | ResNet/EfficientNet classifier checkpoints | stable |
+| `outputs/sweeps.dvc` | `outputs/sweeps/` | small | Hydra sweep summaries | stable |
+
+**Breakdown of `outputs/spdnet_plantseg/` (36 GB total)**:
+
+| Subpath | Size | Critical? | Why |
+|---|---:|---|---|
+| `spdnet_fix_n{1,3}_*/checkpoints/` | ~5 GB | yes | Token-fusion training checkpoints (best.ckpt, last.ckpt) |
+| `spdnet_spatial_n1_ps{,_pv}/checkpoints/` | ~5 GB | yes | Spatial-fusion training checkpoints |
+| `cams/` + `*_eval/seeds_*/` | ~15 GB | partly | Generated CAMs and seed `.npy` dumps for the 1247-image val set. Required for revisiting CRF parameter choice without re-running inference. |
+| `feature_seed_eval/` | ~1 GB | yes | First feat_chmean+CRF sweep evidence (Section 5.8) |
+| `seg_probe_phase1/` | **2.7 GB** | **yes** | 11 probe checkpoints (~105 MB each), eval.json, head.pt, viz/ |
+| `seg_probe_phase2/` | **5.0 GB** | **yes** | 9 fine-tuned SPDNet checkpoints + probe heads + eval.json |
+| `seg_probe_phase3/` | **678 MB** | **yes** | From-scratch ckpt + scratch_init.pt + eval.json + SUMMARY.md |
+| `*.dvc-friendly small files (eval_summary*.json, *_corrected_refs/...)` | <100 MB | yes | Headline aggregated summaries |
+
+### 14.3 Evaluation artifacts (small, must be in DVC)
+
+These small JSON/MD files are the headline numbers everyone looks at first. All live inside `outputs/spdnet_plantseg/` and are therefore covered by `outputs/spdnet_plantseg.dvc`.
+
+| Artifact | Where | Why it must be DVC-tracked |
+|---|---|---|
+| `eval_summary_corrected_refs.json` | `outputs/spdnet_plantseg/` | Aggregate `feat_chmean`/`feat_chvar` results (Section 5.10.4) |
+| `eval_summary_cam_classifier.json` | `outputs/spdnet_plantseg/` | Aggregate `cam_classifier` results (Section 5.10.5) |
+| `seg_probe_phase{1,2,3}/SUMMARY.md` | `outputs/spdnet_plantseg/` | Human-readable probe rollup (Section 5.12) |
+| `seg_probe_phase1/selected.json` | `outputs/spdnet_plantseg/` | Phase-1→Phase-2 hand-off (selected positions) |
+| `seg_probe_phase2/chosen.json` | `outputs/spdnet_plantseg/` | Phase-2→Phase-3 hand-off (best ckpt+pos+λ) |
+| `seg_probe_phase{1,2,3}/**/eval.json` | `outputs/spdnet_plantseg/` | Per-probe full metrics: thresholds, CRF top-5, full-val IoUs |
+
+### 14.4 Visualizations (separate DVC pointer)
+
+| `.dvc` pointer | Path | Size | Contents |
+|---|---|---:|---|
+| `outputs/visualizations.dvc` | `outputs/visualizations/` | ~1.5 GB | All visualization PNG grids (see Section 3 for the 12 sub-directories: MCTformer baselines, SPDNet activations, cross-attention maps, feat_chmean+CRF batches, etc.) |
+
+### 14.5 Experiment tracking
+
+| `.dvc` pointer | Path | Size | Contents |
+|---|---|---:|---|
+| `mlruns.dvc` | `mlruns/` | ~8 GB | MLflow run database for all experiments (params, metrics per epoch, tags, artifacts). Required for time-series analysis and the MLflow MCP tool. |
+
+### 14.6 Pipeline logs (deliberately NOT tracked)
+
+`logs/seg_probe_overnight_20260419_140734/` and the standalone `logs/eval_*.log` files are **deliberately not added to DVC** (decision: April 2026). Rationale:
+
+- Every numerical result that mattered was extracted into the per-probe `eval.json` (full threshold sweep + CRF top-5 + final CRF metrics, all four seed modes) and the per-phase `SUMMARY.md` / `selected.json` / `chosen.json`.
+- The logs themselves contain only heartbeats every 10 min, exit codes, durations, and a re-print of the same numbers that already live in the JSON files — i.e. zero information that is not also in the eval artifacts.
+- Wall-clock durations per phase are summarised in Section 5.12 of this document.
+
+If you need the raw logs for forensics they live under `logs/` on the machine that ran the pipeline, but they are out of scope for reproducibility.
+
+### 14.7 Refresh-and-push checklist (after the probe pipeline)
+
+Run these in order from the repo root:
+
+```bash
+# Activate venv (DVC is venv-installed)
+export PATH="/venv/main/bin:$PATH"
+
+# 1) Refresh the SPDNet outputs pointer (now includes seg_probe_phase{1,2,3}/)
+dvc add outputs/spdnet_plantseg
+
+# 2) Refresh MLflow runs (probe runs were logged to a sub-experiment)
+dvc add mlruns
+
+# 3) (No new visualizations were produced by the probes — viz pointer is unchanged)
+# 4) (Pipeline logs are intentionally NOT tracked — see Section 14.6)
+
+# 5) Commit pointer files (autostage=true means dvc add already `git add`-ed them)
+git add RESEARCH_CONTEXT.md
+git commit -m "probe pipeline: results + DVC refresh (62% upper bound)"
+
+# 6) Push DVC blobs to remote
+dvc push
+
+# 7) Push git history
+git push
+```
+
+### 14.8 One-shot pull on a fresh machine
+
+To reproduce the full state for analysis (no training, just checkpoints + eval results + MLflow):
+
+```bash
+git clone git@github.com:dfbakin/plant-diseases-segmentation.git
+cd plant-diseases-segmentation
+git checkout wsss-weakclip-pipeline
+
+export PATH="/venv/main/bin:$PATH"
+
+# Source data (~9 GB)
+dvc pull data/plantsegv3.dvc data/plant-village.dvc pretrained.dvc
+
+# SPDNet experiment family — checkpoints + probe phases + eval (~36 GB)
+dvc pull outputs/spdnet_plantseg.dvc
+
+# Visualizations (~1.5 GB)
+dvc pull outputs/visualizations.dvc
+
+# MLflow tracking (~8 GB) — needed for time-series and the MLflow MCP tool
+dvc pull mlruns.dvc
+
+# Optional: also pull MCTformer/baseline checkpoints (~30 GB)
+dvc pull outputs/mctformer_plantseg_binary.dvc outputs/mctformer_plantseg_multiclass.dvc \
+         outputs/plantseg_architecture_benchmark.dvc
+```
+
+After the pull, verify with:
+```bash
+cat outputs/spdnet_plantseg/seg_probe_phase{1,2,3}/SUMMARY.md
+ls outputs/spdnet_plantseg/seg_probe_phase{1,2,3}/**/eval.json
+```

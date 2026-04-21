@@ -1,6 +1,6 @@
 outs:
-- md5: a22c69337dfabe4842bfc408f51d2d67.dir
-  size: 35893901824
-  nfiles: 25583
+- md5: 953097b8f6744ee53106fc0a10e65eba.dir
+  size: 44762363648
+  nfiles: 27735
   hash: md5
   path: spdnet_plantseg

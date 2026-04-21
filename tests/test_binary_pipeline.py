@@ -228,6 +228,197 @@ class TestThresholdSweepSubsample:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Unit tests: Threshold sweep parallelism  (~5s)
+#
+# Regression suite for the parallel branch added 2026-04-19. Phase 2
+# was burning ~2 h of wall-clock per overnight on a single-threaded
+# trange loop over 100 thresholds × 4 seed dirs × 9 probes; the
+# parallel path uses multiprocessing.Pool.apply_async over thresholds
+# (each evaluate_cam_miou call is independent) for ~Wx speedup.
+#
+# Critical invariant: the parallel branch must produce IDENTICAL
+# best_threshold and curves as the serial branch. Anything else is
+# a regression that would invalidate cross-probe rank comparisons.
+# ═══════════════════════════════════════════════════════════════
+class TestThresholdSweepParallel:
+    """Parallel threshold sweep == serial sweep, bit-for-bit."""
+
+    @staticmethod
+    def _create_seeded_cams_and_gt(tmpdir: Path, n: int, num_fg: int = 1, seed: int = 0):
+        """Like _create_dummy_cams_and_gt but with a seeded RNG so the
+        serial vs parallel comparison sees identical inputs across runs.
+        """
+        cam_dir = tmpdir / "cams"
+        gt_dir = tmpdir / "gt"
+        cam_dir.mkdir()
+        gt_dir.mkdir()
+
+        rng = np.random.default_rng(seed)
+        names = []
+        for i in range(n):
+            name = f"img_{i:04d}"
+            names.append(name)
+            h, w = 32, 32
+            cam_dict = {c: rng.random((h, w)).astype(np.float32) for c in range(num_fg)}
+            np.save(str(cam_dir / f"{name}.npy"), cam_dict)
+            gt = np.zeros((h, w), dtype=np.uint8)
+            gt[8:24, 8:24] = 1
+            Image.fromarray(gt).save(gt_dir / f"{name}.png")
+        return cam_dir, gt_dir, names
+
+    def test_parallel_matches_serial_best_threshold(self):
+        """num_workers=4 must pick the SAME best_threshold as num_workers=1.
+
+        This is the core invariant: any divergence here would silently
+        change the seed/CAM threshold every probe uses for visualization
+        and downstream Phase 2 ranking.
+        """
+        from src.wsss.mctformer.evaluation import evaluate_cam_threshold_sweep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cam_dir, gt_dir, names = self._create_seeded_cams_and_gt(
+                Path(tmpdir), n=12, seed=1234,
+            )
+            kw = dict(
+                predict_dir=str(cam_dir), gt_dir=str(gt_dir),
+                name_list=names, num_cls=2,
+                start=0, end=10, optimize_metric="disease_iou",
+            )
+            serial = evaluate_cam_threshold_sweep(**kw, num_workers=1)
+            parallel = evaluate_cam_threshold_sweep(**kw, num_workers=4)
+
+        assert serial["best_threshold"] == parallel["best_threshold"], (
+            f"serial best_threshold={serial['best_threshold']} != "
+            f"parallel best_threshold={parallel['best_threshold']}"
+        )
+
+    def test_parallel_curves_match_serial(self):
+        """Per-threshold curves must be bit-identical between paths.
+
+        Same input -> same evaluate_cam_miou per threshold -> same dict.
+        Order matters because curves[k] is a list indexed by threshold.
+        """
+        from src.wsss.mctformer.evaluation import evaluate_cam_threshold_sweep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cam_dir, gt_dir, names = self._create_seeded_cams_and_gt(
+                Path(tmpdir), n=8, seed=99,
+            )
+            kw = dict(
+                predict_dir=str(cam_dir), gt_dir=str(gt_dir),
+                name_list=names, num_cls=2,
+                start=0, end=6, optimize_metric="disease_iou",
+            )
+            serial = evaluate_cam_threshold_sweep(**kw, num_workers=1)
+            parallel = evaluate_cam_threshold_sweep(**kw, num_workers=4)
+
+        assert serial["curves"]["threshold"] == parallel["curves"]["threshold"]
+        assert serial["curves"]["mIoU"] == parallel["curves"]["mIoU"]
+        # Per-class curves identical
+        for k in serial["curves"]:
+            if k == "threshold":
+                continue
+            assert serial["curves"][k] == parallel["curves"][k], (
+                f"divergence at curves[{k!r}]"
+            )
+
+    def test_parallel_result_at_best_matches_serial(self):
+        """``result_at_best`` (per-class IoUs at the chosen threshold)
+        must match -- this is what eval.json records as the headline
+        ``probe_iou`` / ``chmean_iou`` etc. number.
+        """
+        from src.wsss.mctformer.evaluation import evaluate_cam_threshold_sweep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cam_dir, gt_dir, names = self._create_seeded_cams_and_gt(
+                Path(tmpdir), n=10, seed=7,
+            )
+            kw = dict(
+                predict_dir=str(cam_dir), gt_dir=str(gt_dir),
+                name_list=names, num_cls=2,
+                start=0, end=8, optimize_metric="disease_iou",
+            )
+            serial = evaluate_cam_threshold_sweep(**kw, num_workers=1)
+            parallel = evaluate_cam_threshold_sweep(**kw, num_workers=4)
+
+        for k in serial["result_at_best"]:
+            assert serial["result_at_best"][k] == parallel["result_at_best"][k], (
+                f"result_at_best[{k!r}] diverged: "
+                f"serial={serial['result_at_best'][k]}, "
+                f"parallel={parallel['result_at_best'][k]}"
+            )
+
+    def test_num_workers_one_uses_serial_path(self):
+        """``num_workers=1`` keeps the historical (pre-2026-04-19) behaviour.
+
+        Smoke check that the default code path still returns sensible
+        keys -- the actual numerical equivalence is covered above by
+        the cross-path tests against the parallel branch.
+        """
+        from src.wsss.mctformer.evaluation import evaluate_cam_threshold_sweep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cam_dir, gt_dir, names = self._create_seeded_cams_and_gt(
+                Path(tmpdir), n=5, seed=42,
+            )
+            result = evaluate_cam_threshold_sweep(
+                predict_dir=str(cam_dir), gt_dir=str(gt_dir),
+                name_list=names, num_cls=2,
+                start=0, end=4, optimize_metric="disease_iou",
+                num_workers=1,
+            )
+        assert "best_threshold" in result
+        assert "best_miou" in result
+        assert "result_at_best" in result
+        assert "curves" in result
+        assert len(result["curves"]["threshold"]) == 4
+
+    def test_single_threshold_falls_back_to_serial_pool(self):
+        """A range of size 1 (start=5, end=6) is degenerate for a Pool;
+        the parallel branch's ``n_thr > 1`` guard must skip the Pool and
+        run serially without error or empty results.
+        """
+        from src.wsss.mctformer.evaluation import evaluate_cam_threshold_sweep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cam_dir, gt_dir, names = self._create_seeded_cams_and_gt(
+                Path(tmpdir), n=4, seed=11,
+            )
+            result = evaluate_cam_threshold_sweep(
+                predict_dir=str(cam_dir), gt_dir=str(gt_dir),
+                name_list=names, num_cls=2,
+                start=5, end=6, optimize_metric="disease_iou",
+                num_workers=8,
+            )
+        assert result["best_threshold"] == 0.05
+        assert len(result["curves"]["threshold"]) == 1
+
+    def test_parallel_warns_about_ignored_patience(self, caplog):
+        """``patience`` is silently meaningless once tasks are dispatched
+        in parallel; we must log a WARNING so anyone passing it knows.
+        """
+        import logging
+        from src.wsss.mctformer.evaluation import evaluate_cam_threshold_sweep
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cam_dir, gt_dir, names = self._create_seeded_cams_and_gt(
+                Path(tmpdir), n=4, seed=55,
+            )
+            with caplog.at_level(logging.WARNING, logger="src.wsss.mctformer.evaluation"):
+                evaluate_cam_threshold_sweep(
+                    predict_dir=str(cam_dir), gt_dir=str(gt_dir),
+                    name_list=names, num_cls=2,
+                    start=0, end=4, optimize_metric="disease_iou",
+                    patience=2, num_workers=4,
+                )
+
+        assert any("patience" in rec.message and "ignored" in rec.message
+                   for rec in caplog.records), (
+            "Expected a 'patience ignored' warning when num_workers>1"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
 # Unit tests: Label export  (~2-3 min for initial scan, cached)
 # ═══════════════════════════════════════════════════════════════
 @requires_data
