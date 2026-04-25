@@ -13,6 +13,8 @@ Fusion modes:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -128,16 +130,26 @@ class SpatialCrossAttention(nn.Module):
         self.gate = nn.Parameter(torch.tensor(0.1))
 
     def forward(
-        self, query_feat: torch.Tensor, ref_feat: torch.Tensor,
-    ) -> torch.Tensor:
+        self,
+        query_feat: torch.Tensor,
+        ref_feat: torch.Tensor,
+        return_attn: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Fuse reference spatial features into query via cross-attention.
 
         Args:
-            query_feat: (B, C, H, W) merged query FPN features.
-            ref_feat:   (B, C, Hr, Wr) merged reference FPN features.
+            query_feat: ``(B, C, H, W)`` merged query FPN features.
+            ref_feat:   ``(B, C, Hr, Wr)`` merged reference FPN features.
+            return_attn: if ``True``, also return a per-query attention
+                concentration map ``(B, H, W)`` in ``[0, 1]``: ``0`` when
+                the query attends uniformly across all reference keys,
+                ``1`` when its attention is perfectly peaked on a single
+                key. This is the ``M(q, r)`` map consumed by the
+                equivariance loss and the P6 probe input.
 
         Returns:
-            (B, C, H, W) query features enriched with spatially-attended reference info.
+            ``(B, C, H, W)`` fused query, or ``(fused, attn_BHW)`` when
+            ``return_attn=True``.
         """
         B, C, H, W = query_feat.shape
 
@@ -149,10 +161,49 @@ class SpatialCrossAttention(nn.Module):
         q = self.norm_q(q)
         kv = self.norm_kv(kv)
 
-        attended, _ = self.cross_attn(q, kv, kv)           # (B, HW, C)
+        # Main forward: regular MHA preserves attention-weight dropout in
+        # train mode so ``fused`` retains its usual regularisation.
+        attended, _ = self.cross_attn(q, kv, kv)
         attended = attended.permute(0, 2, 1).view(B, C, H, W)
+        fused = query_feat + self.gate * attended
 
-        return query_feat + self.gate * attended
+        if not return_attn:
+            return fused
+
+        # Second MHA call dedicated to the attention map. Dropout is
+        # disabled so each per-query softmax row remains a valid
+        # probability distribution (PyTorch's MHA applies dropout AFTER
+        # softmax which can drive row sums and entropy out of range, and
+        # it would also make ``M(q, r) != M(q, r)`` across calls with the
+        # same input -- killing the identity case of L_eq).
+        #
+        # Cost: one extra MHA forward when ``return_attn=True`` (only
+        # during equivariance training and probe extraction). Gradients
+        # still flow through the in-proj weights via this call.
+        saved_train = self.cross_attn.training
+        self.cross_attn.eval()
+        try:
+            _, attn_w = self.cross_attn(
+                q, kv, kv, need_weights=True, average_attn_weights=True,
+            )
+        finally:
+            self.cross_attn.train(saved_train)
+
+        # attn_w: (B, H*W, h_ref*w_ref) is a softmax distribution over
+        # keys PER query position. Its mean over keys is mathematically
+        # constant (= 1/(h_ref*w_ref)) for every query, which makes the
+        # equivariance loss identically zero. Use normalised attention
+        # concentration instead: ``1 - H(p) / log N``, in ``[0, 1]`` per
+        # query, with 0 for uniform attention and 1 for perfectly peaked.
+        # This is query-position-indexed and structurally equivariant
+        # under spatial query reorderings (MHA is permutation-equivariant
+        # in queries), and gradients flow through every key via the
+        # entropy term.
+        log_N = math.log(attn_w.shape[-1])
+        attn_p = attn_w.clamp_min(1e-12)
+        neg_ent = (attn_p * attn_p.log()).sum(dim=-1)        # (B, H*W) in [-log N, 0]
+        attn_map = (1.0 + neg_ent / log_N).view(B, H, W)     # (B, H, W) in [0, 1]
+        return fused, attn_map
 
 
 class SPDNet(nn.Module):
@@ -227,7 +278,7 @@ class SPDNet(nn.Module):
             P3_query_merged:(B, C_fpn, H/8, W/8)   -- "Point A" pre-fusion
             P4_fused:       (B, C_fpn, H/8, W/8)   -- "Point B" post-fusion (refs needed)
             P5_cam_classifier:(B, num_classes, H/8, W/8) -- "Point C" classifier@fused
-            P6_attn_map:    (B, 1, H/8, W/8)       -- head-avg cross-attn map (spatial+ref)
+            P6_attn_map:    (B, 1, H/8, W/8)       -- per-query attention concentration in [0, 1]
         """
         feats = self.extract_features(query)
         c5 = feats[-1]
@@ -272,31 +323,65 @@ class SPDNet(nn.Module):
     def _spatial_attn_with_map(
         self, query_feat: torch.Tensor, ref_feat: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run spatial cross-attention and return (fused, head-avg attn map).
+        """Run spatial cross-attention and return ``(fused, attn (B, 1, H, W))``.
 
-        The attention weights are averaged across heads and across the
-        reference grid, then reshaped to ``(B, 1, H, W)`` so they form a
-        single-channel "where the query attended" heatmap usable as a probe
-        input.
+        Thin wrapper around ``SpatialCrossAttention.forward(..., return_attn=True)``
+        that adds a singleton channel dim so the resulting heatmap is a valid
+        probe input ``(B, 1, H, W)``.
         """
-        B, C, H, W = query_feat.shape
-        sca = self.spatial_attn
+        fused, attn_bhw = self.spatial_attn(query_feat, ref_feat, return_attn=True)
+        return fused, attn_bhw.unsqueeze(1)
 
-        ref_pooled = sca.pool(ref_feat)
-        q = query_feat.flatten(2).permute(0, 2, 1)
-        kv = ref_pooled.flatten(2).permute(0, 2, 1)
-        q = sca.norm_q(q)
-        kv = sca.norm_kv(kv)
+    def attention_map(
+        self,
+        query: torch.Tensor,
+        reference: torch.Tensor | list[torch.Tensor] | None = None,
+        ref_merged_cached: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute the per-query attention concentration map ``M(q, r)``.
 
-        attended, attn_w = sca.cross_attn(
-            q, kv, kv, need_weights=True, average_attn_weights=True,
-        )
-        attended = attended.permute(0, 2, 1).view(B, C, H, W)
-        fused = query_feat + sca.gate * attended
+        Returned tensor has shape ``(B, H, W)`` with values in ``[0, 1]``:
+        0 = query attends uniformly across all reference keys,
+        1 = query has a perfectly peaked attention on a single key.
+        This is the canonical attention map fed to ``equivariance_loss``.
 
-        # attn_w: (B, H*W, h_ref*w_ref) -- average across reference grid -> (B, H*W, 1)
-        attn_collapsed = attn_w.mean(dim=-1).view(B, 1, H, W)
-        return fused, attn_collapsed
+        Spatial fusion mode only: raises ``RuntimeError`` for token mode
+        because there is no attention map to expose.
+
+        Args:
+            query: ``(B, 3, H, W)`` query images.
+            reference: optional reference image(s); ignored when
+                ``ref_merged_cached`` is provided.
+            ref_merged_cached: optional pre-computed merged reference FPN
+                tensor ``(B, C, Hf, Wf)``. Pass this from the LightningModule
+                to avoid re-running the reference backbone + FPN when
+                computing both ``M(q, r)`` and ``M(T(q), r)`` within the same
+                training step.
+        """
+        if self.fusion_mode != "spatial":
+            raise RuntimeError(
+                f"attention_map() requires fusion_mode='spatial' "
+                f"(got {self.fusion_mode!r})"
+            )
+
+        q_fpn = self._get_fpn_features(query)
+        query_merged = self._merge_fpn(q_fpn)
+
+        if ref_merged_cached is not None:
+            ref_merged = ref_merged_cached
+        else:
+            if reference is None:
+                raise ValueError(
+                    "attention_map() requires either `reference` or "
+                    "`ref_merged_cached`"
+                )
+            refs = [reference] if isinstance(reference, torch.Tensor) else reference
+            all_r_fpn = [self._get_fpn_features(r) for r in refs]
+            r_merged_list = [self._merge_fpn(r) for r in all_r_fpn]
+            ref_merged = sum(r_merged_list) / len(r_merged_list)  # type: ignore[arg-type]
+
+        _, attn = self.spatial_attn(query_merged, ref_merged, return_attn=True)
+        return attn  # (B, H, W)
 
     def _merge_and_fuse(
         self,
@@ -345,17 +430,26 @@ class SPDNet(nn.Module):
         self,
         query: torch.Tensor,
         reference: torch.Tensor | list[torch.Tensor] | None = None,
+        return_attn: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Extract intermediate feature maps for seed generation.
+        """Extract intermediate feature maps for seed generation / aux losses.
 
         Returns dict with:
-            query_merged: (B, C, Hf, Wf) merged FPN features before fusion
-            ref_merged:   (B, C, Hf, Wf) merged reference FPN features (if ref given)
-            fused:        (B, C, Hf, Wf) features after fusion (if ref given)
+            ``query_merged``: ``(B, C, Hf, Wf)`` merged FPN features before fusion (P3).
+            ``ref_merged``:   ``(B, C, Hf, Wf)`` merged reference FPN features (if ref given).
+            ``fused``:        ``(B, C, Hf, Wf)`` features after fusion (P4) (if ref given).
+            ``attn_map``:     ``(B, Hf, Wf)`` per-query attention concentration map
+                in ``[0, 1]`` (only when ``return_attn=True`` AND
+                ``fusion_mode='spatial'``).
+
+        Note:
+            ``return_attn`` is silently ignored for ``fusion_mode='token'`` (no
+            attention map exists). The LightningModule only requests it on the
+            spatial branch.
         """
         q_fpn = self._get_fpn_features(query)
         query_merged = self._merge_fpn(q_fpn)
-        result = {"query_merged": query_merged}
+        result: dict[str, torch.Tensor] = {"query_merged": query_merged}
 
         if reference is not None:
             refs = [reference] if isinstance(reference, torch.Tensor) else reference
@@ -373,7 +467,13 @@ class SPDNet(nn.Module):
                     avg_tokens.append(sum(lvl_tokens) / n_refs)  # type: ignore[arg-type]
                 fused = self.adpl_cam.fuse(query_merged, avg_tokens)
             else:
-                fused = self.spatial_attn(query_merged, ref_merged)
+                if return_attn:
+                    fused, attn_bhw = self.spatial_attn(
+                        query_merged, ref_merged, return_attn=True,
+                    )
+                    result["attn_map"] = attn_bhw
+                else:
+                    fused = self.spatial_attn(query_merged, ref_merged)
 
             result["fused"] = fused
 

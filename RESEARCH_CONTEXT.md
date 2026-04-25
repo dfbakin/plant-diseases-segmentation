@@ -952,6 +952,8 @@ The original `generate_cams.py` multiplied attention maps by GT labels (`cls_att
 | `444840611733456632` | weakclip-plantseg-binary-t_0.64 | 1 | Mar 2026 | WSSS (PlantSeg) |
 | `113502554219633766` | weakclip-plantseg-binary-t_0.73 | 1 | Mar 2026 | WSSS (PlantSeg) |
 | `285465004951754042` | spdnet_plantseg | 5+ | Apr 2026 | SPDNet Siamese (PlantSeg) |
+| `620484456636990556` | spdnet_seg_probe | 27 | Apr 2026 | SPDNet Localization Capacity Probe (Ph1/Ph2/Ph3, §5.12 + §5.13.5 Phase A) |
+| `627312757314977784` | spdnet_aux_losses | 4 | Apr 2026 | SPDNet aux spatial losses (\(L_{\text{eq}}\), \(L_{\text{con}}\), \(L_{\text{distill}}\)) — §5.13 |
 
 Runs within `spdnet_plantseg` experiment:
 - `spdnet_448_42` — broken model (ref ignored), 45 ep, mAP=0.621
@@ -963,6 +965,12 @@ Runs within `spdnet_plantseg` experiment:
 - `spdnet_spatial_n1_ps_pv` — Spatial cross-attn, N=1, PlantSeg+PV, 80 ep, mAP=0.888, gate=0.499
 - 1-epoch spatial smoke run (PlantSeg+PV pipeline check) — kept in MLflow only
 - Smoke/test runs: `test_e2e`, `test_n3` (deleted from disk, may remain in MLflow)
+
+Runs within `spdnet_aux_losses` experiment (§5.13):
+- `spdnet_spatial_eq_con_20260423` — initial post-spec run, 76 ep, mAP=0.614, `val/cam_iou_best`=0.205. Revealed the \(L_{\text{eq}}\) attention-map bug (§5.13.2); L_eq stayed at 1e-6–1e-4 throughout training.
+- `spdnet_spatial_eq_20260424` — post-fix eq-only baseline, 80 ep, mAP=0.843 (best 0.8615 @ep72), `val/cam_iou_best`=0.246. This is the reference checkpoint probed in §5.13.5 Phase A.
+- `spdnet_spatial_eq_con_warmstart_20260425` (run C) — warmstart from the eq-only ckpt with \(L_{\text{con}}\) at full strength, 40 ep, mAP=0.841 (−1.9 pp vs starting ckpt), `val/cam_iou_best`=0.252 (+0.002 across 40 epochs).
+- `spdnet_spatial_eq_con_warmup_20260425` (run F, in flight) — from scratch with \(L_{\text{con}}\) linear ramp over ep 14–21, 80 ep target, currently at ep 62 with mAP=0.768 and `val/cam_iou_best`=0.234.
 
 ---
 
@@ -1084,13 +1092,17 @@ dvc pull outputs/spdnet_plantseg.dvc outputs/visualizations.dvc mlruns.dvc
 
 18. **SPDNet on PlantSeg + PlantVillage (DONE — April 2026)**: All previous token-fusion SPDNet training used PlantSeg only. The two spatial fusion runs include both a PS-only and a PS+PV variant. The PS+PV spatial run reaches val mAP 0.888 (best of any SPDNet config), but its localization metrics are not better than the token PS-only baseline (Section 5.10).
 
-19. **Add explicit spatial supervision to SPDNet (THOUGHT — April 2026, re-prioritized)**: Three candidate auxiliary losses were sketched (contrastive, equivariance, self-distillation) so that the cross-attention is forced to be spatially discriminative rather than acting as a content-free bias. Detailed sketch in Section 5.11. After the SPDNet Localization Capacity Probe (Section 5.12) confirmed the localization signal exists in the features, the **equivariance loss is the most attractive starting point** (cheap, no extra labels, directly attacks the failure mode); contrastive becomes Phase B; self-distillation last. Still **not yet planned for implementation**.
+19. **Add explicit spatial supervision to SPDNet (IMPLEMENTED, NULL RESULT — April 2026)**: Three candidate auxiliary losses (`L_eq` equivariance, `L_con` patch contrastive, `L_dist` self-distillation) were spec'd in §5.11.1 and implemented end-to-end (`src/wsss/spdnet/spatial_losses.py`, Lightning wiring, online CAM-IoU metric, warmstart + L_con warmup schedule). Three training runs completed (eq-only baseline, warmstart `eq_con`, from-scratch `eq_con` with linear ramp). **Outcome**: neither loss injects a measurable localization signal. `L_con` reduces its own value 10× (0.028→0.003) while `val/cam_iou_best` moves within noise (+0.002 over 40 warmstart epochs); `L_eq` stays at ~2e-5 because the attention map is already near-uniform and equivariance of a uniform map is trivial. SegProbe on the eq-only ckpt shows the probe signature (P1–P6 IoU) is indistinguishable from the classifier-only spatial ckpt of §5.12. The root cause is architectural: `L_con`'s anchors are the current classifier's argmax positions, making the loss a self-distillation of the classifier's existing (leaky) spatial beliefs; `L_eq` has no non-uniform map to preserve. Full analysis, metric tables, and redesign knobs in Section 5.13.
 
 20. **SPDNet Localization Capacity Probe (DONE — April 2026)**: 3-phase probe pipeline (frozen / unfrozen / from-scratch) with a small learnable seg head at six different SPDNet positions. Lifts SPDNet's localization upper bound from 32 % (current production cam_classifier+CRF) to **~62 % disease IoU** (88 % of the fully-supervised SegNeXt 70.1 % ceiling). Confirms three things that were previously hypotheses: (a) the localization signal is present in SPDNet features, (b) the choice of probe position becomes nearly irrelevant after a few epochs of joint fine-tuning (4 pp spread for Ph2 vs 24 pp for Ph1), (c) the spatial cross-attention checkpoint is statistically indistinguishable from token fusion after fine-tuning. Detailed analysis in Section 5.12.
 
 21. **Promote probe head to production seed source (HIGH PRIORITY, NOT DONE)**: The Phase-2 winner (`spatial_n1_ps_pv` ckpt + `P3_query_merged` probe + retuned CRF) achieves ~60 % disease IoU and is a drop-in replacement for the current `cam_classifier + CRF` seed source. Promoting it to the production WSSS pipeline (Steps 1-2) should lift downstream PSA → RW → WeakCLIP by a similar margin. Single highest-leverage next experiment.
 
 22. **CRF re-tuning on strong seeds (LOW EFFORT)**: With Phase-2/3-quality seeds, the existing CRF parameters (tuned in March on classifier-only seeds) over-smooth and *hurt* the result by ~3 pp (Phase 3: raw 64.9 % → CRF 61.8 %). A fresh CRF param sweep on a 200–300 image subset of the new seed distribution should recover those points. ~2 h of compute.
+
+23. **Non-circular anchor source for \(L_{\text{con}}\) (FOLLOW-UP TO §5.13)**: The §5.13 null result is caused by \(L_{\text{con}}\)'s anchors being the student classifier's own argmax (circular objective). The EMA teacher class `EMATeacher` in `src/wsss/spdnet/spatial_losses.py` is already implemented and unit-tested; wiring it to supply the anchor logits instead of `W_cls · p4_fused` is a small, targeted change (a `con_anchor_source=ema_teacher` switch in `SPDNetSpatialLossesConfig` + a branch in `patch_contrastive_loss`). Minimum experiment: rerun C (`eq_con_warmstart`) and F (`eq_con_warmup`) with EMA-teacher anchors; success criterion is `val/cam_iou_best` moving above the eq-only plateau (~0.246) by ≥ 2 × its history std (~0.015). If EMA-teacher anchors also fail to move the metric, the patch-contrastive family is a dead end on this architecture and the next step is pseudo-mask distillation (item 24 below).
+
+24. **Pseudo-mask distillation into SCA attention (ALTERNATIVE TO AUX LOSSES)**: Since the Phase-2 probe recipe (§5.12.2) already produces 60 % disease IoU segmentations from the same backbone family, the strongest signal we could add to SPDNet training is to distill the probe head's prediction into the SCA attention map. Two concrete formulations: (a) masked MSE between the attention map and a thresholded probe mask; (b) per-class KL between `W_cls · p4_fused` and the probe's foreground logits. Both give the model the exact localization signal that \(L_{\text{eq}}\) and \(L_{\text{con}}\) failed to inject. Requires a frozen probe-head teacher at training time; the compute cost is one extra forward per batch. Cleanly separates "add spatial supervision" from "invent clever self-supervised losses" — we already have a teacher, so use it.
 
 ---
 
@@ -1302,7 +1314,216 @@ with `λ_3 = 0` for the first warm-up phase to avoid the self-reinforcing degene
 
 A complementary direction also opened up by the probe: **promote the probe head + Phase-2 fine-tune recipe to production**. That alone gives ~60% disease IoU today, with no new losses. The spatial-loss work is then "research" — chasing the remaining ~8 pp gap to the fully-supervised ceiling. None of this changes the loss list above; it only re-orders the priority.
 
-This is the most natural next experiment after the current "spatial fusion does not learn spatial signal" finding. It is **not yet planned for implementation**.
+This is the most natural next experiment after the current "spatial fusion does not learn spatial signal" finding. **Defaults are now locked in §5.11.1 below**; implementation lands as the `spdnet_spatial_eq_con` run series.
+
+### 5.11.1 Formal Specification (April 2026 — locked, implementation pending)
+
+This subsection supersedes the sketch above. It is the contract for the planned implementation in `src/wsss/spdnet/spatial_losses.py`. Values listed under "Implementation defaults" are what the headline first run (`spdnet_spatial_eq_con`) will use.
+
+#### Where each loss attaches
+
+```mermaid
+graph TD
+    Q[Query] --> SCA[SpatialCrossAttention]
+    R[Reference] --> SCA
+    SCA --> A["Attention map M"]
+    SCA --> P4["P4 fused"]
+
+    Qaug["T applied to query"] --> SCAaug[SCA shared weights]
+    R --> SCAaug
+    SCAaug --> Aaug["A_aug"]
+
+    A -->|"apply T"| TA["T(M)"]
+    TA --> Leq["L_eq: MSE on attention"]
+    Aaug --> Leq
+
+    P3q[P3 query_merged] --> Proj["1x1 to 128, L2 norm"]
+    Proj --> Lcon["L_con: InfoNCE"]
+    P4 --> Anchors["Top-K CAM anchors detached"]
+    Anchors --> Lcon
+
+    P4 --> CLS[Linear classifier]
+    CLS --> Lcls["L_cls: BCE"]
+
+    P4 --> S["S: per-class spatial logits"]
+    Teacher["EMA teacher S_t detached"] --> Ldist["L_distill: DINO KL"]
+    S --> Ldist
+
+    Lcls --> Total[Total]
+    Leq --> Total
+    Lcon --> Total
+    Ldist --> Total
+```
+
+#### Notation
+
+For a batch of \(B\) (query, reference) pairs:
+
+- \(q_i, r_i \in \mathbb{R}^{3 \times H \times W}\) — query and reference images
+- \(y_i \in \{0,1\}^C\) — multilabel target (\(C = 115\); PlantSeg foreground is essentially single-label)
+- \(F^{P3}_q, F^{P3}_r \in \mathbb{R}^{B \times 256 \times H' \times W'}\) — pre-fusion features at probe position `P3_query_merged` (\(H' = H/8\), \(W' = W/8\))
+- \(F^{P4} = \mathrm{SCA}(F^{P3}_q, F^{P3}_r) \in \mathbb{R}^{B \times 256 \times H' \times W'}\) — post-fusion features at `P4_fused`
+- \(M(q, r) \in \mathbb{R}^{B \times H' \times W'}\) — head-averaged attention map from `SpatialCrossAttention` (currently discarded; the Phase B refactor in [src/wsss/spdnet/model.py](src/wsss/spdnet/model.py) returns it)
+- \(S(q, r) = W_{\text{cls}} F^{P4} \in \mathbb{R}^{B \times C \times H' \times W'}\) — per-class spatial logits at `P5_cam_classifier`
+- \(\mathcal{T} = \{\mathrm{id}, \mathrm{hflip}, \mathrm{rot90}, \mathrm{rot180}, \mathrm{rot270}\}\) — discrete geometric transforms with explicit inverses; same parameters apply to both 3-channel images and 1-channel attention maps
+
+#### Equivariance loss \(L_{\text{eq}}\)
+
+**What we enforce**: a model that has learned to localize must produce attention that follows the query's spatial perturbation. The lazy bias pattern from §5.10.6 is invariant to \(T\) and is therefore penalised.
+
+\[
+L_{\text{eq}}(q, r) \;=\; \frac{1}{B \cdot H' W'} \sum_{i=1}^{B} \big\| T\!\left(M(q_i, r_i)\right) \;-\; M\!\left(T(q_i), r_i\right) \big\|_F^2
+\]
+
+\(T \in \mathcal{T}\) is sampled uniformly **per batch** (single batched second forward pass). The reference is **not** transformed; the equivariance is asserted on the query branch only, which is the branch whose attention we are trying to fix. Color jitter is excluded (no inverse on the 1-channel attention map).
+
+#### Patch contrastive loss \(L_{\text{con}}\)
+
+**Embedding space**. Small projection head \(g(\cdot)\) (single \(1{\times}1\) conv, \(256 \to 128\)) on top of \(F^{P3}_q\), with channel-wise \(L^2\) normalization:
+
+\[
+z_{i,p} \;=\; \frac{g(F^{P3}_{q,i,:,p})}{\big\|g(F^{P3}_{q,i,:,p})\big\|_2} \;\in\; S^{127}
+\]
+
+**CAM-peak anchor bootstrap** (the mid-ground from the open question above). For each image \(i\) with positive class \(y_i\), the per-class spatial logit map is
+
+\[
+\tilde S_{i, y_i} \;=\; \mathrm{minmax}\!\left( W_{\text{cls}, y_i} F^{P4}_i \right) \;\in\; [0, 1]^{H' \times W'}
+\]
+
+Anchor selection runs under `torch.no_grad()` so the anchor positions never receive gradient.
+
+- **Anchor set** \(\mathcal{A}_i = \mathrm{topK}_p\, \tilde S_{i, y_i}(p)\), \(K = 8\)
+- **Background set** \(\mathcal{B}_i\): \(M = 16\) positions sampled uniformly from \(\{p : \tilde S_{i, y_i}(p) < \mathrm{median}\}\)
+
+For each anchor \(a \in \mathcal{A}_i\):
+
+- **Positives** \(\mathcal{P}(a) = \mathcal{A}_i \setminus \{a\}\) (intra-image foreground patches)
+- **Negatives** \(\mathcal{N}(a) = \mathcal{B}_i \cup \bigcup_{j: y_j \neq y_i} \mathcal{A}_j\) (own background + cross-class anchors in batch)
+
+**Loss** (SupCon-style InfoNCE):
+
+\[
+L_{\text{con}}^{(a)} \;=\; -\,\frac{1}{|\mathcal{P}(a)|} \sum_{p \in \mathcal{P}(a)} \log \frac{\exp\!\left(z_a^\top z_p / \tau\right)}{\sum\limits_{x \in \{p\} \cup \mathcal{N}(a)} \exp\!\left(z_a^\top z_x / \tau\right)}
+\]
+
+\[
+L_{\text{con}} \;=\; \frac{1}{\sum_i |\mathcal{A}_i|} \sum_i \sum_{a \in \mathcal{A}_i} L_{\text{con}}^{(a)}
+\]
+
+**Why P3 and not P4**: P4 already contains reference info via the SCA residual; using P4 would let the loss "cheat" by aligning the residual contribution rather than the query backbone's discriminative features.
+
+**Multilabel handling**: anchors collected per positive class and unioned. Negatives must come from images whose label set is disjoint from the anchor's image. PlantSeg foreground is essentially single-label so this is mostly a no-op.
+
+#### Self-distillation \(L_{\text{distill}}\) (off by default; \(\lambda_{\text{distill}} = 0\) in launch run)
+
+**Two-network setup**. Student \(\theta_s\) is the trainable SPDNet. Teacher \(\theta_t\) is an architectural twin with `requires_grad=False`. After every optimizer step:
+
+\[
+\theta_t \;\leftarrow\; \alpha\, \theta_t + (1 - \alpha)\, \theta_s, \qquad \alpha = 0.999
+\]
+
+BatchNorm running stats are EMA'd alongside parameters (they are buffers, not in `parameters()`).
+
+**Distillation target = per-class spatial logits \(S\)**, not the attention map. \(S\) is one step closer to the metric we measure (CAM-IoU); if the student matched teacher's \(M\) but its classifier weights drifted, \(S\) could still diverge.
+
+For each image \(i\) with positive class \(y_i\), define a 1D distribution over spatial positions:
+
+\[
+\tilde S^{(t)}_i \;=\; \mathrm{flatten}\!\left( S^{(t)}_{i, y_i, :, :} \right) \;\in\; \mathbb{R}^{H'W'}, \qquad \tilde S^{(s)}_i \;=\; \mathrm{flatten}\!\left( S^{(s)}_{i, y_i, :, :} \right)
+\]
+
+**DINO-style centering and sharpening** (the key collapse mitigations):
+
+\[
+c \;\leftarrow\; \beta\, c + (1 - \beta)\, \frac{1}{B}\sum_{i=1}^{B} \tilde S^{(t)}_i, \qquad \beta = 0.9
+\]
+
+\[
+P^{(t)}_i \;=\; \mathrm{softmax}\!\left( \frac{\tilde S^{(t)}_i - c}{T_t} \right), \qquad P^{(s)}_i \;=\; \mathrm{softmax}\!\left( \frac{\tilde S^{(s)}_i}{T_s} \right)
+\]
+
+with \(T_t = 0.04\), \(T_s = 0.1\). Teacher distribution is detached.
+
+**Loss** (forward KL, so the floor when student matches teacher exactly is zero):
+
+\[
+L_{\text{distill}} \;=\; \frac{1}{B} \sum_i \sum_{p=1}^{H'W'} P^{(t)}_i[p] \, \log \frac{P^{(t)}_i[p]}{P^{(s)}_i[p]}
+\]
+
+**Degenerate fixed-point analysis** (each row is a known collapse mode and its mitigation):
+
+| Failure mode | What happens | Mitigation |
+|---|---|---|
+| Constant student attention | Student and teacher both uniform ⟹ KL = 0 ⟹ no gradient | \(L_{\text{cls}}\) always on (different classes need different attention to classify) |
+| Trivial copy \(P^{(s)} = P^{(t)}\) | Loss floor = 0, no learning signal | Sharpening: \(T_t < T_s\) makes the teacher always "harder" than what the student can express |
+| Mode collapse (teacher always picks the same position) | Same anchor regardless of input | Centering: \(c\) absorbs the over-represented position next step |
+| Cold start (teacher \(\approx\) init) | Distillation pushes student toward random init | Warmup: \(\lambda_{\text{distill}} = 0\) for first 10 epochs |
+| BN drift between student and teacher | Inference-time stats diverge | EMA the BN running stats too (buffers, not just `parameters()`) |
+
+#### Composite loss
+
+\[
+L_{\text{total}} \;=\; L_{\text{cls}} + \lambda_{\text{eq}}\, L_{\text{eq}} + \lambda_{\text{con}}\, L_{\text{con}} + \lambda_{\text{distill}}\, L_{\text{distill}}
+\]
+
+#### Implementation defaults (launch run `spdnet_spatial_eq_con`)
+
+| Hyperparameter | Default | Notes |
+|---|---:|---|
+| `lambda_eq` | 1.0 | Equal weight to classification — cheapest, lowest risk |
+| `lambda_con` | 0.5 | Half of cls — contrastive is noisier (CAM-bootstrap anchors), don't dominate before CAMs sharpen |
+| `lambda_distill` | 0.0 | Off in launch run; recommended 0.1 when enabled |
+| `eq_transforms` | `{id, hflip, rot90, rot180, rot270}` | Sampled uniformly per batch |
+| `eq_apply_to` | `attention_map` | Head-averaged, 1-channel |
+| `con_anchor_source` | `cam_peaks` | From `cam_classifier(P4_fused)`, detached |
+| `con_top_K` | 8 | Anchors per (image, positive class) |
+| `con_M_negatives` | 16 | Background patches sampled per image |
+| `con_temperature` | 0.07 | SimCLR convention |
+| `con_projection_dim` | 128 | \(1{\times}1\) conv on top of `P3_query_merged` |
+| `con_position` | `P3_query_merged` | Pre-fusion, query-only |
+| `distill_target` | `cam_classifier_logits` (\(S\)) | Per-class spatial logits at `P5_cam_classifier` |
+| `distill_alpha` | 0.999 | Teacher EMA momentum |
+| `distill_T_teacher` | 0.04 | Sharper than student |
+| `distill_T_student` | 0.1 | DINO defaults |
+| `distill_center_beta` | 0.9 | DINO centering momentum |
+| `distill_warmup_epochs` | 10 | \(\lambda_{\text{distill}} = 0\) for first 10 epochs |
+
+#### Training-time localization metric
+
+A new helper `OnlineCAMIoU` in `src/wsss/spdnet/online_loc_metric.py` (planned) is attached to `SPDNetModule`:
+
+- Fixed 100-image val subset selected at module init (seed = 1234, deterministic, filtered to images with GT masks at `outputs/plantseg_binary_mc115/gt_binary_val/`).
+- Same-class reference per query, picked deterministically (first image per class in train pool).
+- Every K = 2 epochs: forward through cam_classifier mode, max over fg classes, resize to GT, threshold at 0.3, compute disease IoU.
+- Cost: ~30 s/eval on a 5090.
+
+**Logged as `val/cam_disease_iou`**. This is the single number watched alongside `val/mAP` to catch the "mAP up, IoU down" silent regression observed in §5.10. The test plan considers a launch-run successful only if `val/cam_disease_iou` moves materially above the spatial-cross-attention baseline (~23 %) and ideally approaches or exceeds the token baseline (~32 %), regardless of `val/mAP`.
+
+#### Compute cost summary (per training step)
+
+- Plain forward (student) — for \(L_{\text{cls}}\), \(M(q, r)\), and \(S^{(s)}\)
+- Augmented forward (student) — for \(L_{\text{eq}}\), needs \(M(T(q), r)\); reference features cached
+- Teacher forward — for \(S^{(t)}\) (only when \(\lambda_{\text{distill}} > 0\))
+
+With \(\lambda_{\text{eq}}, \lambda_{\text{con}} > 0\) and \(\lambda_{\text{distill}} = 0\) (launch run): ~1.7x baseline forward cost (reference cache shared).
+With all three losses on: ~2.5x. Baseline epoch ≈ 10 min on a single 5090; launch-run epoch ≈ 17 min; full-3-loss epoch ≈ 25 min. An 80-epoch run takes ~22 h with all three losses on.
+
+#### Alternatives to revisit (NOT in launch run, all wired into config)
+
+If the launch run does not move `val/cam_disease_iou`, these are the design knobs to flip in priority order:
+
+1. **Equivariance target = attended features** (256 channels) instead of attention map (1 channel). Diluted but operates on the post-fusion representation that the classifier directly consumes.
+2. **Equivariance set extended with random crop + resize** — adds scale equivariance. Inverse on the attention map needs careful handling at borders.
+3. **Contrastive position = `P4_fused`** instead of P3. Tests whether forcing post-fusion features to be discriminative is more effective than constraining only the backbone.
+4. **Contrastive anchor source = `class_token`**: cosine similarity between patch features and \(W_{\text{cls}, y}\) (the classifier weight row for class \(y\)) — no CAM bootstrap, more direct semantic signal.
+5. **Contrastive anchor source = `pseudo_mask`**: CRF-refined chmean mask as the positive region. Closer to GT but introduces a CRF call inside the training loop.
+6. **Distillation target = attention map \(M\)** instead of \(S\). More architecturally surgical (directly attacks "attention does not localize"), one step further from the CAM-IoU metric.
+7. **Distillation loss = masked MSE** \((M_t > \tau_t)\) instead of softmax-KL. FixMatch-style, simpler to reason about, requires \(\tau_t\) tuning.
+8. **Multi-position contrastive**: apply InfoNCE jointly at P3 and P4 (or P3 and P2). Risk: gradients fight each other; recommended only if single-position is clearly underfitting.
+9. **Per-sample equivariance \(T\)** instead of per-batch. Stronger signal, slower to implement (the second forward must group samples by \(T\)).
+
+All of these become CLI overrides on `SPDNetSpatialLossesConfig`, not code changes.
 
 ---
 
@@ -1322,7 +1543,7 @@ This is the most natural next experiment after the current "spatial fusion does 
 - `P1_layer4` — backbone C5 output (2048 channels, post-ResNet50-stage4)
 - `P2_fpn_p2` — finest FPN level (256 ch, post-MSE)
 - `P3_query_merged` — pre-fusion merged query feature (256 ch) — this is where the existing `feat_chmean`/`feat_chvar` baselines tap
-- `P4_fused` — post-fusion feature (256 ch, with reference contribution)
+- `P4_fused` — post-fusion feature (256 ch, with reference contribution)h
 - `P5_cam_classifier` — classifier weights projected on the fused feature (115 ch)
 - `P6_attn_map` — spatial cross-attention map (1 ch, spatial-only)
 
@@ -1433,6 +1654,141 @@ Four robustness fixes were added during the run after the first overnight pass s
 - **Parallel threshold sweep** (`src/wsss/mctformer/evaluation.py`): the 100-step threshold sweep was previously single-threaded. Now uses `multiprocessing.Pool` across thresholds (≈8× speedup), guarded by a `__main__` check and a `num_workers=1` serial fallback for unit tests.
 
 All four changes are covered by regression tests (`tests/test_seg_probe.py`, `tests/test_overnight_orchestrator.py`, `tests/test_binary_pipeline.py::TestThresholdSweepParallel`).
+
+---
+
+### 5.13 SPDNet Auxiliary Spatial Losses — Implementation and Null Result (April 2026)
+
+**Status**: implemented, three full runs completed / in flight, outcome is a **null result**: neither \(L_{\text{eq}}\) nor \(L_{\text{con}}\) injects a measurable localization signal. This section documents what was tried, the metric evidence, and the root-cause analysis that explains the failure.
+
+#### 5.13.1 Scope
+
+The §5.11.1 spec was implemented end-to-end in:
+
+- `src/wsss/spdnet/spatial_losses.py` — `equivariance_loss`, `patch_contrastive_loss`, `self_distillation_loss`, `ProjectionHead`, `EMATeacher`.
+- `src/wsss/spdnet/lightning.py` — wiring into `SPDNetModule.training_step`; effective-lambda schedule `effective_lambda_con(epoch)` for a linear warmup; EMA teacher update in `on_train_batch_end`.
+- `src/wsss/spdnet/model.py` — two-pass spatial attention forward that returns both the training-time `fused` tensor (with MHA dropout) AND a deterministic dropout-free **attention-concentration map** `attn_map` used by \(L_{\text{eq}}\) (see §5.13.2 for why the naive `attn.mean(dim=-1)` did not work).
+- `src/wsss/spdnet/online_loc_metric.py` — `OnlineCAMIoU` (fixed 100-image val subset, 21-threshold sweep, logs `val/cam_iou_best`, `val/cam_iou_best_thr`, `val/cam_iou_auc`).
+- `src/conf/spdnet.py` — `SPDNetSpatialLossesConfig` including `con_warmup_start_epoch` / `con_warmup_epochs` for linear ramp-up.
+- `src/train_spdnet.py` — `+checkpoint=<path>` override that loads weights only (no optimizer / scheduler / epoch state) for warmstart experiments.
+- `scripts/run_spdnet_aux_losses_experiments.sh` + `scripts/run_overnight_acf.sh` — launch orchestrators for the three runs below.
+
+Unit tests covering the invariants (`L_eq`-nonzero regression, contrastive-loss degenerate cases, warmup schedule invariants W1–W6, warmstart key handling) live in `tests/test_spatial_losses.py`.
+
+#### 5.13.2 The \(L_{\text{eq}}\) bug — attention map was effectively constant
+
+The first aux-loss run `spdnet_spatial_eq_con_20260423` reported `train/L_eq_epoch` = **1e-4 to 1e-6** from epoch 1 — three orders of magnitude below the classification loss — and never moved. Inspection revealed that the original `attn_map` was defined as the **mean over reference keys** of the post-softmax attention weights. Every row of the per-query softmax sums to 1, so `attn.mean(dim=-1) = 1 / N_ref` for every query regardless of the input. In other words, `attn_map` was an input-independent constant, and `L_eq = MSE(T(constant), constant) = 0` identically.
+
+**Fix** (`_spatial_attn_with_map` in `src/wsss/spdnet/model.py`): replace the mean with the **normalized attention concentration**
+\[
+\text{conc}(q) \;=\; 1 + \frac{\sum_k p_k \log p_k}{\log N_{\text{ref}}} \;\in\; [0, 1]
+\]
+where \(p\) is the per-query softmax over references. `0` = uniform attention (no spatial structure), `1` = perfectly peaked. This quantity is input-dependent, differentiable, and structurally equivariant under query-axis permutations (MHA is permutation-equivariant in queries).
+
+Two secondary changes needed to make \(L_{\text{eq}}\) well-behaved:
+- A **second MHA forward in eval mode** (lines 183–190) produces the map without post-softmax dropout, so that `M(q, r) == M(q, r)` deterministically across calls with identical inputs. Without this, PyTorch's MHA dropout is applied *after* softmax, so rows no longer sum to 1 and the identity case of \(L_{\text{eq}}\) is non-zero purely from RNG.
+- A regression test `TestAttnMapNonConstancy` (5 sub-cases in `tests/test_spatial_losses.py`) pins the invariant that `attn_map` must vary across queries and must change under geometric transforms of the query. A smoke-test assertion `assert L_eq > 1e-8` on a synthetic batch catches the constant-map failure at CI time.
+
+**Post-fix behavior, run `spdnet_spatial_eq_20260424` (eq-only, 80 ep)**: `train/L_eq_epoch` rises from 0 → 2.8e-5 over epochs 1–20 and then slowly drifts back to 1.6e-5 by epoch 80. This is still a *very small* value relative to `L_cls` (≈ 1e-3), but it is now input-dependent and it is what the model can actually drive — see §5.13.6 for why it stays this small (the attention map stays close to uniform, so equivariance is trivially satisfied).
+
+#### 5.13.3 Experiment chain A → C → F (April 24–25, 2026)
+
+All three runs use `fusion_mode=spatial`, `batch=16 × accum=2` (effective batch 32), PlantSeg+PlantVillage, heavy aug, N=1 reference, on a single RTX 5090. Tracked in the `spdnet_aux_losses` MLflow experiment (ID `627312757314977784`). Orchestrated via `scripts/run_overnight_acf.sh`.
+
+| Tag | Run | MLflow run ID | Config | Epochs | Duration | Purpose |
+|-----|-----|---------------|--------|-------:|---------:|---------|
+| **baseline** | `spdnet_spatial_eq_20260424` | `e53eaf59…` | \(\lambda_{\text{eq}}=1.0\), \(\lambda_{\text{con}}=0\) | 80 | 10.3 h | eq-only reference, post-fix |
+| **A** | Phase-1 probes on the baseline ckpt | — | `AUX_ONLY=1` seg-probe screen | — | ~5 h | Does the baseline's P1–P6 look any different from the classifier-only spatial ckpt of §5.12? |
+| **C** | `spdnet_spatial_eq_con_warmstart_20260425` | `e16414c8…` | \(\lambda_{\text{eq}}=1.0\), \(\lambda_{\text{con}}=0.5\), warmstart from baseline ckpt, no warmup | 40 | 5.6 h | From a converged classifier, does \(L_{\text{con}}\) improve localization? |
+| **F** | `spdnet_spatial_eq_con_warmup_20260425` | `246e64fe…` | \(\lambda_{\text{eq}}=1.0\), \(\lambda_{\text{con}}=0.5\), linear ramp \(\lambda_{\text{con}}\) from 0 over epochs 14→21 | 62/80 in flight | still running | From scratch with \(L_{\text{con}}\) introduced only after the classifier has stabilised (\(\text{val}/\text{mAP} \geq 0.6\)). |
+
+Warmstart (C) loads weights only via `train_spdnet.py`'s `+checkpoint=<path>` override; optimizer/scheduler/epoch counter are fresh. `strict=False` accepts the expected missing-key set (`proj_head.conv.weight`, `proj_head.conv.bias`). Warmup (F) uses `losses.con_warmup_start_epoch=14, losses.con_warmup_epochs=7` — the ramp brackets the epoch band (14) where the eq-only baseline first reaches \(\text{val}/\text{mAP} \approx 0.6\).
+
+#### 5.13.4 Classification headline
+
+| Run | Best `val/mAP` | Final `val/mAP` | Final `train/mAP` | Notes |
+|-----|---------------:|----------------:|------------------:|-------|
+| baseline (eq-only, 80 ep) | **0.8615** (ep 72) | 0.8435 | 0.9558 | Recovery to ≥ classifier-only \(\text{val}/\text{mAP}\) (§5.9.1: 0.888) takes PlantSeg+PV data plus the full 80 epochs. |
+| C (warmstart, 40 ep) | 0.8604 (ep 1) | **0.8412** | 0.9056 | **Monotonic post-start degradation**: drop −1.9 pp absolute, never recovered. Starting evaluation after 1 epoch of fresh-optimizer LR warmup already below the loaded ckpt's 0.8615. |
+| F (warmup, at ep 62) | 0.7681 | 0.7681 | 0.6674 | Classifier lagging eq-only at every matched epoch past \(\lambda_{\text{con}}\) ramp. |
+
+Adding \(L_{\text{con}}\) at \(\lambda = 0.5\) **demonstrably damages classification** in both directions tested (warmstart from converged; from scratch with ramp). At ep 1 of C the model is already below the loaded checkpoint, which isolates the damage to the new loss (optimizer/scheduler are fresh but LR is still in warmup, so the only actor with non-trivial signal is the new \(L_{\text{con}}\) gradient).
+
+#### 5.13.5 Localization headline
+
+**Online CAM-IoU on the 100-image val subset** (best over a 21-threshold sweep, computed at every epoch from `cam_classifier` output):
+
+| Run | `val/cam_iou_best` at start | `val/cam_iou_best` at end | Δ across training | History std |
+|-----|----------------------------:|---------------------------:|------------------:|------------:|
+| baseline (eq-only, 80 ep) | 0.198 | **0.2456** | +0.048 | 0.016 |
+| C (warmstart, 40 ep) | 0.2503 | 0.2523 | **+0.002** | **0.006** |
+| F (warmup, at ep 62) | 0.198 | 0.234 | +0.036 | 0.011 |
+
+C is the cleanest control: *with* \(L_{\text{con}}\) activated for the full run, starting from a checkpoint whose CAM-IoU is already at the eq-only plateau, **cam-IoU moves by 0.002 (one-third of its own history std) across 40 epochs**. The loss itself is minimised — `train/L_con_epoch` falls **10×** from 0.028 (ep 1) to 0.003 (ep 40) — while the quantity that \(L_{\text{con}}\) is supposed to improve sits flat.
+
+F shows the same pattern in reverse. Before the \(L_{\text{con}}\) ramp kicks in (ep 14), cam-IoU tracks eq-only: 0.246 at ep 14 vs eq-only 0.232 at ep 14. During the ramp (ep 15–22, \(\lambda_{\text{con}}\) climbing 0 → 0.5), cam-IoU **drops** 0.246 → 0.219 → 0.224. Once \(\lambda_{\text{con}}\) plateaus at 0.5, cam-IoU hovers in 0.22–0.24, below the eq-only plateau of 0.24–0.25. The contrastive loss's entry into the objective is accompanied by a downward step in the localization metric.
+
+**Phase-A seg-probe results on the baseline ckpt** (position sweep, 20 epochs, 300-image val subset, CRF-refined; `outputs/spdnet_plantseg/seg_probe_phase1/spatial_eq_20260424/*/eval.json`):
+
+| Position | `probe_iou` | `chmean` | `chvar` | `cam_cls` |
+|----------|------------:|---------:|--------:|----------:|
+| P1_layer4 | **45.10** | 35.23 | 35.06 | — |
+| P2_fpn_p2 | 43.77 | 21.95 | 34.47 | 17.28 |
+| **P3_query_merged** (target of \(L_{\text{con}}\)) | **41.73** | 21.95 | 35.37 | 25.34 |
+| **P4_fused** | **40.31** | 21.95 | 35.41 | 28.96 |
+| P5_cam_classifier | 27.94 | 28.52 | 28.86 | 28.96 |
+| **P6_attn_map** (target of \(L_{\text{eq}}\)) | **17.46** | **21.93** | — | — |
+
+Compared with the classifier-only `spatial_n1_ps_pv` ckpt probed in §5.12.1 (P1=45.46 / P2=44.51 / P3=42.56 / P4=42.07 / P5=29.05 / P6=21.95), **every row is equal-or-worse within ±1 pp** after 80 epochs with \(L_{\text{eq}}\) on. P6_attn_map is 4.5 pp *lower* (17.46 vs 21.95). The probe signature of the eq-only checkpoint is indistinguishable from (or slightly worse than) the classifier-only checkpoint. \(L_{\text{eq}}\) as implemented did not shape the spatial features in any direction that a 2-layer probe could detect.
+
+**Two observations from the probe table itself** (independent of the comparison to §5.12.1):
+
+1. The probe IoU **decreases monotonically P1 → P5** (45 → 44 → 42 → 40 → 28). Later positions — the ones that \(L_{\text{eq}}\) and \(L_{\text{con}}\) are supposed to shape — are *worse* at localization than the frozen early backbone. If the aux losses were working, P3/P4 should have caught up or exceeded P1/P2.
+2. `P6_attn_map` probe IoU (17.46 %) is **below the channel-mean baseline (21.93 %)** at the same position. The attention map as a localizer is worse than averaging random channels. The quantity whose equivariance we are enforcing contains less disease information than an uninformed aggregation.
+
+#### 5.13.6 Root-cause analysis
+
+The metric pattern (\(L_{\text{con}}\) drops 10×, cam-IoU flat; \(L_{\text{eq}}\) stays at 1e-5, attention map near-uniform; probe signature unchanged) is not a hyperparameter problem. It is a consequence of two structural properties of the losses as written.
+
+**Failure mode 1 — \(L_{\text{con}}\) anchors are chosen by the classifier itself, so the objective is self-referential.**
+
+In `src/wsss/spdnet/spatial_losses.py` (`patch_contrastive_loss`, lines 178–196), the top-\(K\) anchor positions are the argmax of `W_cls · p4_fused` — the positions where the **current classifier already thinks the active class lives**. \(L_{\text{con}}\) then drives
+- the anchor embeddings toward each other,
+- the background embeddings (bottom-\(M\)) away from the anchors,
+- cross-image anchor embeddings away from the anchors.
+
+Any classifier whose spatial beliefs are internally consistent — even *wrong* beliefs, e.g. "the class lives on the leaf edge" or "the class lives where the illumination is darkest" — satisfies these constraints with a small InfoNCE value. The loss is minimised by making the classifier's *existing* spatial pattern crisper, not by moving it toward the actual disease. In more compact language: \(L_{\text{con}}\) is a self-distillation of the classifier's current spatial beliefs, dressed up as a contrastive loss. It carries **no independent localization signal** into the model — there is no term that could tell the optimiser "your anchor positions are wrong in such-and-such a direction."
+
+This is not a subtle prediction; it is exactly what the C-run metrics show. `L_con` falls 0.028 → 0.003 (a factor of ~10), while `val/cam_iou_best` moves +0.002 ± 0.006. The loss is being minimised by sharpening the classifier's current (leaky) spatial beliefs, and no information about the *true* disease location enters the gradient.
+
+The implementation note at §5.11.1 ("contrastive position = P3 so the loss can't cheat by aligning the residual contribution") is orthogonal to this issue — the cheating path we worried about was P3-vs-P4 post-fusion leakage, not the classifier-bootstrap self-reference. The spec called this out as an "open question" ("class labels are coarse, GT masks would be ideal … a mid-ground is to use the model's own CAM peaks as initial anchors and refine with EMA") but the mid-ground was never replaced with a non-circular signal.
+
+**Failure mode 2 — the attention map is already near-uniform, so equivariance is trivially satisfied.**
+
+`P6_attn_map` probe IoU = 17.46 < `chmean` baseline 21.93 (§5.13.5). A map that loses to channel-mean aggregation is, for the purposes of localization, functionally uniform. Equivariance of a uniform map is automatic: \(T(\text{const}) = \text{const}\) for any geometric \(T\). The optimiser has no reason to move the map away from uniform — doing so would *increase* \(L_{\text{eq}}\), not decrease it, as long as the map itself is already \(T\)-invariant.
+
+The entire `train/L_eq_epoch` trajectory across 80 epochs stays inside \([1\text{e}{-}5, 3\text{e}{-}5]\) (§5.13.2). The classification-loss gradient provides the only mechanism by which the map could develop structure, but classification is solved by \(\mathrm{GAP}(F^{P4}) \cdot W_{\text{cls}}\) — it does not need the attention map to concentrate anywhere. \(L_{\text{eq}}\) can only **preserve** structure once it exists; it cannot create it. Since classification does not create attention structure, \(L_{\text{eq}}\) has nothing to preserve, and the map stays uniform.
+
+**Combined interpretation.** Neither loss contains a term that *creates* localization structure. One loss (\(L_{\text{con}}\)) re-encodes the classifier's existing spatial beliefs; the other (\(L_{\text{eq}}\)) preserves a map that has no structure to start with. The only gradient path toward better localization through this objective stack is the classification loss itself — which is exactly the pathway §5.10 and §5.12 already established to be insufficient.
+
+This is consistent with a simple quantitative check (not run yet, but cheap): across the three runs, `val/cam_iou_best` correlates with `val/mAP` at the same time-step, and moves in the opposite direction when \(L_{\text{con}}\) damages classification (the C run: \(\Delta\text{mAP} = -0.019\) between ep 1 and ep 40, \(\Delta\text{cam-IoU} = +0.002\); the magnitudes differ but the sign pattern is "cam-IoU follows mAP, and both hurt when \(L_{\text{con}}\) is added").
+
+#### 5.13.7 What would actually move the metric
+
+Before committing to a redesign, the cheap diagnostics below would pin the mechanism claims of §5.13.6 to specific images and specific numbers (each costs ≲ 20 min on a single 5090, using the eq-only ckpt):
+
+- **Attention-map entropy on the val subset**: compute \(-\sum_k p_k \log p_k\) for the per-query attention softmax and report mean/std. Mechanism 2 predicts mean entropy close to \(\log N_{\text{ref}} = \log 196 = 5.28\) (uniform).
+- **Anchor-vs-GT IoU**: for each val image, binarise the top-\(K\) anchor positions and IoU-match against the GT disease mask. Mechanism 1 predicts near-chance alignment. Direct test of the "anchors are wrong" claim.
+- **SegProbe on the C checkpoint**: if \(L_{\text{con}}\) merely failed to help, the C-ckpt probe signature should equal eq-only; if \(L_{\text{con}}\) actively eroded P3/P4 features, it should be worse. Distinguishes "no signal" from "negative signal".
+
+If the diagnostics confirm both mechanisms, the design knobs to flip (in priority order, all reachable as CLI overrides on `SPDNetSpatialLossesConfig` plus a small code change):
+
+1. **\(L_{\text{con}}\) anchor source ≠ current classifier.** The §5.11.1 spec already listed two non-circular alternatives under "Alternatives to revisit": EMA-teacher CAM peaks (break the self-reference by lagging the classifier) and `class_token` / pseudo-mask anchors (inject an external signal). EMA-teacher anchors are the lowest-risk swap: `src/wsss/spdnet/spatial_losses.py::EMATeacher` is already implemented and tested; wiring it to supply anchor logits instead of the student's `W_cls · p4_fused` is a ~20-line change.
+2. **Give \(L_{\text{eq}}\) something to preserve.** Add an attention-concentration regulariser (e.g. \(-\mathbb{E}[H(\text{attn})]\) with a small coefficient, or a TV-smoothness-plus-mass term) that *creates* a non-uniform map. Equivariance of a uniform map is free; we need structure first.
+3. **Try \(L_{\text{con}}\) at `P4_fused` or on `class_token`** — §5.11.1 alternatives 3/4. This tests whether the issue is the P3/P4 choice vs the anchor-source choice. If EMA-teacher anchors at P3 already fix it, this becomes optional.
+4. **Replace the whole objective with direct pseudo-mask supervision.** The Phase-2 probe recipe (§5.12.2) already gets to 60 % disease IoU from this checkpoint family. Distilling the probe head's prediction into the SCA attention map (a masked MSE or KL between \(M\) and a thresholded probe mask) is a stronger signal than anything we can get from patch-level contrastive or attention-map equivariance.
+
+**Interpreting the null result.** Neither the spec nor the implementation is "wrong" in the bug sense — they correctly encode the losses as described. What they encode is simply insufficient: absent a non-circular localization signal, neither loss can inject one. §5.11 called this out at decision time ("*Choice of 'same disease' anchor for the contrastive loss — class labels are coarse, GT masks would be ideal but defeat the WSSS premise. A mid-ground is to use the model's own CAM peaks as initial anchors and refine with EMA.*") — the current implementation uses the CAM-peak mid-ground but without the EMA refinement, which turns out to be the part that breaks the circularity. The EMA teacher is already built (§5.11.1 / `EMATeacher` class); a follow-up experiment `eq_con_ema_teacher` that hooks it up and re-runs the C-vs-F controls is the minimum evidence required before declaring patch contrastive a dead end on this architecture.
 
 ---
 

@@ -28,6 +28,7 @@ from src.conf.spdnet import SPDNetConfig
 from src.data.voc_classification import NUM_PLANTSEG_FG_CLASSES, PlantSegMCTformerDataset
 from src.wsss.spdnet.dataset import SiamesePlantSegDataset, siamese_collate_fn
 from src.wsss.spdnet.lightning import SPDNetModule
+from src.wsss.spdnet.online_loc_metric import OnlineCAMIoU
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +147,33 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
     log.info(f"LR scaling: {cfg.model.learning_rate} * {dcfg.batch_size}/256 = {scaled_lr}")
 
     fusion_mode = getattr(cfg.model, "fusion_mode", "token")
+
+    losses_cfg = getattr(cfg, "losses", None)
+    online_metric: OnlineCAMIoU | None = None
+    if losses_cfg is not None and bool(losses_cfg.online_loc_eval_enabled):
+        try:
+            online_metric = OnlineCAMIoU(
+                plantseg_root=dcfg.root,
+                gt_binary_dir=losses_cfg.online_loc_gt_binary_dir,
+                num_classes=num_classes,
+                subset_size=int(losses_cfg.online_loc_eval_subset_size),
+                seed=int(losses_cfg.online_loc_eval_seed),
+                every_n_epochs=int(losses_cfg.online_loc_eval_every_n_epochs),
+                image_size=image_size,
+                eval_batch_size=int(losses_cfg.online_loc_eval_batch_size),
+                enabled=True,
+            )
+            log.info(
+                f"OnlineCAMIoU enabled: {len(online_metric.query_names)} queries, "
+                f"every {losses_cfg.online_loc_eval_every_n_epochs} epoch(s)"
+            )
+        except FileNotFoundError as e:
+            log.warning(
+                f"OnlineCAMIoU disabled (resource missing): {e}. "
+                "DVC-pull the binary GT masks to enable."
+            )
+            online_metric = None
+
     module = SPDNetModule(
         num_classes=num_classes,
         fpn_channels=cfg.model.fpn_channels,
@@ -156,9 +184,56 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         warmup_epochs=cfg.trainer.warmup_epochs,
         min_lr=cfg.trainer.min_lr,
         fusion_mode=fusion_mode,
+        losses_cfg=losses_cfg,
+        online_loc_metric=online_metric,
+        image_size=image_size,
     )
     total_params = sum(p.numel() for p in module.parameters())
     log.info(f"Model parameters: {total_params:,}  fusion_mode={fusion_mode}")
+    if losses_cfg is not None:
+        log.info(
+            f"Aux losses: lambda_eq={losses_cfg.lambda_eq}, "
+            f"lambda_con={losses_cfg.lambda_con}, "
+            f"lambda_distill={losses_cfg.lambda_distill}, "
+            f"distill_warmup_epochs={losses_cfg.distill_warmup_epochs}, "
+            f"con_warmup_start_epoch={losses_cfg.con_warmup_start_epoch}, "
+            f"con_warmup_epochs={losses_cfg.con_warmup_epochs}"
+        )
+
+    # Optional warmstart: load *weights only* from an existing checkpoint.
+    # Optimizer state, LR scheduler state, and epoch counter stay fresh --
+    # so this is "start a new training session from these weights", not
+    # "resume an interrupted run". Exposed via the Hydra override
+    # ``+checkpoint=<path>``. Missing keys (e.g. proj_head when the source
+    # run had lambda_con=0) are expected and logged, not fatal.
+    # Use OmegaConf.select so the absent-field case is a clean ``None``
+    # rather than a ConfigAttributeError from the structured SPDNetConfig.
+    ckpt_path = OmegaConf.select(cfg, "checkpoint", default=None)
+    if ckpt_path:
+        ckpt_file = Path(str(ckpt_path))
+        if not ckpt_file.is_file():
+            raise FileNotFoundError(
+                f"Warmstart checkpoint not found: {ckpt_file}"
+            )
+        log.info(f"Warmstart: loading weights from {ckpt_file}")
+        ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt)
+        missing, unexpected = module.load_state_dict(state_dict, strict=False)
+        if missing:
+            log.warning(
+                f"Warmstart: {len(missing)} missing keys (expected for fresh "
+                f"heads such as proj_head / ema_teacher). Examples: "
+                f"{missing[:3]}"
+            )
+        if unexpected:
+            log.warning(
+                f"Warmstart: {len(unexpected)} unexpected keys dropped. "
+                f"Examples: {unexpected[:3]}"
+            )
+        log.info(
+            "Warmstart done: model weights loaded; optimizer/scheduler/epoch "
+            "counter remain fresh."
+        )
 
     include_pv = getattr(dcfg, "include_plantvillage", False)
     run_name = cfg.run_name or f"spdnet_{image_size}_{cfg.seed}"

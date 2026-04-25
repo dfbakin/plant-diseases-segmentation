@@ -204,6 +204,19 @@ else
     bad "tests/test_binary_pipeline.py threshold sweep FAILED — parallel/serial divergence"
 fi
 
+# Auxiliary spatial losses + online localization metric regression suite.
+# Cheap (~30 s); guards the equivariance / patch-contrastive /
+# self-distillation losses and the OnlineCAMIoU sweep that the
+# spdnet_spatial_eq* runs depend on. A regression here would silently
+# change every aux-loss value or kill the online IoU plot.
+if python -m pytest tests/test_equivariance_transforms.py \
+        tests/test_spatial_losses.py tests/test_online_loc_metric.py -q 2>&1 \
+        | tail -3 | grep -qE "passed"; then
+    ok "tests/test_{equivariance_transforms,spatial_losses,online_loc_metric}.py (54 cases)"
+else
+    bad "tests/test_{equivariance_transforms,spatial_losses,online_loc_metric}.py FAILED — aux losses broken"
+fi
+
 # CLI surface check: the --crf-eval-timeout-sec flag must exist on
 # eval_seg_probes.py, otherwise the bash phase scripts will fail with
 # "unrecognized argument" the moment they reach the eval step.

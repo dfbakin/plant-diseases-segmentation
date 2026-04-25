@@ -22,6 +22,12 @@
 #       Tiny dataset, 1 epoch, 30-image CRF subset, 5-image viz.
 #       Writes to outputs/spdnet_plantseg/_smoke/seg_probe_phase1/.
 #       Should finish in ~5 min.
+#
+#   AUX_ONLY=1 CKPT_AUX=... AUX_TAG=... bash scripts/run_seg_probes_phase1.sh
+#       Only runs the 6 aux-spatial probes on the AUX checkpoint. Skips
+#       the token (5) and spatial-baseline (6) loops, and skips their
+#       preflight file checks. Useful when the original baseline ckpts
+#       have been pruned / aren't available locally.
 ###############################################################################
 
 set -euo pipefail
@@ -33,11 +39,23 @@ export PATH="/venv/main/bin:$PATH"
 # Config
 # ----------------------------------------------------------------------------
 
-CKPT_TOKEN="outputs/spdnet_plantseg/spdnet_fix_n1_heavy/checkpoints/best.ckpt"
-CKPT_SPATIAL="outputs/spdnet_plantseg/spdnet_spatial_n1_ps_pv/checkpoints/epoch=epoch=76-val_mAP=val/mAP=0.8882.ckpt"
+CKPT_TOKEN="${CKPT_TOKEN:-outputs/spdnet_plantseg/spdnet_fix_n1_heavy/checkpoints/best.ckpt}"
+CKPT_SPATIAL="${CKPT_SPATIAL:-outputs/spdnet_plantseg/spdnet_spatial_n1_ps_pv/checkpoints/epoch=epoch=76-val_mAP=val/mAP=0.8882.ckpt}"
 
-TOKEN_TAG="token_n1_heavy"
-SPATIAL_TAG="spatial_n1_ps_pv"
+TOKEN_TAG="${TOKEN_TAG:-token_n1_heavy}"
+SPATIAL_TAG="${SPATIAL_TAG:-spatial_n1_ps_pv}"
+
+# OPTIONAL: 3rd checkpoint for the aux-loss-trained spatial model. When set,
+# the script runs the 6 spatial positions on this checkpoint AFTER the
+# baseline 11 probes -- the user uses this to rerun Phase 1 against the new
+# `spdnet_spatial_eq_con` (or sibling) checkpoint without code edits.
+#
+#   CKPT_AUX=outputs/spdnet_plantseg/spdnet_aux_losses/.../<best>.ckpt \
+#   AUX_TAG=spatial_eq_con \
+#       bash scripts/run_seg_probes_phase1.sh
+CKPT_AUX="${CKPT_AUX:-}"
+AUX_TAG="${AUX_TAG:-spatial_aux_losses}"
+AUX_ONLY="${AUX_ONLY:-0}"
 
 ALL_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier P6_attn_map)
 TOKEN_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier)
@@ -105,12 +123,24 @@ if [[ -f "$DONE_MARKER" ]]; then
     exit 0
 fi
 
-if [[ ! -f "$CKPT_TOKEN" ]]; then
-    echo "ERROR: token checkpoint missing: $CKPT_TOKEN" >&2
-    exit 1
+if [[ "$AUX_ONLY" == "1" ]]; then
+    if [[ -z "$CKPT_AUX" ]]; then
+        echo "ERROR: AUX_ONLY=1 requires CKPT_AUX to be set." >&2
+        exit 1
+    fi
+    echo "[phase1] AUX_ONLY=1 -- token/spatial baseline probes will be skipped."
+else
+    if [[ ! -f "$CKPT_TOKEN" ]]; then
+        echo "ERROR: token checkpoint missing: $CKPT_TOKEN" >&2
+        exit 1
+    fi
+    if [[ ! -f "$CKPT_SPATIAL" ]]; then
+        echo "ERROR: spatial checkpoint missing: $CKPT_SPATIAL" >&2
+        exit 1
+    fi
 fi
-if [[ ! -f "$CKPT_SPATIAL" ]]; then
-    echo "ERROR: spatial checkpoint missing: $CKPT_SPATIAL" >&2
+if [[ -n "$CKPT_AUX" && ! -f "$CKPT_AUX" ]]; then
+    echo "ERROR: CKPT_AUX set but file missing: $CKPT_AUX" >&2
     exit 1
 fi
 
@@ -165,21 +195,34 @@ run_one_probe() {
 
 t0=$(date +%s)
 
-echo ""
-echo "============================================================"
-echo "  Token checkpoint -- 5 positions"
-echo "============================================================"
-for pos in "${TOKEN_POSITIONS[@]}"; do
-    run_one_probe "$TOKEN_TAG" "$CKPT_TOKEN" "$pos" 2>&1 | tee -a "$LOG_FILE"
-done
+if [[ "$AUX_ONLY" != "1" ]]; then
+    echo ""
+    echo "============================================================"
+    echo "  Token checkpoint -- 5 positions"
+    echo "============================================================"
+    for pos in "${TOKEN_POSITIONS[@]}"; do
+        run_one_probe "$TOKEN_TAG" "$CKPT_TOKEN" "$pos" 2>&1 | tee -a "$LOG_FILE"
+    done
 
-echo ""
-echo "============================================================"
-echo "  Spatial checkpoint -- 6 positions"
-echo "============================================================"
-for pos in "${SPATIAL_POSITIONS[@]}"; do
-    run_one_probe "$SPATIAL_TAG" "$CKPT_SPATIAL" "$pos" 2>&1 | tee -a "$LOG_FILE"
-done
+    echo ""
+    echo "============================================================"
+    echo "  Spatial checkpoint -- 6 positions"
+    echo "============================================================"
+    for pos in "${SPATIAL_POSITIONS[@]}"; do
+        run_one_probe "$SPATIAL_TAG" "$CKPT_SPATIAL" "$pos" 2>&1 | tee -a "$LOG_FILE"
+    done
+fi
+
+if [[ -n "$CKPT_AUX" ]]; then
+    echo ""
+    echo "============================================================"
+    echo "  Aux-loss spatial checkpoint -- 6 positions  (tag=$AUX_TAG)"
+    echo "  (set via CKPT_AUX=$CKPT_AUX)"
+    echo "============================================================"
+    for pos in "${SPATIAL_POSITIONS[@]}"; do
+        run_one_probe "$AUX_TAG" "$CKPT_AUX" "$pos" 2>&1 | tee -a "$LOG_FILE"
+    done
+fi
 
 # ----------------------------------------------------------------------------
 # Decision gate
