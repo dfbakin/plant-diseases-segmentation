@@ -134,22 +134,24 @@ class SpatialCrossAttention(nn.Module):
         query_feat: torch.Tensor,
         ref_feat: torch.Tensor,
         return_attn: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Fuse reference spatial features into query via cross-attention.
 
         Args:
             query_feat: ``(B, C, H, W)`` merged query FPN features.
             ref_feat:   ``(B, C, Hr, Wr)`` merged reference FPN features.
-            return_attn: if ``True``, also return a per-query attention
-                concentration map ``(B, H, W)`` in ``[0, 1]``: ``0`` when
-                the query attends uniformly across all reference keys,
-                ``1`` when its attention is perfectly peaked on a single
-                key. This is the ``M(q, r)`` map consumed by the
-                equivariance loss and the P6 probe input.
+            return_attn: if ``True``, also return:
+                - ``attn_map (B, H, W)`` in ``[0, 1]``: the per-query
+                  attention concentration map ``M(q, r)`` consumed by
+                  the equivariance loss and the P6 probe input.
+                - ``attn_w   (B, H*W, h_ref*w_ref)``: the raw post-softmax
+                  attention weights per query position (head-averaged).
+                  Required by ``attention_marginal_entropy_loss`` so it
+                  can compute the per-key marginal ``mu_k``.
 
         Returns:
-            ``(B, C, H, W)`` fused query, or ``(fused, attn_BHW)`` when
-            ``return_attn=True``.
+            ``(B, C, H, W)`` fused query, or ``(fused, attn_map, attn_w)``
+            when ``return_attn=True``.
         """
         B, C, H, W = query_feat.shape
 
@@ -203,7 +205,7 @@ class SpatialCrossAttention(nn.Module):
         attn_p = attn_w.clamp_min(1e-12)
         neg_ent = (attn_p * attn_p.log()).sum(dim=-1)        # (B, H*W) in [-log N, 0]
         attn_map = (1.0 + neg_ent / log_N).view(B, H, W)     # (B, H, W) in [0, 1]
-        return fused, attn_map
+        return fused, attn_map, attn_w
 
 
 class SPDNet(nn.Module):
@@ -223,11 +225,13 @@ class SPDNet(nn.Module):
         mse_reduction: int = 4,
         pretrained: bool = True,
         fusion_mode: str = "token",
+        ref_pool_size: int = 14,
     ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.fpn_channels = fpn_channels
         self.fusion_mode = fusion_mode
+        self.ref_pool_size = ref_pool_size
 
         backbone = models.resnet50(
             weights=ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
@@ -247,7 +251,9 @@ class SPDNet(nn.Module):
         if fusion_mode == "token":
             self.adpl_cam = ADPLCam(num_levels=ADPL_CAM_LEVELS)
         elif fusion_mode == "spatial":
-            self.spatial_attn = SpatialCrossAttention(channels=fpn_channels)
+            self.spatial_attn = SpatialCrossAttention(
+                channels=fpn_channels, ref_pool_size=ref_pool_size,
+            )
         else:
             raise ValueError(f"Unknown fusion_mode: {fusion_mode!r}")
 
@@ -329,7 +335,9 @@ class SPDNet(nn.Module):
         that adds a singleton channel dim so the resulting heatmap is a valid
         probe input ``(B, 1, H, W)``.
         """
-        fused, attn_bhw = self.spatial_attn(query_feat, ref_feat, return_attn=True)
+        fused, attn_bhw, _attn_w = self.spatial_attn(
+            query_feat, ref_feat, return_attn=True,
+        )
         return fused, attn_bhw.unsqueeze(1)
 
     def attention_map(
@@ -380,7 +388,9 @@ class SPDNet(nn.Module):
             r_merged_list = [self._merge_fpn(r) for r in all_r_fpn]
             ref_merged = sum(r_merged_list) / len(r_merged_list)  # type: ignore[arg-type]
 
-        _, attn = self.spatial_attn(query_merged, ref_merged, return_attn=True)
+        _, attn, _attn_w = self.spatial_attn(
+            query_merged, ref_merged, return_attn=True,
+        )
         return attn  # (B, H, W)
 
     def _merge_and_fuse(
@@ -441,6 +451,11 @@ class SPDNet(nn.Module):
             ``attn_map``:     ``(B, Hf, Wf)`` per-query attention concentration map
                 in ``[0, 1]`` (only when ``return_attn=True`` AND
                 ``fusion_mode='spatial'``).
+            ``attn_w``:       ``(B, Hf*Wf, h_ref*w_ref)`` raw post-softmax
+                attention weights per query position (head-averaged). Needed
+                by ``attention_marginal_entropy_loss`` to compute per-key
+                marginals. Only present when ``return_attn=True`` AND
+                ``fusion_mode='spatial'``.
 
         Note:
             ``return_attn`` is silently ignored for ``fusion_mode='token'`` (no
@@ -468,10 +483,11 @@ class SPDNet(nn.Module):
                 fused = self.adpl_cam.fuse(query_merged, avg_tokens)
             else:
                 if return_attn:
-                    fused, attn_bhw = self.spatial_attn(
+                    fused, attn_bhw, attn_w = self.spatial_attn(
                         query_merged, ref_merged, return_attn=True,
                     )
                     result["attn_map"] = attn_bhw
+                    result["attn_w"] = attn_w
                 else:
                     fused = self.spatial_attn(query_merged, ref_merged)
 

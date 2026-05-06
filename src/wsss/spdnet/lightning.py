@@ -25,10 +25,32 @@ from src.wsss.spdnet.online_loc_metric import OnlineCAMIoU
 from src.wsss.spdnet.spatial_losses import (
     EMATeacher,
     ProjectionHead,
+    attention_concentration_loss,
+    attention_marginal_entropy_loss,
+    cam_pseudo_mask_loss,
     equivariance_loss,
     patch_contrastive_loss,
     self_distillation_loss,
 )
+
+
+def _warmup_schedule(
+    base: float, start: int, ramp: int, current: int,
+) -> float:
+    """Linear warmup with explicit start epoch.
+
+    Returns ``0`` for ``current < start`` and before any positive ``base``;
+    linearly interpolates up to ``base`` over ``ramp`` epochs starting at
+    ``start``, then stays at ``base`` afterwards. ``ramp <= 0`` means "jump
+    to ``base`` at ``start``".
+    """
+    if base <= 0.0:
+        return 0.0
+    if current < start:
+        return 0.0
+    if ramp <= 0 or current >= start + ramp:
+        return base
+    return base * float(current - start) / float(ramp)
 
 
 class SPDNetModule(L.LightningModule):
@@ -68,6 +90,7 @@ class SPDNetModule(L.LightningModule):
         losses_cfg: SPDNetSpatialLossesConfig | None = None,
         online_loc_metric: OnlineCAMIoU | None = None,
         image_size: int = 448,
+        ref_pool_size: int = 14,
     ) -> None:
         super().__init__()
         # OnlineCAMIoU + losses_cfg are constructed externally and may not be
@@ -79,6 +102,7 @@ class SPDNetModule(L.LightningModule):
             mse_reduction=mse_reduction,
             pretrained=pretrained,
             fusion_mode=fusion_mode,
+            ref_pool_size=ref_pool_size,
         )
         self.criterion = nn.MultiLabelSoftMarginLoss()
 
@@ -149,17 +173,48 @@ class SPDNetModule(L.LightningModule):
         uses ``self.current_epoch`` (the canonical training-step entry point).
         Exposed on the module for unit-testability.
         """
-        base = float(self.losses_cfg.lambda_con)
-        if base <= 0.0:
-            return 0.0
-        e = int(self.current_epoch if epoch is None else epoch)
-        start = int(self.losses_cfg.con_warmup_start_epoch)
-        ramp = int(self.losses_cfg.con_warmup_epochs)
-        if e < start:
-            return 0.0
-        if ramp <= 0 or e >= start + ramp:
-            return base
-        return base * float(e - start) / float(ramp)
+        return _warmup_schedule(
+            base=float(self.losses_cfg.lambda_con),
+            start=int(self.losses_cfg.con_warmup_start_epoch),
+            ramp=int(self.losses_cfg.con_warmup_epochs),
+            current=int(self.current_epoch if epoch is None else epoch),
+        )
+
+    def effective_lambda_mask(self, epoch: int | None = None) -> float:
+        """Return the linearly-warmed-up pseudo-mask loss weight.
+
+        Same shape as ``effective_lambda_con`` but keyed off
+        ``mask_warmup_start_epoch`` / ``mask_warmup_epochs``. Both defaults
+        are zero so ``lambda_mask`` applies in full from epoch 0 on; set
+        ``mask_warmup_*`` to ramp the supervision gradually on top of a
+        warmstart.
+        """
+        return _warmup_schedule(
+            base=float(self.losses_cfg.lambda_mask),
+            start=int(self.losses_cfg.mask_warmup_start_epoch),
+            ramp=int(self.losses_cfg.mask_warmup_epochs),
+            current=int(self.current_epoch if epoch is None else epoch),
+        )
+
+    def effective_lambda_ac(self, epoch: int | None = None) -> float:
+        """Return the linearly-warmed-up attention-concentration weight.
+
+        Same shape as ``effective_lambda_mask`` but keyed off
+        ``ac_warmup_start_epoch`` / ``ac_warmup_epochs``. Both defaults are
+        zero so ``lambda_ac`` applies in full from epoch 0 (existing recipes
+        are unchanged). Set non-zero to delay L_ac introduction until the
+        classifier has built a discriminative spatial signal -- this avoids
+        the epoch-3 attention collapse observed in cold-start runs where L_ac
+        is applied on top of random MSE logits (the 2026-04-30 highres run
+        saturated attn_mean to 0.98 within 3 epochs and pinned val/cam_iou
+        at 0.198 for the remaining run).
+        """
+        return _warmup_schedule(
+            base=float(self.losses_cfg.lambda_ac),
+            start=int(self.losses_cfg.ac_warmup_start_epoch),
+            ramp=int(self.losses_cfg.ac_warmup_epochs),
+            current=int(self.current_epoch if epoch is None else epoch),
+        )
 
     # ------------------------------------------------------------------
     # Training loop
@@ -172,9 +227,14 @@ class SPDNetModule(L.LightningModule):
         B = q.size(0)
 
         # Single forward through the student. Request the attention map only
-        # when we actually need it (spatial fusion + lambda_eq > 0); this
-        # avoids the dense need_weights=True path on the baseline run.
-        want_attn = self._spatial_fusion and self.losses_cfg.lambda_eq > 0
+        # when we actually need it (spatial fusion + any of: lambda_eq,
+        # lambda_ac, lambda_marg_H). This avoids the dense need_weights=True
+        # path on the baseline run.
+        want_attn = self._spatial_fusion and (
+            self.losses_cfg.lambda_eq > 0
+            or self.losses_cfg.lambda_ac > 0
+            or self.losses_cfg.lambda_marg_H > 0
+        )
         feats = self.model.extract_merged_features(q, refs, return_attn=want_attn)
         fused = feats["fused"]
         pooled = fused.mean(dim=[2, 3])
@@ -184,22 +244,84 @@ class SPDNetModule(L.LightningModule):
         total = L_cls
         comp: dict[str, torch.Tensor] = {"L_cls": L_cls.detach()}
 
-        # ------------------ Equivariance ------------------
+        # ------------------ Equivariance (+ attention concentration) ------------------
         if want_attn:
             attn_orig = feats["attn_map"]
-            # Round-robin transform per batch (deterministic, batch-uniform
-            # so the per-step compute cost is constant).
-            t_choices = self.losses_cfg.equivariance_transforms
-            if len(t_choices) > 0:
-                t_id = int(t_choices[batch_idx % len(t_choices)])
-                q_aug = ET.apply(q, t_id)
-                attn_aug = self.model.attention_map(
-                    q_aug,
-                    ref_merged_cached=feats.get("ref_merged"),
+            if self.losses_cfg.lambda_eq > 0:
+                # Round-robin transform per batch (deterministic, batch-uniform
+                # so the per-step compute cost is constant).
+                t_choices = self.losses_cfg.equivariance_transforms
+                if len(t_choices) > 0:
+                    t_id = int(t_choices[batch_idx % len(t_choices)])
+                    q_aug = ET.apply(q, t_id)
+                    attn_aug = self.model.attention_map(
+                        q_aug,
+                        ref_merged_cached=feats.get("ref_merged"),
+                    )
+                    L_eq = equivariance_loss(attn_orig, attn_aug, t_id)
+                    total = total + self.losses_cfg.lambda_eq * L_eq
+                    comp["L_eq"] = L_eq.detach()
+            if self.losses_cfg.lambda_ac > 0:
+                # D1: push attn_map away from its uniform fixed point. The
+                # gradient flows through ``attn_orig`` back into the SCA
+                # module, so it's essential that ``attn_orig`` was computed
+                # in the current forward pass (which it is above).
+                #
+                # The schedule ``lam_ac_eff = effective_lambda_ac()`` linearly
+                # ramps L_ac's contribution (default: full weight from epoch
+                # 0, matching legacy D1 recipes). Setting ``ac_warmup_*`` on
+                # cold-start runs is now the recommended default because L_ac
+                # has a trivial minimum at attn_map == 1 everywhere that is
+                # otherwise reached in 2-3 epochs before the classifier has
+                # built useful spatial features.
+                lam_ac_eff = self.effective_lambda_ac()
+                comp["lambda_ac_eff"] = torch.tensor(
+                    lam_ac_eff, device=fused.device, dtype=fused.dtype,
                 )
-                L_eq = equivariance_loss(attn_orig, attn_aug, t_id)
-                total = total + self.losses_cfg.lambda_eq * L_eq
-                comp["L_eq"] = L_eq.detach()
+                L_ac = attention_concentration_loss(attn_orig)
+                if lam_ac_eff > 0.0:
+                    total = total + lam_ac_eff * L_ac
+                comp["L_ac"] = L_ac.detach()
+                # Always-logged diagnostic: mean concentration is the
+                # positive-valued mirror of L_ac. Tracked even during L_ac
+                # warmup (when lam_ac_eff == 0) so operators can watch for
+                # the attn_mean > 0.95 collapse signature throughout training.
+                comp["attn_mean"] = attn_orig.detach().mean()
+            if self.losses_cfg.lambda_marg_H > 0:
+                # D4 (RQ2): L_marg_H = -mean(M) + beta * KL(mu || U).
+                # Unlike L_ac this penalises single-key dominance via the
+                # marginal of attention weights over keys, so it has no
+                # mode-collapse fixed point. Requires the full (B, P, N_k)
+                # attention tensor, not just the concentration summary.
+                attn_w = feats["attn_w"]
+                L_marg_H = attention_marginal_entropy_loss(
+                    attn_w, beta=self.losses_cfg.marg_H_beta,
+                )
+                total = total + self.losses_cfg.lambda_marg_H * L_marg_H
+                comp["L_marg_H"] = L_marg_H.detach()
+
+        # ------------------ Pseudo-mask CAM supervision (D2) ------------------
+        lam_mask_eff = self.effective_lambda_mask()
+        # Log the schedule so MLflow sees the ramp even when lam_mask is 0.
+        comp["lambda_mask_eff"] = torch.tensor(
+            lam_mask_eff, device=fused.device, dtype=fused.dtype,
+        )
+        if lam_mask_eff > 0.0:
+            L_mask = cam_pseudo_mask_loss(
+                p3_query=feats["query_merged"],
+                p4_fused=fused,
+                cls_weight=self.model.classifier.weight,
+                labels=labels,
+                alpha_pos=self.losses_cfg.mask_alpha_pos,
+                beta_neg=self.losses_cfg.mask_beta_neg,
+                # Deprecated alias wins over ``mask_combiner`` when the
+                # user has explicitly set it (legacy behaviour). ``None``
+                # means "use mask_combiner" (the new D4 path).
+                use_intersection=self.losses_cfg.mask_use_intersection,
+                mask_combiner=self.losses_cfg.mask_combiner,
+            )
+            total = total + lam_mask_eff * L_mask
+            comp["L_mask"] = L_mask.detach()
 
         # ------------------ Patch contrastive ------------------
         if self.proj_head is not None:
@@ -220,6 +342,7 @@ class SPDNetModule(L.LightningModule):
                     top_k=self.losses_cfg.con_top_K,
                     m_negatives=self.losses_cfg.con_M_negatives,
                     temperature=self.losses_cfg.con_temperature,
+                    anchor_source=self.losses_cfg.con_anchor_source,
                 )
                 total = total + lam_con_eff * L_con
                 comp["L_con"] = L_con.detach()
@@ -315,8 +438,20 @@ class SPDNetModule(L.LightningModule):
     # ------------------------------------------------------------------
 
     def configure_optimizers(self) -> dict[str, Any]:
-        # Skip frozen params (EMA teacher) -- AdamW would otherwise allocate
-        # state for them even though their grads are always None.
+        # Silently-inverted cosine guard. CosineAnnealingLR with
+        # ``eta_min >= base_lr`` interpolates *upward* across its T_max window
+        # instead of decaying: the highres896 run on 2026-04-30 wasted ~10 h
+        # before we noticed (``trainer.min_lr=1e-5`` + linear-scaling rule
+        # pulling peak to 7.8e-6 put the floor above the peak).
+        # Fail loudly before any forward pass so the trap can't recur.
+        if self.min_lr >= self.learning_rate:
+            raise ValueError(
+                f"min_lr ({self.min_lr:g}) must be strictly below the (already "
+                f"batch-scaled) base learning rate ({self.learning_rate:g}). "
+                "CosineAnnealingLR would otherwise ascend from base_lr to "
+                "eta_min rather than decay. Reduce trainer.min_lr or raise "
+                "model.learning_rate so that base_lr * batch_size / 256 > min_lr."
+            )
         trainable = [p for p in self.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(
             trainable,

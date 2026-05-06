@@ -953,7 +953,10 @@ The original `generate_cams.py` multiplied attention maps by GT labels (`cls_att
 | `113502554219633766` | weakclip-plantseg-binary-t_0.73 | 1 | Mar 2026 | WSSS (PlantSeg) |
 | `285465004951754042` | spdnet_plantseg | 5+ | Apr 2026 | SPDNet Siamese (PlantSeg) |
 | `620484456636990556` | spdnet_seg_probe | 27 | Apr 2026 | SPDNet Localization Capacity Probe (Ph1/Ph2/Ph3, §5.12 + §5.13.5 Phase A) |
-| `627312757314977784` | spdnet_aux_losses | 4 | Apr 2026 | SPDNet aux spatial losses (\(L_{\text{eq}}\), \(L_{\text{con}}\), \(L_{\text{distill}}\)) — §5.13 |
+| `627312757314977784` | spdnet_aux_losses | 12 | Apr 2026 | SPDNet aux spatial losses (\(L_{\text{eq}}\), \(L_{\text{con}}\), \(L_{\text{distill}}\), D1–D4 ablation) — §5.13 |
+| `115309098075776200` | phase5_highres | 7 | Apr 30 – May 3, 2026 | SPDNet at 896² (cls-only baseline + D4 ac_safe warmstart + cold d4ac) — §5.14 |
+| `421877393125189226` | phase5_lr_fix | 2 | May 4 – May 6, 2026 | SPDNet at 896² with Trap 1+2 fixes (P1 cls-only + P2 mask-only) — §5.14.6 |
+| `540180262716932031` | phase5_lr_fix_smoke | 2 | May 4, 2026 | Smoke runs validating the new LR-fix launcher pipeline (Hydra parsing, ref_pool_size auto, warmup) |
 
 Runs within `spdnet_plantseg` experiment:
 - `spdnet_448_42` — broken model (ref ignored), 45 ep, mAP=0.621
@@ -968,9 +971,33 @@ Runs within `spdnet_plantseg` experiment:
 
 Runs within `spdnet_aux_losses` experiment (§5.13):
 - `spdnet_spatial_eq_con_20260423` — initial post-spec run, 76 ep, mAP=0.614, `val/cam_iou_best`=0.205. Revealed the \(L_{\text{eq}}\) attention-map bug (§5.13.2); L_eq stayed at 1e-6–1e-4 throughout training.
-- `spdnet_spatial_eq_20260424` — post-fix eq-only baseline, 80 ep, mAP=0.843 (best 0.8615 @ep72), `val/cam_iou_best`=0.246. This is the reference checkpoint probed in §5.13.5 Phase A.
+- `spdnet_spatial_eq_20260424` — post-fix eq-only baseline, 80 ep, mAP=0.843 (best 0.8615 @ep72), `val/cam_iou_best`=0.246. This is the reference checkpoint probed in §5.13.5 Phase A. **Used as warmstart source for the entire D-chain below**.
 - `spdnet_spatial_eq_con_warmstart_20260425` (run C) — warmstart from the eq-only ckpt with \(L_{\text{con}}\) at full strength, 40 ep, mAP=0.841 (−1.9 pp vs starting ckpt), `val/cam_iou_best`=0.252 (+0.002 across 40 epochs).
-- `spdnet_spatial_eq_con_warmup_20260425` (run F, in flight) — from scratch with \(L_{\text{con}}\) linear ramp over ep 14–21, 80 ep target, currently at ep 62 with mAP=0.768 and `val/cam_iou_best`=0.234.
+- `spdnet_spatial_eq_con_warmup_20260425` (run F) — from scratch with \(L_{\text{con}}\) linear ramp over ep 14–21, 80 ep, finished mAP=0.776 (vs eq-only 0.844). Confirms §5.13.6 finding that \(L_{\text{con}}\) damages classification.
+- D-chain (April 27, 40-ep warmstarts from eq-only ckpt, all at 448²; **D2 is the localisation winner of this experiment family**):
+  - `spdnet_spatial_d1_ac_warmstart_20260427` — D1 attention concentration alone, mAP=0.822, attn_mean collapsed to 1.0 (canonical D1 failure).
+  - `spdnet_spatial_d2_mask_warmstart_20260427` — D2 pseudo-mask intersection, mAP=0.853, **`val/cam_iou_best`=0.262 (best of the family)**.
+  - `spdnet_spatial_d3_d2plus_union_warmstart_20260427` — D3 D2 + L_con union, mAP=0.883.
+  - `spdnet_spatial_d4_main_warmstart_20260427` — D4 L_marg_H + mask(union), mAP=0.797.
+  - `spdnet_spatial_d4_attn_only_warmstart_20260427` — D4 L_marg_H alone, mAP=0.845, `val/cam_iou_best`=0.200.
+  - `spdnet_spatial_d4_ac_safe_warmstart_20260427` — D4 L_ac at λ=0.05 + L_mask, mAP=0.810, **attn_mean collapsed to 0.998 — confirms H1 hypothesis FALSE**.
+  - `spdnet_spatial_d4_int_warmstart_20260427` — D4 main with mask_combiner=intersection, mAP=0.787.
+
+Runs within `phase5_highres` experiment (§5.14, all `image_size=896`, `fusion_mode=spatial`):
+- `spdnet_highres896_d4_ac_safe_20260430` (run `747cf03c…`) — first D4 highres attempt, killed at ep 2 by `min_lr ≥ scaled_lr` cosine inversion. Compute wasted ~10 h before fix added.
+- `spdnet_highres896_d4_ac_safe_20260430` (run `6e68b48b…`, warmstart from 448 D4_ac_safe ckpt) — **collapsed**: mAP plateau 0.71, attn_mean=0.998 from step 0. `val/cam_iou_best`=0.284 is a saturated-attention transient, not a real signal.
+- `spdnet_highres896_cold_d4ac_20260430` (run `c199b296…`) — first cold-from-scratch D4 ac_safe, killed early (epoch 19, mAP 0.137).
+- `spdnet_highres896_cold_d4ac_20260430` (run `597c4c54…`, RESUMED) — same config restarted from scratch; reached ep 51 with mAP=0.489 / cam_iou=0.241. Same canonical collapse signature: attn_mean → 0.997 by ep 21.
+- `spdnet_highres896_clsonly_20260501` — 30-ep cls-only sanity precursor, mAP=0.543, `val/cam_iou_best`=0.219.
+- `spdnet_highres896_clsonly_20260502` — **headline 80-ep cls-only run, FINISHED**: mAP=0.838 (vs 448 baseline 0.888, **−5 pp**), `val/cam_iou_best`=0.241 (vs 448 d2_mask 0.262, **−2 pp**). 23.9 h on RTX 5090. Cleanest evidence that 896 is currently strictly worse than 448 (§5.14).
+- `spdnet_highres896_d4_ac_safe_20260430` (run `b1dbc0df…`) — second relaunch attempt, immediately failed at warmup epoch 0 (status RUNNING — actually killed; classification loss step 0.69, no progress).
+
+Runs within `phase5_lr_fix` experiment (§5.14.6, all `image_size=896`, `fusion_mode=spatial`, `ref_pool_size=20`):
+- `phase5_lr_fix_P1_cls_only_20260504` (run `53123f3d…`, **FINISHED**) — pure classifier, 60 ep, batch=6 accum=5, eff-batch LR rule → `scaled_lr=5.86e-5`. **Peak `val/mAP=0.849` at ep 41**, final 0.823 (cosine-tail overfitting). `val/cam_iou_best`=0.247 peak. 21.9 h on the current host. Trap-1 LR fix verified: vs H6 (legacy LR rule, same arch, 80 ep) per-epoch convergence is 1.4–1.5× faster, peak val/mAP +1.1 pp, train/mAP +5.8 pp.
+- `phase5_lr_fix_P2_aux_mask_only_20260504` (run `cfc32ec9…`, **STOPPED at ep 51 by user once L_mask gain was clear**) — pseudo-mask supervision (`λ_mask=0.05`, mask_combiner=union, warmup ep 15→20), 80-ep budget, batch=4 accum=8, eff-batch LR rule → `scaled_lr=6.25e-5`. **Peak `val/cam_iou_best=0.284` at ep 21** (right at end of λ_mask ramp), `val/cam_iou_auc=0.222` (vs P1 0.158, **+6.4 pp** — the headline localisation result of §5.14). Peak `val/mAP=0.709` at ep 47 (well below P1's 0.849; cost of training L_mask from scratch). **No collapse** by construction (`λ_ac=0`, `λ_marg_H=0`).
+
+Runs within `phase5_lr_fix_smoke` experiment (§5.14.6 pre-launch validation):
+- 2 runs — Hydra override parsing test, ref_pool_size auto resolution test, warmup schedule test. Disposable; not part of any published numbers. Kept in MLflow only because the smoke launcher logs there; can be filtered out for analysis.
 
 ---
 
@@ -1103,6 +1130,22 @@ dvc pull outputs/spdnet_plantseg.dvc outputs/visualizations.dvc mlruns.dvc
 23. **Non-circular anchor source for \(L_{\text{con}}\) (FOLLOW-UP TO §5.13)**: The §5.13 null result is caused by \(L_{\text{con}}\)'s anchors being the student classifier's own argmax (circular objective). The EMA teacher class `EMATeacher` in `src/wsss/spdnet/spatial_losses.py` is already implemented and unit-tested; wiring it to supply the anchor logits instead of `W_cls · p4_fused` is a small, targeted change (a `con_anchor_source=ema_teacher` switch in `SPDNetSpatialLossesConfig` + a branch in `patch_contrastive_loss`). Minimum experiment: rerun C (`eq_con_warmstart`) and F (`eq_con_warmup`) with EMA-teacher anchors; success criterion is `val/cam_iou_best` moving above the eq-only plateau (~0.246) by ≥ 2 × its history std (~0.015). If EMA-teacher anchors also fail to move the metric, the patch-contrastive family is a dead end on this architecture and the next step is pseudo-mask distillation (item 24 below).
 
 24. **Pseudo-mask distillation into SCA attention (ALTERNATIVE TO AUX LOSSES)**: Since the Phase-2 probe recipe (§5.12.2) already produces 60 % disease IoU segmentations from the same backbone family, the strongest signal we could add to SPDNet training is to distill the probe head's prediction into the SCA attention map. Two concrete formulations: (a) masked MSE between the attention map and a thresholded probe mask; (b) per-class KL between `W_cls · p4_fused` and the probe's foreground logits. Both give the model the exact localization signal that \(L_{\text{eq}}\) and \(L_{\text{con}}\) failed to inject. Requires a frozen probe-head teacher at training time; the compute cost is one extra forward per batch. Cleanly separates "add spatial supervision" from "invent clever self-supervised losses" — we already have a teacher, so use it.
+
+25. **Phase 5 high-resolution training (DONE — null result, May 2026)**: doubled training resolution from 448 to 896 expecting both better classification (more pixels per disease lesion) and better localisation (finer cam grid: 56² → 112²). **Outcome**: classification regressed from `val/mAP=0.888` to `0.838` (−5 pp absolute), localisation regressed from `val/cam_iou_best=0.262` to `0.241` (−2 pp), and *every* aux-loss highres run collapsed the attention map within 5 epochs (faster than at 448 due to the fixed 14×14 reference key set). Section §5.14 lists the four scale traps (LR rule, SCA bandwidth, min_lr inversion, validation transform) and ranks the fixes by leverage. The headline conclusion is that high resolution buys nothing without first scaling LR by ~2× *and* rescaling `ref_pool_size` with image size; the order of operations is "fix optimisation, then re-evaluate localisation gains".
+
+26. **2× LR for highres training (DONE — May 4–6, 2026, §5.14.6)**: implemented as an **effective-batch** LR rule (`scaled_lr = base_lr * (batch_size * accumulate_grad_batches) / 256`) plus a `model.learning_rate_override` escape hatch in `src/conf/spdnet.py` and `src/train_spdnet.py`. Verified live in P1 (`phase5_lr_fix_P1_cls_only`, scaled_lr=5.86e-5 vs H6's 3.12e-5). **Outcome**: per-epoch convergence 1.4–1.5× faster, peak `val/mAP` 0.849 vs H6's 0.838 (+1.1 pp), train/mAP 0.915 vs 0.857 (+5.8 pp). The fix works for training-fit speed but the **val ceiling is architecturally bounded around 0.85** — closing the remaining 4-pp gap to the 448 baseline (0.888) is unlikely to be LR-driven. The classification deficit at 896 is an information-bottleneck issue at the FPN /32 deepest level, not an optimisation issue. Implication: **stop scaling resolution as a classification knob**; treat 896 as a localisation-only knob.
+
+27. **Scale-aware SCA `ref_pool_size` (DONE — May 4, 2026, §5.14.6)**: `SPDNetModelConfig.ref_pool_size` defaults to `0` (auto), resolving in `train_spdnet.py` to `max(14, image_size // 44)` — at 896² yields `rps=20` (400 keys, Q:K = 125:1 vs 256:1 with rps=14). The conservative `// 44` divisor (instead of the originally-planned `// 32`) was chosen after smoke-testing showed the *merged* FPN feature map is at /4 stride (224×224 = 50,176 query tokens at 896²), so the attention buffer scales 4× faster than the originally-assumed /8 — `// 32` would OOM at batch ≥ 4. **Outcome**: direct effect on cls-only iou is small (+0.6 pp), but **enables L_mask supervision at 896 to inject a clean signal** without bandwidth saturation (P2 cam_iou_auc 0.222 vs P1 0.158 = +6.4 pp). Unit test in `tests/test_spdnet.py:TestRefPoolSizeConfigurable`.
+
+28. **Run seg-probe pipeline on the H4 cls-only highres ckpt (LOW EFFORT)**: the `spdnet_highres896_clsonly_20260502` checkpoint is the first SPDNet ckpt trained at 896². If the Phase-2 probe recipe (§5.12.2) lifts it to ≥ 65 % disease IoU (vs 448 ceiling 62 %), high resolution buys ~3 pp on the localisation upper bound *despite* the classifier being worse. If it lifts to only ~60 % then 896 is a dead end without the LR/SCA fixes (#26 + #27). Total compute: ~6 h for Ph1 + Ph2. **Now also worth running on the P1 ep 41 ckpt** (the LR-fixed cls-only) — comparing the probe ceiling on H4 vs P1 isolates the LR-fix contribution to the localisation upper bound.
+
+29. **Warm-start fine-tune from the P1 peak ckpt (HIGHEST PRIORITY for the localisation roadmap, §5.14.7)**: the P2 from-scratch run pays a 15-pp val/mAP cost during the L_mask warmup window because the classifier is still converging. Warm-starting from `outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/epoch=epoch=40-val_mAP=val/mAP=0.8490.ckpt` (already saved by Lightning's top-k callback) avoids this Pareto fight: classifier is at its plateau, L_mask becomes additive regularisation, and the pseudo-mask teacher is sharper from step 0 (cam_iou_best ≈ 0.247 instead of 0.22). Existing `+checkpoint=<path>` Hydra override (`train_spdnet.py:253-271`) handles weights-only loading with fresh optimizer state — exactly the right semantics. Planned 3-config sweep (rps=20, 25 ep each, fine-tune LR ~ 1.2e-5): `WS_A` λ_mask=0.05, `WS_B` λ_mask=0.10, `WS_C` λ_mask=0.05+λ_marg_H=0.005. Predicted outcome: val/cam_iou_best ≈ 0.30–0.32, val/mAP within ±1 pp of P1 peak, val/cam_iou_auc 0.25–0.27. ~4–5 h per run on a 5090.
+
+30. **`ref_pool_size` ablation sweep at 896² (parallel-friendly, §5.14.7)**: P1 vs H6 demonstrated rps=20 has only a +0.6 pp direct effect on iou, but the architectural argument is that ref-patch sizes 32 px (rps=28) and 22 px (rps=40) better match the natural disease-lesion scale (~30–80 px) than rps=20 (45 px). Run cls-only at 896² with rps ∈ {28, 40} for 30 epochs each, measure peak val/cam_iou_best vs P1's 0.247. If the gain is ≥ 1 pp at rps=40, fold it into the warm-start sweep. If the gain is < 0.5 pp, conclude rps is a saturated knob at 896 and freeze it at 20. ~12 h per run on a 5090. *Naturally pairs with the warm-start sweep on a 2× 5090 host: rps ablation on one card, warm-start sweep on the other.*
+
+31. **Cosine schedule too long for the small dataset (LOW EFFORT, applies to ALL future runs)**: P1 lost 3 pp val/mAP during the cosine tail (ep 41 peak 0.849 → ep 60 final 0.823) while train/mAP kept climbing 0.85 → 0.92. Classic small-dataset overfitting under shrinking LR. **Action**: in all future highres runs, use either (a) `max_epochs=50` with `min_lr=1e-6`, or (b) `max_epochs=80` with `EarlyStopping(monitor='val/mAP', patience=15, mode='max')`. Cheap fix; saves both compute and metric drift.
+
+32. **Architectural ceiling at 896² classification ≈ 0.85 val/mAP — implications for resolution scaling (NEW HYPOTHESIS, §5.14.6)**: P1's val/mAP plateau at 0.849 is well below the 448 baseline of 0.888, even with the LR rule fixed. The information-bottleneck argument: the FPN's deepest level (`backbone.layer4`) is at /32 stride = 28×28 at 896² — same number of *deep semantic* tokens as 14×14 at 448². The merged FPN feature at /4 has 4× more tokens but those tokens are mostly low-level features (the /4 and /8 FPN levels). For *classification* (which is GAP-pooled across all spatial positions), the deep-token bottleneck is what matters, and it doesn't change with input resolution. **If this holds**, then 896 is fundamentally a localisation knob, not a classification knob, and scaling further to 1024 / 1280 will hit the same wall at the same val/mAP. **Falsifiable test**: train a 1024² cls-only run (24 h on a 5090) — if it also plateaus at 0.84–0.85, the ceiling is confirmed and we should stop scaling input resolution and instead consider freezing the backbone + training a higher-res FPN-only stub.
 
 ---
 
@@ -1792,6 +1835,248 @@ If the diagnostics confirm both mechanisms, the design knobs to flip (in priorit
 
 ---
 
+### 5.14 Phase-5 High-Resolution Training (April 30 – May 3, 2026)
+
+**Hypothesis**: Doubling the training resolution from 448 to 896 should reduce the localisation floor by a factor of two (the merged FPN feature map at /8 jumps from 56×56 to 112×112) and let `cam_classifier` resolve disease lesions at the natural scale of plant disease spots (~30–80 px in the original image vs the ~4–10 px representation at 448²).
+
+**Experiment design** (`outputs/phase5_highres/`, MLflow experiment `phase5_highres` ID `115309098075776200`, 7 logged runs):
+
+| Tag | Run name | Status | Epochs | Aux losses | Best `val/mAP` | Best `val/cam_iou_best` | Duration |
+|-----|----------|-------:|-------:|-----------|---------------:|------------------------:|---------:|
+| H1 | `spdnet_highres896_d4_ac_safe_20260430` (run `747cf03c…`) | RUNNING (crashed ep 2) | 2 | \(\lambda_{\text{ac}}=0.1\), \(\lambda_{\text{eq}}=1.0\), \(\lambda_{\text{mask}}=0.1\) (intersection) | 0.156 (early) | — | aborted |
+| H1' | `spdnet_highres896_d4_ac_safe_20260430` (run `6e68b48b…`, **warmstart from D4_ac_safe 448 ckpt** ep 21) | RUNNING (mAP plateau, paused) | 21 | same as H1 | **0.7358** (ep 11) | **0.2842** (ep 9) | ~10 h |
+| H2 | `spdnet_highres896_cold_d4ac_20260430` (run `c199b296…`, FROM SCRATCH) | RUNNING (epoch 19) | 19 | \(\lambda_{\text{ac}}=0.05\), \(\lambda_{\text{mask}}=0.1\) (union, both warmup ep 15→20) | 0.137 | — (no online metric history yet) | aborted |
+| H2' | same name, run `597c4c54…`, RESUMED FROM SCRATCH | RUNNING (epoch 51) | 51 | same as H2 | **0.4892** (ep 47) | **0.2709** (ep 19) | ~17 h |
+| H3 | `spdnet_highres896_clsonly_20260501` (30-ep cls-only sanity) | FINISHED | 30 | none (pure classifier) | 0.5431 | 0.2192 | 9.0 h |
+| H4 | `spdnet_highres896_clsonly_20260502` (full 80-ep cls-only) | **FINISHED** | 80 | none (pure classifier) | **0.8381** (ep 78) | **0.2413** (ep 47) | **23.9 h** |
+
+The headline run is **H4** — 80 epochs, pure classifier, no auxiliary losses, the cleanest possible apples-to-apples comparison against the 448 baselines from §5.7.3 / §5.10.5.
+
+#### 5.14.1 Headline result: pure classifier at 896 underperforms 448
+
+| Run | Resolution | Best `val/mAP` | Best `val/cam_iou_best` | Notes |
+|-----|-----------:|---------------:|------------------------:|-------|
+| `spdnet_spatial_n1_ps_pv` (§5.10) | 448 | **0.888** (ep 76) | n/a (pre-OnlineCAMIoU era) | 80 ep, ~6.6 h |
+| `spdnet_spatial_eq_20260424` (§5.13) | 448 | 0.862 (ep 72) | 0.246 | 80 ep, eq-only |
+| `spdnet_spatial_d2_mask_warmstart_20260427` (§5.13.5 D-chain) | 448 | 0.853 | **0.262** | 40 ep warmstart |
+| `spdnet_highres896_clsonly_20260502` (this work) | 896 | **0.838** | 0.241 | 80 ep cls-only |
+
+Two clean negative observations from H4 alone:
+
+1. **Classification mAP regressed** from 0.888 → 0.838 (−5.0 pp absolute) at double the resolution and ~3.6× the wall clock. The 448 spatial classifier had already converged by epoch ~50; the 896 one was still climbing at the end of the cosine schedule. The training loss reached 0.0019 (well into the overfitting regime, train mAP 0.857), so it is not a "needs more epochs" issue — it is *the model fits worse on the same task at higher resolution*.
+2. **Localisation `val/cam_iou_best` regressed** from 0.246 (eq-only 448) and 0.262 (D2-mask 448) down to 0.241 — **strictly worse at 896 than the corresponding 448 run with no aux losses**. The hypothesised "more pixels → finer disease localisation" did not materialise even on the cls-only architecture that bypasses every aux-loss failure mode.
+
+#### 5.14.2 Why classification mAP got worse at higher resolution — the four scale traps
+
+The training pipeline has at least four hyperparameter choices that quietly assume the 448 calibration. Each one moves in the *wrong* direction when image size doubles. These are listed roughly in order of impact magnitude.
+
+**Trap 1 — Linear LR-scaling rule on a smaller batch (PRIMARY SUSPECT).**
+
+`src/train_spdnet.py` line 146 implements the standard "linear rule": `scaled_lr = base_lr * batch_size / 256`. Both the 448 and 896 runs used the same numerator (`learning_rate=0.00133` in the highres config, `learning_rate=0.0005` in the 448 spatial-PV config — but the latter was effectively scaled by `batch_size=8 / 256` to ~3.125e-5 anyway). What changed is the denominator.
+
+| Run | Per-step batch | accumulate | Eff. batch | `scaled_lr` (final) | Steps/epoch |
+|-----|--------------:|-----------:|-----------:|--------------------:|------------:|
+| 448 spatial PS+PV (§5.10) | 8 | 4 | 32 | 3.125e-5 | 1058 |
+| 448 spatial eq-only (§5.13) | 8 | 4 | 32 | 3.125e-5 | 1058 |
+| 896 cls-only H4 (this work) | 6 | 5 | 30 | **3.117e-5** | 1130 |
+
+Numerically the LR is virtually identical between 448 and 896. But this is the *wrong target*. In bf16-mixed training with a fixed model (ResNet50 + FPN + SCA + 115-way classifier), the gradient *signal* per parameter is approximately:
+
+$$ \|\nabla\|_{\text{step}} \;\approx\; \|\nabla\|_{\text{per-image}} \cdot \sqrt{\text{eff.\ batch}} $$
+
+The eff. batch is essentially the same. But `‖∇‖_per-image` *itself* depends on the spatial dimensions of the loss-bearing tensors. In particular, both `L_cls` (BCE on a `[B,115]` logit vector via `mean(dim=[2,3])`) **and** the post-softmax MHA gradient flow are *spatial-mean-reduced*. Doubling H,W means each spatial location in the gradient gets divided by 4× more contributions, which shrinks the per-parameter SNR by ~√4 = 2× even though the loss magnitude stays the same. The right LR for 896 with eff. batch 30 is therefore roughly **2× the 448 LR**, not the same. The H4 run was effectively trained at half the appropriate learning rate.
+
+This shows up in the `train/mAP` curve from H4 (queried via MLflow): training mAP is still climbing past epoch 60 (0.788 → 0.857 across epochs 51–79) and only plateaus *because the cosine schedule has already pulled the LR below 5e-6 by then*. At 448, the same architecture saturates `train/mAP` ≥ 0.95 by epoch 50 and overfits the rest of the way. The classifier is **gradient-starved**, not data-starved.
+
+**Trap 2 — Reference cross-attention key set is fixed at 14×14 regardless of input resolution.**
+
+`SpatialCrossAttention.__init__` in `src/wsss/spdnet/model.py` line 119 sets `ref_pool_size=14` unconditionally. At 448² → query feature map is `(B, 256, 56, 56) = 3136` query tokens attending to `14² = 196` keys. At 896² → query is `(B, 256, 112, 112) = 12544` query tokens attending to **the same 196 keys**. The attention bandwidth per query token has dropped 4× — each key now serves on average 64 query positions instead of 16. The softmax temperature implicit in the head dimension `d_k = 64` is unchanged, so the attention distribution becomes **proportionally more peaked at the same Q·K^T scale**. Two consequences:
+
+- The "lazy bias" pattern observed in §5.10.6 (query-invariant attention) is *strictly more dominant* at 896 — fewer keys means the softmax has fewer ways to differentiate query positions, and the easiest classifier-friendly residual is a single shared key for all queries.
+- The gate parameter ends up exposing this bias: at 448 the spatial PV gate converged to 0.499; the H4 highres run did not log gate explicitly, but the `attn_mean` diagnostic (when on) collapsed to 0.998 within 3 epochs of any aux-loss run that touched it (see Trap 3 below) — this is direct evidence that the attention has already collapsed onto a single key.
+
+**Fix (~3 lines)**: scale `ref_pool_size` with image_size, e.g. `ref_pool_size = max(14, image_size // 32)` → 28 at 896. This brings the attention bandwidth per query back to the 448 ratio. Optional: also rescale the attention temperature by `sqrt(N_keys / 196)` to keep the softmax sharpness invariant.
+
+**Trap 3 — `min_lr` floor inversion (FIXED but only after wasting compute).**
+
+The lightning module `configure_optimizers` (lines 444–452) now raises a `ValueError` if `min_lr >= scaled_lr`. This guard was added *during* the highres campaign because the very first H1 run on April 30 wasted ~10 h with `trainer.min_lr=1e-5` while the linear-scaling rule pulled the peak LR to 7.8e-6 (`learning_rate=0.0005 * 4 / 256 = 7.8e-6`). With `eta_min=1e-5 > 7.8e-6`, `CosineAnnealingLR` interpolates *upward* from the warmup peak instead of decaying — the LR climbs from 7.8e-6 to 1e-5 and stays there for 35 epochs, producing the H1 run's stuck-at-mAP-0.71 trajectory. The H4 (clsonly) config used `min_lr=1e-6` and `learning_rate=0.00133` so the inversion didn't fire, but the guard is essential for any future highres run.
+
+**Trap 4 — `image_size_unscaled` artefacts in val transform and CRF settings.**
+
+`src/train_spdnet.py:build_val_transform(image_size)` resizes the short side to `(256/224)*image_size = 1024` before center-cropping to 896. The 448 run's val transform resized to 512 and cropped to 448. **Both the resize ratio and the cropping fraction are the same** (the val transform itself doesn't introduce a relative scale change), so this trap is benign — but is worth confirming because the GT binary masks at `outputs/plantseg_binary_mc115/gt_binary_val/` were generated with `image_size=384` (§5.1.1). The OnlineCAMIoU metric's `_resize_to_gt` step therefore upsamples a 112×112 cam to 384×384, then masks against a 384×384 GT. At 448 the cam was 56×56 → upsample factor 6.86×; at 896 the cam is 112×112 → upsample factor 3.43×. The 896 cam *should* be a strictly better localiser by virtue of needing less interpolation, yet the metric went **down** by 0.005. Combined with Trap 1+2 this is consistent with "the model is gradient-starved AND attention-collapsed", both of which strictly dominate the +1px GT alignment win.
+
+#### 5.14.3 Why localisation got worse — direct attention collapse on every aux-loss run
+
+The H1', H2', and H1 runs all turn on `lambda_ac > 0` and/or `lambda_mask > 0`. Their `train/L_ac_epoch` and `train/attn_mean_epoch` curves show the **identical mode-collapse signature** that §5.13 documented for D1/D4 at 448, but **arriving 5× faster** at 896.
+
+H2' (`597c4c54088144ba97ab1e23efce8d65`, cold from-scratch `d4_ac_safe`):
+
+```
+epoch  attn_mean_epoch  L_ac_epoch     val/cam_iou_best
+1      0.001            -0.001         0.198
+3      0.116            -0.117         0.198
+5      0.690            -0.690         0.198
+7      0.661            -0.661         0.199
+9      0.624            -0.624         0.202   ← attention mass starts redistributing
+11     0.558            -0.557         0.225
+13     0.518            -0.518         0.231
+15     0.490            -0.490         0.226   ← lambda_mask kicks in (warmup ep 15→20)
+17     0.795            -0.795         0.242   ← collapse re-engages
+19     0.985            -0.985         0.270   ← peak "fake" cam_iou at saturated attention
+21     0.991            -0.991         0.260
+…
+49     0.997            -0.997         0.235
+51     0.997            -0.997         0.241
+```
+
+The pattern is the canonical D1 collapse: `attn_mean → 1` (every query attends to exactly one key), `L_ac → −1` (the trivial minimum of `−mean(M)`), `cam_iou` initially looks better because the normalised cam concentrates onto the single attended key but plateaus at 0.24 (basically the same level as cls-only H4). The **only** reason H2' has higher `val/cam_iou_best` than H4 is the saturated-attention transient, not an actual localisation signal — `val/mAP` plateaus at 0.49 (vs H4's 0.84) because the classifier is stuck on top of a one-key attention map.
+
+H1' (warmstart from a 448 D4_ac_safe ckpt that was **already collapsed**) skips the climb and lives at `attn_mean ≈ 0.998` from step 0; `val/cam_iou_best` peaks at 0.284 at epoch 9 then drifts back to 0.27 with negligible mAP movement.
+
+The §5.13.6 root-cause analysis (\(L_{\text{ac}}\) has a trivial minimum at `attn_map = 1` everywhere) is **identical at 896** — the attention regulariser was never going to inject localisation, and at higher resolution the collapse happens faster because the 112×112 → 14×14 attention bottleneck of Trap 2 makes the trivial fixed point an even stronger local optimum.
+
+#### 5.14.4 Headline metrics summary
+
+```
+                              448 baseline      896 (this work)     Δ
+val/mAP  (best, cls-only)     0.888              0.838              −0.050
+val/mAP  (best, eq-only)      0.862              n/a (no eq highres) —
+val/mAP  (best, d2_mask)      0.853              n/a (collapsed)     —
+
+val/cam_iou_best  (eq-only)   0.246              n/a (no eq highres) —
+val/cam_iou_best  (d2_mask)   0.262              0.270 (H1', collapsed-attention transient — not a real signal)
+val/cam_iou_best  (cls-only)  n/a (no metric)    0.241
+
+wall-clock (80 ep, RTX 5090)  ~6.6 h             ~24 h               +3.6×
+```
+
+**Verdict on Phase 5**: doubling resolution did not improve either classification or localisation. Without the four scale fixes above (chiefly the LR rule and the SCA bandwidth), 896² training is strictly worse than 448² for SPDNet. All aux-loss runs at 896 collapsed the attention map within 5 epochs (faster than at 448 because of Trap 2). The H4 cls-only run is the cleanest evidence that **the regression is in the optimisation, not in the auxiliary losses**.
+
+#### 5.14.5 What to try next, ranked by leverage
+
+1. **2× the LR for 896 (DONE — see §5.14.6)** — implemented as an *effective-batch* LR rule (`scaled_lr = base_lr * (batch_size * accumulate_grad_batches) / 256`) plus an explicit `model.learning_rate_override` escape hatch. Verified live in P1 (`phase5_lr_fix_P1_cls_only`): peak `val/mAP` lifted from H4's 0.838 → 0.849 (+1.1 pp) and per-epoch convergence accelerated 1.4–1.5×. The ceiling moved less than expected — see §5.14.6 for the architectural-bound argument.
+2. **Scale `ref_pool_size` with image size (DONE — see §5.14.6)** — `SPDNetModelConfig.ref_pool_size` now defaults to `0` ("auto"), which resolves to `max(14, image_size // 44)` in `train_spdnet.py`. At 896² this yields `rps=20` (400 keys, Q:K = 125:1 vs. 256:1 with rps=14). Direct effect on cls-only iou_best is small (+0.6 pp), but **enables L_mask supervision at 896 to give a much larger leveraged effect** (+6 pp val/cam_iou_auc, see P2 in §5.14.6).
+3. **Re-tune CRF on the H4 cls-only seeds at full res** — the existing CRF parameters (tuned in March on 56×56 classifier seeds) are guaranteed to over-smooth 112×112 seeds. A 200-image sweep on the same seed dump should recover ~3–5 pp disease IoU just from this, mirroring the §5.12.3 finding for probe seeds.
+4. **Re-run the seg-probe pipeline (§5.12) on the H4 ckpt** — the probe lifted the 448 spatial PS+PV ckpt from 32 % to 62 % disease IoU. If the same probe + 15 ep fine-tune lifts the 896 cls-only ckpt to ≥65 %, then the whole "high resolution improves localisation" hypothesis is recoverable; the bottleneck was just the cls-only readout. If it lifts to only ~60 % (i.e. matches the 448 ceiling), then 896 buys nothing fundamental and we can stop scaling resolution.
+5. **Don't run aux-loss highres until fix 1 + fix 2 are in.** Every aux-loss run at 896 will hit the collapse mode 5× faster than at 448; spending compute on the loss specs *while the optimisation is broken* is the same fallacy as §5.13's null result chain. The aux-loss conclusions of §5.13.6 transfer wholesale. **§5.14.6 P2 confirms that with the fixes in and L_mask only (no L_ac, no L_marg_H), there is no collapse and a clean +6 pp cam_iou_auc gain — the conclusion holds.**
+
+#### 5.14.6 Phase-5 LR-Fix Verification Campaign (May 4 – May 6, 2026)
+
+Once Trap 1 (effective-batch LR rule) and Trap 2 (scale-aware `ref_pool_size`) were code-complete (`src/train_spdnet.py`, `src/conf/spdnet.py`, `src/wsss/spdnet/{model,lightning}.py`), `scripts/run_phase5_lr_fix.sh` was launched as a 4-phase verification chain (MLflow experiment `phase5_lr_fix`, ID `421877393125189226`):
+
+- **P1** `phase5_lr_fix_P1_cls_only_20260504` — pure classifier, 60 epochs, batch=6, accum=5 (eff_batch=30), `ref_pool_size=20` (auto), no aux losses. Falsifiability test for Trap 1.
+- **P2** `phase5_lr_fix_P2_aux_mask_only_20260504` — pure pseudo-mask supervision (`λ_mask=0.05`, `mask_combiner=union`, warmup ep 15→20), 80 epochs, batch=4, accum=8 (eff_batch=32). No `L_ac` and no `L_marg_H` — by construction immune to D1-style attention collapse.
+- **P3 / P4** — scheduled but **NOT EXECUTED** (deliberately skipped; user halted P2 at ep 51 once the L_mask gain was empirically clear, and P3/P4 were superseded by the warm-start plan in §5.14.7).
+
+**Headline numbers** (all at `image_size=896`, `fusion_mode=spatial`, `ref_pool_size=20`):
+
+| Run | epochs | LR (peak) | val/mAP final | val/mAP **peak** | val/iou_best final | val/iou_best **peak** | val/iou_auc | train/mAP |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **H6** cls-only (legacy LR rule, baseline) | 80/80 | 3.12e-5 | 0.838 | 0.838 (ep 78) | 0.227 | 0.241 (ep 47) | 0.167 | 0.857 |
+| **P1** cls-only (eff-batch LR fix) | 60/60 | **5.86e-5** | 0.823 | **0.849 (ep 41)** | 0.240 | 0.247 (ep 26) | 0.158 | **0.915** |
+| **P2** mask-only (eff-batch LR + L_mask) | **51/80** (stopped) | **6.25e-5** | 0.686 | 0.709 (ep 47) | 0.270 | **0.284 (ep 21)** | **0.222** | 0.756 |
+| 448 reference: `spdnet_spatial_d2_mask_warmstart` (§5.13.5) | 40 ep warmstart | n/a | 0.853 | 0.853 | 0.262 | 0.262 | n/a | n/a |
+
+**Convergence speed** (epoch where `val/mAP` first crosses the threshold):
+
+| Run | ≥ 0.50 | ≥ 0.70 | ≥ 0.80 | ≥ 0.84 |
+|---|:---:|:---:|:---:|:---:|
+| **H6** (legacy LR) | 18 | 31 | 49 | — never |
+| **P1** (LR fix) | 12 | 19 | 34 | 41 |
+| **P2** (LR fix + L_mask) | 13 | — (stopped) | — | — |
+
+**Key findings**:
+
+1. **Trap 1 fix works for training-fit speed but not for the validation ceiling.** P1 vs H6 is the cleanest possible A/B (same architecture, same image size, same number of epochs of opportunity, only the LR rule differs). Per-epoch convergence is **1.4–1.5× faster** (P1 hits 0.80 val/mAP at ep 34; H6 at ep 49). `train/mAP` lifts from 0.857 → 0.915 (+5.8 pp). But the **val ceiling moves only +1.1 pp** (0.838 → 0.849). This is much less than the 5 pp deficit vs the 448 baseline (`val/mAP=0.888`).
+
+2. **Architectural ceiling at 896² appears to be ~ 0.85 val/mAP, not LR-bound.** The FPN's deepest level is at /32 (= 28×28 at 896²); doubling input resolution gives 4× more *query tokens* in the merged /4 feature map but no extra information at the deepest semantic scale. P1 essentially saturates the 896² classification capacity; further LR scaling is unlikely to close the remaining 4-pp gap to the 448 baseline. Implication: **resolution alone is not the right knob for classification at this architecture** — it's a localisation knob.
+
+3. **Cosine-decay tail overfitting is real on this dataset.** P1's val/mAP drifted from peak 0.849 (ep 41, LR ≈ 1.7e-5) down to 0.823 (ep 60, LR = 1e-6) while train/mAP kept climbing 0.85 → 0.92. The model uses the LR-shrinking phase to memorize train without help to val. The peak checkpoint (`outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/epoch=epoch=40-val_mAP=val/mAP=0.8490.ckpt`) is materially better than the final checkpoint and is the right starting point for any fine-tune. **For future small-dataset highres runs, shorten max_epochs to ~50 or use early stopping on val/mAP.**
+
+4. **Trap 2 fix has a small direct effect on cls-only iou but is essential for L_mask to work cleanly.** P1 (rps=20) vs H6 (rps=14) iou_best peak: 0.247 vs 0.241 = +0.6 pp (within noise). The architectural argument is correct — bandwidth is dominated by the GAP-classifier head, not by SCA — but rps=20 *enables* P2's pseudo-mask supervision to inject a clean signal without saturation: P2 reached cam_iou_auc=0.222 (vs P1 0.158, **+6.4 pp**) and cam_iou_best peak 0.284 (vs P1 0.247, **+3.7 pp**). The same recipe at rps=14 (the H4 baseline) had to compete with a more bandwidth-starved attention map.
+
+5. **L_mask supervision works cleanly at 896² with the trap fixes — the headline localisation result.** P2's `val/cam_iou_best` trajectory in the warmup window (`mask_warmup_start_epoch=15`, `ramp=5`):
+
+   ```
+   epoch  λ_mask  L_mask   val/cam_iou_best
+   15     0.000   0.036    0.220   ← classifier near saturation, mask not yet active
+   17     0.010   0.033    0.239   (+0.018 in 2 epochs as λ_mask just begins)
+   18     0.020   0.032    0.258   (+0.020)
+   19     0.030   0.031    0.275   (+0.017)
+   20     0.040   0.030    0.279   (+0.004 — saturating)
+   21     0.050   0.030    0.284   PEAK (full λ_mask reached)
+   22     0.050   0.029    0.275   stable equilibrium begins
+   ...
+   51     0.050   0.025    0.270   end of run, low-amplitude oscillation only
+   ```
+
+   The +6 pp lift in cam_iou_best is **synchronous with the λ_mask ramp** — clean evidence that L_mask is doing the work, not a confounder. After the ramp the metric stabilises at 0.27–0.28 with std ≈ 0.005 — a stable Pareto equilibrium between L_cls (sharp/discriminative CAM) and L_mask (spatially-covering CAM). **No collapse**: by construction P2 has `λ_ac=0` and `λ_marg_H=0`, so the D1 trivial-fixed-point regime is impossible, and the cam_iou trajectory has no negative drift.
+
+6. **L_mask materially slows classification convergence at 896²**, even with all fixes in. P2's val/mAP at ep 47 is **0.685** vs P1 at the same epoch 0.838 — a 15-pp gap. Train/mAP also lags (0.756 vs 0.915 at ep 47). The configurations differ only by L_mask and per-step batch size; the eff_batch and scaled LR are within 7 % of each other. Loss-magnitude analysis: with `λ_mask=0.05` and `train/L_mask ≈ 0.025`, the mask term contributes ~0.0012 to the loss vs `train/L_cls ≈ 0.003` → mask is ~30 % of the total optimisation pressure. **L_mask at λ=0.05 is a co-objective, not a regulariser.** This motivates §5.14.7's warm-start approach (decouple the two objectives in time, not in loss-coefficient space).
+
+**Acceptance criteria (vs the launcher's pre-declared targets)**:
+
+| Phase | Criterion | Pre-declared target | Actual peak | Verdict |
+|---|---|---|---|---|
+| P1 | `val/mAP` | ≥ 0.85 | 0.849 | **marginal pass** (peak; final 0.823 falls short) |
+| P1 | `val/cam_iou_best` | ≥ 0.24 | 0.247 | **pass** |
+| P2 | `val/mAP` AND `val/cam_iou_best` | ≥ 0.83 AND ≥ 0.27 | 0.709 / 0.284 | **mAP fail, iou strong pass** |
+
+The mAP failure on P2 is **expected and informative** — it's the cost of training L_mask from scratch. P3/P4 were not run because P2 already validated the localisation gain and the next experiment (warm-start) is a much better use of compute.
+
+#### 5.14.7 Optimal path forward — Warm-start fine-tune from the P1 peak checkpoint
+
+The P1+P2 results re-frame the next experiment. Rather than train L_mask from scratch (paying the 15-pp mAP cost during ramp), use **two-stage training**: P1's `epoch=40-val_mAP=0.8490.ckpt` is already a strong 896² classifier; we add localisation supervision on top with a much lower LR.
+
+Three properties make this strictly better than the from-scratch P2 recipe:
+
+1. **The pseudo-mask teacher is sharper at the start.** The combiner `chvar ∪ cam_top-α` depends on the classifier's CAM. At P1's peak the CAM is already at cam_iou_best ≈ 0.247; in P2's from-scratch ep 15 it was ≈ 0.22. A better teacher → a better L_mask gradient signal → a better student.
+2. **No Pareto fight during early training.** The classifier is at its plateau; L_mask becomes additive regularisation rather than a co-objective competing for capacity.
+3. **Can use a more aggressive λ_mask without classification regression**, because the classifier doesn't need to reach its plateau under the new loss landscape — it's already there, and only needs to refine its CAM.
+
+**Existing infrastructure (already wired)**: `train_spdnet.py:253-271` reads `+checkpoint=<path>` as a Hydra override, calls `module.load_state_dict(state_dict, strict=False)`, and **does not load optimizer state** — exactly the right semantics for fine-tuning. Source: implemented during the §5.10 spatial campaign for the eq-only warmstart.
+
+**Predicted outcome**, anchored on P2's ramp window (cam_iou jumped 0.22 → 0.28 in 6 epochs even with a sub-optimal teacher):
+
+- `val/cam_iou_best` ≈ 0.30–0.32 by ep 5–10 of fine-tuning, plateau by ep 15–20.
+- `val/mAP` stays within ±1 pp of P1's peak (0.84–0.85).
+- `val/cam_iou_auc` ≈ 0.25–0.27 (vs P2's 0.222 from scratch).
+- Wallclock per fine-tune: ~8–10 h for 25 epochs at batch=4 accum=8 on the current host; **~4–5 h on a 5090**.
+
+**Concrete planned sweep** (2× RTX 5090 host, two parallel jobs per pair):
+
+| Run name | warm-start ckpt | λ_mask | extras | epochs |
+|---|---|---:|---|---:|
+| `WS_A_lambda005` | P1 ep41 best.ckpt | 0.05 | mask_combiner=union | 25 |
+| `WS_B_lambda010` | P1 ep41 best.ckpt | 0.10 | mask_combiner=union | 25 |
+| `WS_C_lambda005_marg_H` | P1 ep41 best.ckpt | 0.05 | + λ_marg_H=0.005 | 25 |
+
+All three use `learning_rate_override` to set a fine-tune LR ~ `5.86e-5 / 5 ≈ 1.2e-5` (peak), `warmup_epochs=2`, `min_lr=1e-7`, cosine to end-LR.
+
+**Open question**: whether to combine warm-start with a **larger ref_pool_size sweep** (rps ∈ {20, 28, 40}). Argument for: rps=28-40 gives reference-patch sizes (32 px / 22 px) that match the ~30–80 px disease lesion scale better than rps=20 (45 px). Argument against: P1 vs H6 showed only +0.6 pp on the iou direct effect; the dominant gain comes from L_mask leveraging whatever bandwidth is available. **Decision: do an rps ablation as a separate parallel sweep on the second 5090** (cls-only at 896 × rps ∈ {28, 40}, 30 epochs each), keep warm-start runs at rps=20 for direct comparability with P1/P2. Cost: ~12 h per ablation run; total ~1 day on 2 cards.
+
+#### 5.14.8 Compute / host plan
+
+The current host (single 24-32 GB GPU) has run all of §5.13 + §5.14 to completion at high quality but is now compute-rate-limited for the parallel-friendly next phase (warm-start + rps ablation = 4–6 short runs that are mutually independent).
+
+**Selected**: vast.ai 2× RTX 5090 host (each card 32 GB GDDR7, 1.79 TB/s memory bandwidth, ~210 TFLOPS bf16 dense). Rationale:
+
+- Our research plan is embarrassingly parallel — best mapped to two independent concurrent jobs (`CUDA_VISIBLE_DEVICES=0` and `=1`), no DDP needed.
+- Per-card bf16 throughput exceeds A100-PCIe; memory bandwidth is the highest of the three options and helps the 50,176 × 400-1600 attention matmul.
+- 32 GB/card is comfortable for our ceiling configuration (896² × bs=4 × accum=8 × rps=40, peak ~12–15 GB).
+- Vast.ai pricing: 2× 5090 ≈ same hourly cost as a single A100 → 2× concurrent throughput at parity.
+
+**Rejected alternatives**:
+- A100-40G/80G: forces serial execution of the sweep; no advantage for our model size.
+- RTX PRO 5000 Blackwell (48 GB): single-card capacity exceeds need; lower memory bandwidth (1.34 TB/s) than 5090; no parallelism.
+
+**Pre-host-switch checklist**:
+- [ ] Refresh `outputs/phase5_lr_fix.dvc` (NEW; 1.9 GB), `outputs/phase5_highres.dvc` (NEW; pruned), `outputs/spdnet_aux_losses.dvc` (NEW), `mlruns.dvc` (refresh) — see §14.7.
+- [ ] Commit code changes for the four trap fixes + smoke tests + new launcher (see git-staging plan below the §14 update).
+- [ ] On the new host, `dvc pull outputs/phase5_lr_fix.dvc` is the only critical pull for warm-start; the rest are reference baselines.
+
+---
+
 ## 11. How to Reproduce Key Results
 
 ### Binary pipeline
@@ -2220,6 +2505,36 @@ A single big `outputs/spdnet_plantseg.dvc` covers the entire SPDNet experiment f
 | `seg_probe_phase3/` | **678 MB** | **yes** | From-scratch ckpt + scratch_init.pt + eval.json + SUMMARY.md |
 | `*.dvc-friendly small files (eval_summary*.json, *_corrected_refs/...)` | <100 MB | yes | Headline aggregated summaries |
 
+**Aux-loss & high-resolution checkpoints** (`outputs/spdnet_aux_losses/` + `outputs/phase5_highres/`, **NOT YET DVC-TRACKED**):
+
+| Subpath | Size | Critical? | Why |
+|---|---:|---|---|
+| `outputs/spdnet_aux_losses/spdnet_spatial_eq_20260424/` | ~625 MB | **yes** | The eq-only baseline ckpt — warmstart source for the entire D-chain (§5.13.3, §5.13.5) and the only checkpoint with online cam-IoU history. **`val/cam_iou_best=0.246` reference number lives here**. |
+| `outputs/spdnet_aux_losses/spdnet_spatial_d2_mask_warmstart_20260427/` | ~625 MB | **yes** | D2 pseudo-mask intersection — best `val/cam_iou_best=0.262` of the entire aux-loss family (§5.14.4 baseline). Single best aux-loss localisation result. |
+| `outputs/spdnet_aux_losses/spdnet_spatial_d{1,3,4}_*/` (5 dirs) | ~3.1 GB | partly | D1/D3/D4 ablation checkpoints for the §5.13/§5.14 attention-collapse story. Reproducible from the eq-only ckpt + 4 h compute each, but useful if we need to reinspect collapse dynamics. |
+| `outputs/spdnet_aux_losses/spdnet_spatial_eq_con_*` (3 dirs) | ~1.9 GB | partly | The April 23–25 contrastive-loss runs (§5.13.3 chain A/C/F). Same reproducibility profile as D-chain. |
+| `outputs/phase5_highres/spdnet_highres896_clsonly_20260502/checkpoints/last.ckpt` | ~312 MB | **yes** | **The headline H4 ckpt for §5.14**. Cleanest possible 896² classifier. Required for #26 (2×LR test), #27 (SCA bandwidth fix verification), #28 (highres seg-probe pipeline). |
+| `outputs/phase5_highres/spdnet_highres896_clsonly_20260502/checkpoints/best_cam_iou.ckpt` | ~312 MB | **yes** | The epoch where `val/cam_iou_best=0.241` was achieved (ep 47). Not the best mAP but the best localiser of the highres campaign. |
+| `outputs/phase5_highres/spdnet_highres896_clsonly_20260502/checkpoints/epoch=*` (50 dirs) | ~580 MB | NO | Per-epoch checkpoints; redundant with `last.ckpt` + MLflow metric history. **Recommend prune before DVC add.** |
+| `outputs/phase5_highres/spdnet_highres896_clsonly_20260501/` | ~936 MB | partly | 30-ep precursor to H4. Small comparison value; trajectory is fully captured in MLflow. **Recommend not DVC-tracking once H4 is committed.** |
+| `outputs/phase5_highres/spdnet_highres896_cold_d4ac_20260430/` | ~1.9 GB | partly | The collapsed cold from-scratch D4 highres run. Useful for reproducing the collapse signature in §5.14.3 but otherwise low-value. **Keep `last.ckpt` only.** |
+| `outputs/phase5_highres/spdnet_highres896_d4_ac_safe_20260430/` | ~1.9 GB | partly | Warmstart-from-448 highres D4 collapse trace. Same prune rule. |
+| `outputs/phase5_highres/*/config.yaml` | < 10 KB | **yes** | Per-run Hydra config. Required for any reproduction. |
+
+**Phase-5 LR-fix verification family** (`outputs/phase5_lr_fix/`, **NEW, NOT YET DVC-TRACKED**, §5.14.6 — *critical for warm-start fine-tune on the new host*):
+
+| Subpath | Size | Critical? | Why |
+|---|---:|---|---|
+| `outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/best_cam_iou.ckpt` | ~312 MB | **yes** | P1 best-iou checkpoint (val/cam_iou_best=0.247 @ ep 26). Useful for the §5.14.7 warm-start sweep "C" variant (warmstart from best-iou rather than best-mAP). |
+| `outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/epoch=epoch=40-val_mAP=val/mAP=0.8490.ckpt` | ~312 MB | **yes** | **The headline P1 peak checkpoint (val/mAP=0.849 @ ep 41).** This is the warm-start source for §5.14.7's WS_A/WS_B/WS_C sweep — the single most critical file to push to DVC before host switch. |
+| `outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/last.ckpt` | ~312 MB | partly | P1 final epoch (val/mAP=0.823, post-cosine drift). Lower priority than `epoch=40-...` because the peak ckpt is strictly better. Keep for completeness. |
+| `outputs/phase5_lr_fix/phase5_lr_fix_P2_aux_mask_only_20260504/checkpoints/best_cam_iou.ckpt` | ~312 MB | **yes** | P2 best-iou checkpoint (val/cam_iou_best=0.284 @ ep 21). The strongest 896² *trained-from-scratch* localiser to date — useful as a baseline for warm-start ablations. |
+| `outputs/phase5_lr_fix/phase5_lr_fix_P2_aux_mask_only_20260504/checkpoints/epoch=epoch=47-val_mAP=val/mAP=0.7089.ckpt` | ~312 MB | partly | P2 best-mAP checkpoint (val/mAP=0.709 @ ep 47). Useful only if comparing classification trade-offs; otherwise redundant with the best-iou ckpt. |
+| `outputs/phase5_lr_fix/phase5_lr_fix_P2_aux_mask_only_20260504/checkpoints/last.ckpt` | ~312 MB | partly | P2 final logged epoch (51) before user halt. Same priority as P1 last.ckpt. |
+| `outputs/phase5_lr_fix/*/checkpoints/epoch=epoch=NN-val_mAP=val/` (empty wrappers) | 0 B | NO | **Lightning checkpoint-naming bug** — `val/mAP` template creates a path with a literal slash, generating empty parent directories `epoch=epoch=NN-val_mAP=val/` containing the actual `mAP=0.xxxx.ckpt` file. The 6 checkpoint files above are the only actual content; the dozens of empty `epoch=*` directories are redundant and **should be pruned before `dvc add`** (cosmetic only, but cleaner). |
+| `outputs/phase5_lr_fix/*/config.yaml` | < 10 KB | **yes** | Per-run Hydra config (records `model.ref_pool_size=20`, `learning_rate_override` if set, λ_mask, warmup, etc.). Required to reproduce the exact LR rule and warm-up schedule. |
+| `outputs/phase5_lr_fix/*/.hydra/` | < 100 KB | partly | Hydra resolved overrides + override.yaml; useful for forensics if config.yaml ever drifts. |
+
 ### 14.3 Evaluation artifacts (small, must be in DVC)
 
 These small JSON/MD files are the headline numbers everyone looks at first. All live inside `outputs/spdnet_plantseg/` and are therefore covered by `outputs/spdnet_plantseg.dvc`.
@@ -2255,9 +2570,9 @@ These small JSON/MD files are the headline numbers everyone looks at first. All 
 
 If you need the raw logs for forensics they live under `logs/` on the machine that ran the pipeline, but they are out of scope for reproducibility.
 
-### 14.7 Refresh-and-push checklist (after the probe pipeline)
+### 14.7 Refresh-and-push checklist (after the probe pipeline + Phase 5 highres + Phase 5 LR-fix verification)
 
-Run these in order from the repo root:
+Run these in order from the repo root, **before switching hosts** to the 2× RTX 5090 vast.ai box (§5.14.8):
 
 ```bash
 # Activate venv (DVC is venv-installed)
@@ -2266,22 +2581,56 @@ export PATH="/venv/main/bin:$PATH"
 # 1) Refresh the SPDNet outputs pointer (now includes seg_probe_phase{1,2,3}/)
 dvc add outputs/spdnet_plantseg
 
-# 2) Refresh MLflow runs (probe runs were logged to a sub-experiment)
+# 2) Add the aux-loss checkpoint family (eq-only baseline + D-chain).
+#    Headline ckpt: outputs/spdnet_aux_losses/spdnet_spatial_eq_20260424/checkpoints/
+#    Single best localiser of this family: spdnet_spatial_d2_mask_warmstart_20260427.
+#    NOTE: ~6.5 GB total; consider whether all 8 ablation checkpoints are needed or
+#    if the eq-only + d2_mask + 1-2 representative collapse runs are sufficient.
+dvc add outputs/spdnet_aux_losses
+
+# 3) Add Phase 5 highres outputs (§5.14). PRUNE epoch=*/ before adding.
+#    Worth keeping per run: config.yaml + checkpoints/last.ckpt + checkpoints/best_cam_iou.ckpt
+#    Drop: per-epoch checkpoints (50 dirs in clsonly_20260502 alone, ~580 MB).
+#    See §14.2 Phase 5 breakdown for the full size accounting.
+for d in outputs/phase5_highres/*/checkpoints; do
+    find "$d" -mindepth 1 -maxdepth 1 -type d -name 'epoch=*' -exec rm -rf {} +
+done
+dvc add outputs/phase5_highres
+
+# 4) **NEW** — Add Phase 5 LR-fix outputs (§5.14.6). PRUNE the empty epoch=epoch=* dirs first.
+#    Worth keeping: 6 actual .ckpt files (~1.9 GB total) + config.yaml + .hydra/ per run.
+#    The dozens of empty `epoch=epoch=NN-val_mAP=val/` parent dirs are a Lightning naming
+#    bug; their content (the actual `mAP=0.xxxx.ckpt` files) is what `last.ckpt` and
+#    `best_cam_iou.ckpt` already symlink to. Pruning is cosmetic but keeps the artifact tidy.
+for d in outputs/phase5_lr_fix/*/checkpoints; do
+    find "$d" -mindepth 1 -maxdepth 1 -type d -name 'epoch=epoch=*' -empty -exec rmdir {} + 2>/dev/null || true
+done
+dvc add outputs/phase5_lr_fix
+
+# 5) Refresh MLflow runs (probe runs + aux-loss D-chain + phase5_highres + phase5_lr_fix
+#    + phase5_lr_fix_smoke). The total mlruns/ is ~7.4 GB now.
 dvc add mlruns
 
-# 3) (No new visualizations were produced by the probes — viz pointer is unchanged)
-# 4) (Pipeline logs are intentionally NOT tracked — see Section 14.6)
+# 6) (No new visualizations from the probes / phase5 — viz pointer is unchanged)
+# 7) (Pipeline logs are intentionally NOT tracked — see Section 14.6)
 
-# 5) Commit pointer files (autostage=true means dvc add already `git add`-ed them)
-git add RESEARCH_CONTEXT.md
-git commit -m "probe pipeline: results + DVC refresh (62% upper bound)"
+# 8) Commit pointer files (DVC autostages them; pointer files are tiny YAML).
+git add RESEARCH_CONTEXT.md \
+    outputs/spdnet_plantseg.dvc \
+    outputs/spdnet_aux_losses.dvc \
+    outputs/phase5_highres.dvc \
+    outputs/phase5_lr_fix.dvc \
+    mlruns.dvc
+git commit -m "phase5 lr-fix verification (P1+P2) + RESEARCH_CONTEXT §5.14.6/§5.14.7"
 
-# 6) Push DVC blobs to remote
+# 9) Push DVC blobs to remote (this is the slow step — ~16 GB new content total).
 dvc push
 
-# 7) Push git history
+# 10) Push git history.
 git push
 ```
+
+**Total new DVC blob volume**: ~1.9 GB (`phase5_lr_fix`) + ~5.0 GB (`phase5_highres` after prune) + ~6.5 GB (`spdnet_aux_losses`) + delta on `mlruns` (~1 GB new) ≈ **14–15 GB to push** before host switch.
 
 ### 14.8 One-shot pull on a fresh machine
 
@@ -2300,10 +2649,21 @@ dvc pull data/plantsegv3.dvc data/plant-village.dvc pretrained.dvc
 # SPDNet experiment family — checkpoints + probe phases + eval (~36 GB)
 dvc pull outputs/spdnet_plantseg.dvc
 
+# **CRITICAL for the 2× 5090 host: the warm-start checkpoint** (~1.9 GB) — §5.14.7 sweep starting point.
+dvc pull outputs/phase5_lr_fix.dvc
+
+# Aux-loss D-chain family (~6.5 GB) — required to reproduce §5.13 + §5.14 figures
+dvc pull outputs/spdnet_aux_losses.dvc
+
+# Phase 5 highres family (~5 GB after pruning, ~7.5 GB unpruned) — H4/H6 baselines.
+dvc pull outputs/phase5_highres.dvc
+
 # Visualizations (~1.5 GB)
 dvc pull outputs/visualizations.dvc
 
 # MLflow tracking (~8 GB) — needed for time-series and the MLflow MCP tool
+#   Now includes phase5_highres (115309098075776200), phase5_lr_fix (421877393125189226),
+#   phase5_lr_fix_smoke (540180262716932031), and the spdnet_aux_losses D-chain.
 dvc pull mlruns.dvc
 
 # Optional: also pull MCTformer/baseline checkpoints (~30 GB)
@@ -2315,4 +2675,42 @@ After the pull, verify with:
 ```bash
 cat outputs/spdnet_plantseg/seg_probe_phase{1,2,3}/SUMMARY.md
 ls outputs/spdnet_plantseg/seg_probe_phase{1,2,3}/**/eval.json
+ls outputs/spdnet_aux_losses/spdnet_spatial_eq_20260424/checkpoints/  # eq-only baseline
+ls outputs/spdnet_aux_losses/spdnet_spatial_d2_mask_warmstart_20260427/checkpoints/  # best aux-loss localiser
+ls outputs/phase5_highres/spdnet_highres896_clsonly_20260502/checkpoints/  # H4 headline
+ls outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/  # P1 peak (warm-start source)
+ls outputs/phase5_lr_fix/phase5_lr_fix_P2_aux_mask_only_20260504/checkpoints/  # P2 best-iou (mask-only baseline)
+```
+
+**Smoke-launch the warm-start sweep on the new host** (single 5090 — both jobs would also fit on one 32 GB card if memory allows, but parallelism on 2× 5090 is the intended regime):
+
+```bash
+# Card 0: WS_A (λ_mask=0.05)
+CUDA_VISIBLE_DEVICES=0 python -m src.train_spdnet \
+    +checkpoint=outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/best_cam_iou.ckpt \
+    run_name=WS_A_lambda005 experiment_name=phase5_warmstart \
+    model.fusion_mode=spatial model.input_size=896 model.ref_pool_size=20 \
+    model.learning_rate_override=1.2e-5 \
+    trainer.max_epochs=25 trainer.warmup_epochs=2 trainer.min_lr=1e-7 \
+    trainer.precision=bf16-mixed trainer.accumulate_grad_batches=8 \
+    data.image_size=896 data.batch_size=4 data.num_workers=4 \
+    losses.lambda_eq=0 losses.lambda_con=0 losses.lambda_distill=0 \
+    losses.lambda_ac=0 losses.lambda_marg_H=0 \
+    losses.lambda_mask=0.05 losses.mask_combiner=union \
+    losses.mask_warmup_start_epoch=0 losses.mask_warmup_epochs=0 \
+    losses.online_loc_eval_enabled=true &
+
+# Card 1: rps ablation control (cls-only at rps=40)
+CUDA_VISIBLE_DEVICES=1 python -m src.train_spdnet \
+    run_name=rps40_cls_only experiment_name=phase5_rps_ablation \
+    model.fusion_mode=spatial model.input_size=896 model.ref_pool_size=40 \
+    model.learning_rate=0.0005 \
+    trainer.max_epochs=30 trainer.warmup_epochs=5 trainer.min_lr=1e-6 \
+    trainer.precision=bf16-mixed trainer.accumulate_grad_batches=8 \
+    data.image_size=896 data.batch_size=4 data.num_workers=4 \
+    losses.lambda_eq=0 losses.lambda_con=0 losses.lambda_distill=0 \
+    losses.lambda_ac=0 losses.lambda_marg_H=0 losses.lambda_mask=0 \
+    losses.online_loc_eval_enabled=true &
+
+wait
 ```

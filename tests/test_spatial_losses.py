@@ -26,6 +26,10 @@ from src.wsss.spdnet.model import SPDNet
 from src.wsss.spdnet.spatial_losses import (
     EMATeacher,
     ProjectionHead,
+    attention_argmax_share_loss,
+    attention_concentration_loss,
+    attention_marginal_entropy_loss,
+    cam_pseudo_mask_loss,
     equivariance_loss,
     patch_contrastive_loss,
     self_distillation_loss,
@@ -1087,3 +1091,1294 @@ class TestSpatialLossesIntegration:
             for p, p0 in zip(teacher.teacher.parameters(), snapshot)
         )
         assert moved > 0, "EMA update did not change teacher params"
+
+
+# ---------------------------------------------------------------------------
+# D1: Attention concentration regulariser
+# ---------------------------------------------------------------------------
+
+
+class TestAttentionConcentrationLoss:
+    """Covers the D1 attention-concentration regulariser invariants.
+
+    Listed as (AC1)-(AC6) in RESEARCH_CONTEXT.md §5.13.7 "D1 design".
+    """
+
+    def test_AC1_uniform_map_loss_is_zero(self) -> None:
+        """attn_map == 0 everywhere (the actual uniform-attention fixed
+        point the SCA converges to) -> loss == 0."""
+        attn = torch.zeros(2, 8, 8)
+        loss = attention_concentration_loss(attn)
+        assert loss.item() == 0.0
+
+    def test_AC2_perfectly_peaked_map_loss_is_minus_one(self) -> None:
+        """attn_map == 1 everywhere (every query attends to a single key)
+        -> loss == -1, the global minimum."""
+        attn = torch.ones(2, 8, 8)
+        loss = attention_concentration_loss(attn)
+        assert loss.item() == pytest.approx(-1.0, abs=1e-7)
+
+    def test_AC3_monotonic_in_mean(self) -> None:
+        """Loss strictly decreases as mean concentration grows (the
+        regulariser has no spurious plateau)."""
+        means = [0.1, 0.3, 0.5, 0.7, 0.9]
+        losses = [
+            attention_concentration_loss(torch.full((1, 4, 4), m)).item()
+            for m in means
+        ]
+        for lo, hi in zip(losses, losses[1:]):
+            assert hi < lo, (
+                f"loss must decrease as concentration grows; got {losses}"
+            )
+
+    def test_AC4_matches_minus_mean(self) -> None:
+        """Exact numeric identity L_ac = -mean(attn_map) for random input."""
+        torch.manual_seed(7)
+        attn = torch.rand(3, 8, 8)
+        loss = attention_concentration_loss(attn)
+        assert torch.allclose(loss, -attn.mean())
+
+    def test_AC5_gradient_flows_through_attn_map(self) -> None:
+        """Backward must write non-zero grads into the ``attn_map`` tensor
+        (which in production carries the SCA in-proj weights)."""
+        torch.manual_seed(8)
+        attn = torch.rand(2, 8, 8, requires_grad=True)
+        loss = attention_concentration_loss(attn)
+        loss.backward()
+        assert attn.grad is not None
+        # ``-1 / (B*H*W)`` on every element; very small but identical.
+        expected = -1.0 / (2 * 8 * 8)
+        assert torch.allclose(attn.grad, torch.full_like(attn.grad, expected))
+
+    def test_AC6_wrong_shape_raises(self) -> None:
+        attn = torch.rand(2, 4, 8, 8)  # 4D
+        with pytest.raises(ValueError, match=r"\(B, H, W\)"):
+            attention_concentration_loss(attn)
+        attn = torch.rand(8, 8)        # 2D
+        with pytest.raises(ValueError, match=r"\(B, H, W\)"):
+            attention_concentration_loss(attn)
+
+    def test_AC7_integrates_with_spdnet_forward(self) -> None:
+        """End-to-end: a real SPDNet spatial forward returns ``attn_map``
+        with live grad that propagates back to the SCA in-proj weights
+        via ``attention_concentration_loss``."""
+        torch.manual_seed(9)
+        student = SPDNet(
+            num_classes=4, fpn_channels=16, pretrained=False,
+            fusion_mode="spatial",
+        )
+        q = torch.randn(2, 3, 64, 64)
+        r = torch.randn(2, 3, 64, 64)
+        feats = student.extract_merged_features(q, r, return_attn=True)
+        attn = feats["attn_map"]
+        # Numerical sanity: on a random init the concentration should sit
+        # well below the peak (this model hasn't been trained to concentrate).
+        assert 0.0 <= attn.mean().item() <= 1.0
+        loss = attention_concentration_loss(attn)
+        loss.backward()
+        # At least one SCA in-proj weight gets a grad.
+        g = student.spatial_attn.cross_attn.in_proj_weight.grad
+        assert g is not None and g.abs().sum().item() > 0, (
+            "L_ac must update the SCA attention in-projection weights"
+        )
+
+
+# ---------------------------------------------------------------------------
+# D2: Pseudo-mask CAM supervision
+# ---------------------------------------------------------------------------
+
+
+class TestCAMPseudoMaskLoss:
+    """Covers the D2 pseudo-mask CAM loss invariants.
+
+    Listed as (PM1)-(PM9) in RESEARCH_CONTEXT.md §5.13.7 "D2 design".
+    """
+
+    @staticmethod
+    def _make_inputs(B: int = 2, C: int = 4, Cin: int = 8, Hf: int = 8):
+        """Build ``(p3, p4, cls_weight, labels)`` for the pseudo-mask loss."""
+        torch.manual_seed(17)
+        p3 = torch.randn(B, Cin, Hf, Hf, requires_grad=True)
+        p4 = torch.randn(B, Cin, Hf, Hf, requires_grad=True)
+        cls_weight = torch.randn(C, Cin, requires_grad=True)
+        labels = _disjoint_labels(B, C)
+        return p3, p4, cls_weight, labels
+
+    def test_PM1_no_active_labels_returns_grad_preserving_zero(self) -> None:
+        p3, p4, cls_w, _ = self._make_inputs()
+        labels = torch.zeros(p3.shape[0], cls_w.shape[0])  # all-zero labels
+        loss = cam_pseudo_mask_loss(p3, p4, cls_w, labels)
+        assert loss.item() == 0.0
+        loss.backward()  # must not raise; grad chain intact
+        assert p4.grad is not None
+
+    def test_PM2_invalid_alpha_beta_raises(self) -> None:
+        p3, p4, cls_w, labels = self._make_inputs()
+        with pytest.raises(ValueError, match="alpha_pos"):
+            cam_pseudo_mask_loss(p3, p4, cls_w, labels, alpha_pos=0.0)
+        with pytest.raises(ValueError, match="alpha_pos"):
+            cam_pseudo_mask_loss(p3, p4, cls_w, labels, alpha_pos=1.0)
+        with pytest.raises(ValueError, match="beta_neg"):
+            cam_pseudo_mask_loss(p3, p4, cls_w, labels, beta_neg=0.0)
+        with pytest.raises(ValueError, match="beta_neg"):
+            cam_pseudo_mask_loss(p3, p4, cls_w, labels, beta_neg=1.0)
+        with pytest.raises(ValueError, match=r"alpha_pos \+ beta_neg"):
+            cam_pseudo_mask_loss(
+                p3, p4, cls_w, labels, alpha_pos=0.5, beta_neg=0.5,
+            )
+
+    def test_PM3_pos_and_neg_masks_are_disjoint(self) -> None:
+        """Per-image, pos and neg masks must never overlap (the loss would
+        otherwise be self-contradictory at those pixels)."""
+        # Construct chvar to have many ties at exactly the threshold so
+        # disjointness is enforced by the post-processing, not by pure
+        # strict-inequality on the thresholds. Build p3 so that
+        # ``chvar = Var_c(p3)`` has a plateau.
+        B, Cin, Hf = 2, 4, 8
+        # Make the first 16 positions of each image have identical chvar
+        # (pick them via the plateau), rest have higher chvar.
+        p3 = torch.zeros(B, Cin, Hf, Hf)
+        # Insert a per-position-level offset that makes the plateau fall
+        # exactly at the boundary between positives (top-alpha) and
+        # negatives (bottom-beta): alpha=0.25, beta=0.5 on 64 positions
+        # -> k_pos=16 (top 16), k_neg=32 (bot 32), 16 remain unsupervised.
+        flat = torch.arange(Hf * Hf, dtype=torch.float32).view(Hf, Hf)
+        # Broadcast into p3 via channel 0 so Var_c(p3) == flat / Cin roughly.
+        p3[:, 0] = flat
+        p3[:, 1] = -flat
+        p3[:, 2] = torch.zeros_like(flat)
+        p3[:, 3] = torch.zeros_like(flat)
+
+        p4 = torch.randn(B, Cin, Hf, Hf)
+        cls_w = torch.randn(4, Cin)
+        labels = _disjoint_labels(B, 4)
+
+        # Access the internal masks by reconstructing them exactly the way
+        # the loss does. (We don't have a direct hook, so we replay the
+        # top-alpha/bottom-beta logic.)
+        chvar = p3.detach().var(dim=1, unbiased=False).flatten(1)
+        P = chvar.shape[1]
+        k_pos = max(1, int(round(0.25 * P)))
+        k_neg = max(1, int(round(0.50 * P)))
+        from src.wsss.spdnet.spatial_losses import _kth_threshold
+        thr_pos = _kth_threshold(chvar, k_pos, largest=True)
+        thr_neg = _kth_threshold(chvar, k_neg, largest=False)
+        pos = (chvar >= thr_pos).float()
+        neg = (chvar <= thr_neg).float()
+        # Apply the same "pos *= 1 - neg" step the loss does. After this
+        # there must be no overlap.
+        pos = pos * (1 - neg)
+        overlap = (pos * neg).sum().item()
+        assert overlap == 0.0, (
+            f"pos and neg overlap by {overlap} positions after disjointness "
+            f"filter"
+        )
+
+        # Smoke-level: the loss itself runs without NaN.
+        loss = cam_pseudo_mask_loss(p3, p4, cls_w, labels)
+        assert torch.isfinite(loss)
+
+    def test_PM4_perfect_alignment_gives_zero_loss(self) -> None:
+        """If cam_norm == target exactly at every supervised position the
+        loss must be 0."""
+        B, Cin, Hf = 2, 4, 8
+        P = Hf * Hf
+        # Build chvar via p3 so the top-alpha positions are the first 16
+        # flattened positions (highest-index indices after argsort).
+        # Easiest: make Var_c(p3) = flat index.
+        p3 = torch.zeros(B, Cin, Hf, Hf)
+        flat = torch.arange(P, dtype=torch.float32).view(Hf, Hf)
+        p3[:, 0] = flat
+        p3[:, 1] = -flat
+        # alpha=0.25 -> k_pos=16 (positions 48..63)
+        # beta=0.5  -> k_neg=32 (positions  0..31)
+
+        # Craft p4 so CAM(active) hits exactly those positions.
+        # CAM[b, c] = sum_c' cls_weight[c, c'] * p4[b, c']
+        # For the active class (index 0 for b=0, 1 for b=1), set
+        # cls_weight[active_c] = [1, 0, 0, ...] and place p4[:, 0]
+        # equal to the target mask.
+        target = torch.zeros(B, Hf, Hf)
+        target.view(B, -1)[:, 48:] = 1.0
+        # After per-image min-max norm, p4_c0 = target gives cam_norm = target.
+        p4 = torch.zeros(B, Cin, Hf, Hf)
+        p4[:, 0] = target
+        cls_w = torch.zeros(4, Cin)
+        cls_w[0, 0] = 1.0
+        cls_w[1, 0] = 1.0  # b=1 active class is also class 1 in disjoint labels
+        labels = _disjoint_labels(B, 4)
+        # Disable intersection: with intersection the top-alpha of the CAM
+        # must also land in top-alpha positions, which is satisfied here,
+        # but the test is simpler with intersection=False.
+        loss = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels,
+            alpha_pos=0.25, beta_neg=0.5, use_intersection=False,
+        )
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_PM5_worst_alignment_gives_one(self) -> None:
+        """If cam_norm is 1 at all negatives and 0 at all positives the
+        MSE is exactly 1.0 on every supervised pixel -> total == 1."""
+        B, Cin, Hf = 2, 4, 8
+        P = Hf * Hf
+        p3 = torch.zeros(B, Cin, Hf, Hf)
+        flat = torch.arange(P, dtype=torch.float32).view(Hf, Hf)
+        p3[:, 0] = flat
+        p3[:, 1] = -flat
+
+        # Build an anti-aligned CAM: 1 where target says 0, 0 where target says 1.
+        target = torch.zeros(B, Hf, Hf)
+        target.view(B, -1)[:, 48:] = 1.0
+        anti = 1.0 - target
+        p4 = torch.zeros(B, Cin, Hf, Hf)
+        p4[:, 0] = anti
+        cls_w = torch.zeros(4, Cin)
+        cls_w[0, 0] = 1.0
+        cls_w[1, 0] = 1.0
+        labels = _disjoint_labels(B, 4)
+        loss = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels,
+            alpha_pos=0.25, beta_neg=0.5, use_intersection=False,
+        )
+        assert loss.item() == pytest.approx(1.0, abs=1e-6)
+
+    def test_PM6_grad_through_p4_and_cls_weight(self) -> None:
+        p3, p4, cls_w, labels = self._make_inputs()
+        loss = cam_pseudo_mask_loss(p3, p4, cls_w, labels)
+        loss.backward()
+        assert p4.grad is not None and p4.grad.abs().sum().item() > 0
+        assert cls_w.grad is not None and cls_w.grad.abs().sum().item() > 0
+
+    def test_PM7_no_grad_through_p3_query(self) -> None:
+        """p3_query is only used for the (detached) seed mask; its grad must
+        be None after backward to prevent the feature-extractor from being
+        dragged by the pseudo-mask target (that would turn the loss into a
+        fixed point)."""
+        p3, p4, cls_w, labels = self._make_inputs()
+        p3.retain_grad()
+        loss = cam_pseudo_mask_loss(p3, p4, cls_w, labels)
+        loss.backward()
+        # Either grad is None or grad == 0 -- both satisfy the "chvar side is
+        # detached" contract. (Autograd allocates a zero grad when the tensor
+        # is unused but retain_grad is set.)
+        if p3.grad is not None:
+            assert p3.grad.abs().sum().item() == 0.0, (
+                f"p3_query must be detached in chvar seed computation; "
+                f"grad_abs_sum={p3.grad.abs().sum().item()}"
+            )
+
+    def test_PM8_intersection_shrinks_or_equals_positive_mask(self) -> None:
+        """With ``use_intersection=True`` the positive set is the AND of
+        chvar and CAM tops; it cannot be larger than the chvar-only version."""
+        B, Cin, Hf = 2, 4, 8
+        torch.manual_seed(23)
+        p3 = torch.randn(B, Cin, Hf, Hf)
+        p4 = torch.randn(B, Cin, Hf, Hf)
+        cls_w = torch.randn(4, Cin)
+        labels = _disjoint_labels(B, 4)
+        # Replicate the loss's inner mask construction for both variants.
+        chvar = p3.detach().var(dim=1, unbiased=False).flatten(1)
+        P = chvar.shape[1]
+        k_pos = max(1, int(round(0.25 * P)))
+        from src.wsss.spdnet.spatial_losses import _kth_threshold
+        thr_pos = _kth_threshold(chvar, k_pos, largest=True)
+        pos_chvar = (chvar >= thr_pos).view(B, Hf, Hf).float()
+
+        # CAM top-alpha (per loss's normalisation)
+        S_full = torch.einsum("nc,bchw->bnhw", cls_w, p4)
+        active = labels.argmax(dim=1)
+        idx = active[:, None, None, None].expand(-1, 1, Hf, Hf)
+        cam_act = torch.gather(S_full, 1, idx).squeeze(1)
+        cam_flat = cam_act.flatten(1)
+        mn = cam_flat.amin(dim=1, keepdim=True)
+        mx = cam_flat.amax(dim=1, keepdim=True)
+        cam_norm = ((cam_flat - mn) / (mx - mn + 1e-8)).view(B, Hf, Hf)
+        thr_cam = _kth_threshold(cam_norm.flatten(1), k_pos, largest=True)
+        pos_cam = (cam_norm.flatten(1) >= thr_cam).view(B, Hf, Hf).float()
+
+        inter = pos_chvar * pos_cam
+        assert inter.sum().item() <= pos_chvar.sum().item()
+
+    def test_PM9_constant_cam_does_not_nan(self) -> None:
+        """If the CAM is constant (min == max), per-image min-max norm
+        divides by a near-zero denominator -> must be numerically stable."""
+        B, Cin, Hf = 2, 4, 8
+        p3 = torch.randn(B, Cin, Hf, Hf)
+        # Classifier -> constant CAM means p4 has a null projection onto
+        # cls_weight[active]. Easiest: set cls_weight to zero; then CAM == 0.
+        p4 = torch.randn(B, Cin, Hf, Hf, requires_grad=True)
+        cls_w = torch.zeros(4, Cin)
+        labels = _disjoint_labels(B, 4)
+        loss = cam_pseudo_mask_loss(p3, p4, cls_w, labels)
+        assert torch.isfinite(loss), f"constant CAM produced non-finite loss: {loss}"
+
+
+# ---------------------------------------------------------------------------
+# D3: L_con union anchors
+# ---------------------------------------------------------------------------
+
+
+class TestPatchContrastiveUnionAnchors:
+    """Covers the D3 union-anchor variant of ``patch_contrastive_loss``.
+
+    Listed as (UN1)-(UN5) in RESEARCH_CONTEXT.md §5.13.7 "D3 design".
+    """
+
+    @staticmethod
+    def _make_inputs(B: int = 3, C: int = 4, Cin: int = 8, Hf: int = 8, seed: int = 0):
+        torch.manual_seed(seed)
+        p3 = torch.randn(B, Cin, Hf, Hf, requires_grad=True)
+        p4 = torch.randn(B, Cin, Hf, Hf, requires_grad=True)
+        cls_weight = torch.randn(C, Cin, requires_grad=True)
+        labels = _disjoint_labels(B, C)
+        proj = ProjectionHead(in_channels=Cin, out_channels=Cin * 2)
+        return p3, p4, cls_weight, labels, proj
+
+    def test_UN1_classifier_default_is_backward_compatible(self) -> None:
+        """Calling without ``anchor_source`` must produce the same result
+        as explicitly passing ``anchor_source="classifier"``."""
+        p3, p4, cls_w, labels, proj = self._make_inputs()
+        loss_default = patch_contrastive_loss(
+            p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+        )
+        loss_cls = patch_contrastive_loss(
+            p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+            anchor_source="classifier",
+        )
+        assert torch.allclose(loss_default, loss_cls)
+
+    def test_UN2_union_differs_from_classifier_when_sources_disagree(self) -> None:
+        """Cook up inputs where classifier score and chvar saliency rank
+        positions differently (negatively correlated), then verify the
+        union anchors select a different set -> different loss."""
+        B, C, Cin, Hf = 2, 4, 8, 8
+        torch.manual_seed(3)
+        # Build p3 with a fixed chvar pattern that prefers the top-left.
+        p3 = torch.zeros(B, Cin, Hf, Hf, requires_grad=True)
+        p3.data[:, 0, :4, :4] = 5.0  # high chvar in top-left 4x4
+        p3.data[:, 1, :4, :4] = -5.0
+        # Build p4 so classifier score prefers bottom-right 4x4.
+        p4 = torch.zeros(B, Cin, Hf, Hf, requires_grad=True)
+        p4.data[:, 0, 4:, 4:] = 5.0
+        cls_w = torch.zeros(C, Cin); cls_w[0, 0] = 1.0; cls_w[1, 0] = 1.0
+        cls_w.requires_grad = True
+        labels = _disjoint_labels(B, C)
+        proj = ProjectionHead(in_channels=Cin, out_channels=Cin * 2)
+        l_cls = patch_contrastive_loss(
+            p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+            anchor_source="classifier",
+        )
+        l_union = patch_contrastive_loss(
+            p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+            anchor_source="union_cls_chvar",
+        )
+        assert not torch.allclose(l_cls, l_union, atol=1e-4), (
+            "union anchors must produce a DIFFERENT loss from classifier-only "
+            "when the two sources disagree on ranking"
+        )
+
+    def test_UN3_invalid_source_raises(self) -> None:
+        p3, p4, cls_w, labels, proj = self._make_inputs()
+        with pytest.raises(ValueError, match="anchor_source="):
+            patch_contrastive_loss(
+                p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+                anchor_source="does_not_exist",
+            )
+
+    def test_UN4_union_gradient_flows_through_proj(self) -> None:
+        p3, p4, cls_w, labels, proj = self._make_inputs()
+        loss = patch_contrastive_loss(
+            p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+            anchor_source="union_cls_chvar",
+        )
+        loss.backward()
+        assert proj.conv.weight.grad is not None
+        assert proj.conv.weight.grad.abs().sum().item() > 0
+
+    def test_UN5_when_rankings_agree_union_matches_classifier(self) -> None:
+        """If classifier rank and chvar rank are the same permutation,
+        ``torch.maximum(rank_cls, rank_cv) == rank_cls == rank_cv``, so
+        union anchor set == classifier anchor set (up to ties)."""
+        B, C, Cin, Hf = 2, 4, 4, 4  # small enough to avoid ties
+        torch.manual_seed(5)
+        # Build p3 and p4 so their channel structure forces the same ranking.
+        base = torch.arange(Hf * Hf, dtype=torch.float32).view(Hf, Hf)
+        p3 = torch.zeros(B, Cin, Hf, Hf, requires_grad=True)
+        # Var(p3[:, :]) = (var of row across Cin channels). Put ``base``
+        # into channel 0 with zero elsewhere -> Var == base^2 / Cin (roughly).
+        p3.data[:, 0] = base.unsqueeze(0).expand(B, Hf, Hf)
+        p4 = torch.zeros(B, Cin, Hf, Hf, requires_grad=True)
+        p4.data[:, 0] = base.unsqueeze(0).expand(B, Hf, Hf)
+        cls_w = torch.zeros(C, Cin); cls_w[0, 0] = 1.0; cls_w[1, 0] = 1.0
+        cls_w.requires_grad = True
+        labels = _disjoint_labels(B, C)
+        proj = ProjectionHead(in_channels=Cin, out_channels=Cin * 2)
+        l_cls = patch_contrastive_loss(
+            p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+            anchor_source="classifier",
+        )
+        l_union = patch_contrastive_loss(
+            p3, p4, cls_w, labels, proj, top_k=4, m_negatives=8,
+            anchor_source="union_cls_chvar",
+        )
+        # Not exactly equal numerically because InfoNCE also depends on
+        # background negatives, which use classifier rank in both variants,
+        # but anchors pick the same positions so the two losses must agree
+        # up to floating-point error.
+        assert torch.allclose(l_cls, l_union, atol=1e-5), (
+            f"l_cls={l_cls.item()}, l_union={l_union.item()} disagree"
+        )
+
+
+# ---------------------------------------------------------------------------
+# D2 warmup schedule
+# ---------------------------------------------------------------------------
+
+
+class TestLambdaMaskWarmup:
+    """Mirrors ``TestLambdaConWarmup`` but keyed on ``effective_lambda_mask``.
+
+    Uses the same helper pattern: construct a thin SPDNetModule, vary the
+    schedule fields, and assert on the effective weight at given epochs.
+    """
+
+    @staticmethod
+    def _make_module(
+        *,
+        lambda_mask: float,
+        start: int,
+        ramp: int,
+    ):
+        from src.conf.spdnet import SPDNetSpatialLossesConfig
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        cfg = SPDNetSpatialLossesConfig(
+            lambda_eq=0.0,
+            lambda_con=0.0,
+            lambda_distill=0.0,
+            lambda_mask=lambda_mask,
+            mask_warmup_start_epoch=start,
+            mask_warmup_epochs=ramp,
+            online_loc_eval_enabled=False,
+        )
+        return SPDNetModule(
+            num_classes=4,
+            fpn_channels=16,
+            mse_reduction=4,
+            pretrained=False,
+            learning_rate=1e-4,
+            weight_decay=0.05,
+            warmup_epochs=0,
+            min_lr=1e-5,
+            fusion_mode="spatial",
+            losses_cfg=cfg,
+            online_loc_metric=None,
+            image_size=64,
+        )
+
+    def test_MW1_defaults_no_warmup(self) -> None:
+        m = self._make_module(lambda_mask=1.0, start=0, ramp=0)
+        for e in (0, 5, 100):
+            assert m.effective_lambda_mask(epoch=e) == pytest.approx(1.0)
+
+    def test_MW2_before_start_is_zero(self) -> None:
+        m = self._make_module(lambda_mask=1.0, start=10, ramp=5)
+        for e in range(10):
+            assert m.effective_lambda_mask(epoch=e) == 0.0
+
+    def test_MW3_linear_ramp_values(self) -> None:
+        m = self._make_module(lambda_mask=1.0, start=5, ramp=4)
+        expected = {5: 0.0, 6: 0.25, 7: 0.5, 8: 0.75, 9: 1.0, 20: 1.0}
+        for e, want in expected.items():
+            assert m.effective_lambda_mask(epoch=e) == pytest.approx(
+                want, abs=1e-7,
+            )
+
+    def test_MW4_zero_lambda_disables_regardless(self) -> None:
+        m = self._make_module(lambda_mask=0.0, start=0, ramp=5)
+        for e in (0, 5, 100):
+            assert m.effective_lambda_mask(epoch=e) == 0.0
+
+    def test_MW5_negative_lambda_treated_as_zero(self) -> None:
+        m = self._make_module(lambda_mask=-1.0, start=0, ramp=5)
+        for e in (0, 5, 100):
+            assert m.effective_lambda_mask(epoch=e) == 0.0
+
+
+class TestLambdaAcWarmup:
+    """Same warmup behaviour for ``L_ac`` that ``TestLambdaMaskWarmup`` gives
+    ``L_mask``. Rationale: the 2026-04-30 cold-start highres run collapsed
+    attn_mean to 0.98 by epoch 3 because L_ac fired on random MSE logits; the
+    fix is to delay L_ac until the classifier has built usable spatial
+    features. Both warmup defaults stay at 0 so existing recipes keep their
+    legacy epoch-0 behaviour.
+    """
+
+    @staticmethod
+    def _make_module(
+        *,
+        lambda_ac: float,
+        start: int,
+        ramp: int,
+    ):
+        from src.conf.spdnet import SPDNetSpatialLossesConfig
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        cfg = SPDNetSpatialLossesConfig(
+            lambda_eq=0.0,
+            lambda_con=0.0,
+            lambda_distill=0.0,
+            lambda_mask=0.0,
+            lambda_ac=lambda_ac,
+            ac_warmup_start_epoch=start,
+            ac_warmup_epochs=ramp,
+            online_loc_eval_enabled=False,
+        )
+        return SPDNetModule(
+            num_classes=4,
+            fpn_channels=16,
+            mse_reduction=4,
+            pretrained=False,
+            learning_rate=1e-4,
+            weight_decay=0.05,
+            warmup_epochs=0,
+            min_lr=1e-5,
+            fusion_mode="spatial",
+            losses_cfg=cfg,
+            online_loc_metric=None,
+            image_size=64,
+        )
+
+    def test_AW1_defaults_no_warmup(self) -> None:
+        m = self._make_module(lambda_ac=0.05, start=0, ramp=0)
+        for e in (0, 5, 100):
+            assert m.effective_lambda_ac(epoch=e) == pytest.approx(0.05)
+
+    def test_AW2_before_start_is_zero(self) -> None:
+        m = self._make_module(lambda_ac=0.05, start=15, ramp=5)
+        for e in range(15):
+            assert m.effective_lambda_ac(epoch=e) == 0.0
+
+    def test_AW3_linear_ramp_values(self) -> None:
+        m = self._make_module(lambda_ac=0.05, start=15, ramp=4)
+        expected = {
+            15: 0.0,
+            16: 0.0125,
+            17: 0.025,
+            18: 0.0375,
+            19: 0.05,
+            80: 0.05,
+        }
+        for e, want in expected.items():
+            assert m.effective_lambda_ac(epoch=e) == pytest.approx(
+                want, abs=1e-7,
+            )
+
+    def test_AW4_zero_lambda_disables_regardless(self) -> None:
+        m = self._make_module(lambda_ac=0.0, start=0, ramp=5)
+        for e in (0, 5, 100):
+            assert m.effective_lambda_ac(epoch=e) == 0.0
+
+    def test_AW5_negative_lambda_treated_as_zero(self) -> None:
+        m = self._make_module(lambda_ac=-1.0, start=0, ramp=5)
+        for e in (0, 5, 100):
+            assert m.effective_lambda_ac(epoch=e) == 0.0
+
+    def test_AW6_config_defaults_preserve_legacy_behaviour(self) -> None:
+        """Fresh ``SPDNetSpatialLossesConfig()`` with non-zero lambda_ac and
+        no warmup knobs set must give lam_ac_eff == lambda_ac from epoch 0.
+
+        This is the regression hook for "I accidentally broke existing D1/D4
+        recipes by adding warmup fields" -- every prior run has
+        ``ac_warmup_*=0`` implicitly and must continue to behave identically.
+        """
+        m = self._make_module(lambda_ac=0.5, start=0, ramp=0)
+        assert m.effective_lambda_ac(epoch=0) == pytest.approx(0.5)
+        assert m.effective_lambda_ac(epoch=39) == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# D1/D2/D3 integration: training_step paths that hit the new loss branches
+# ---------------------------------------------------------------------------
+
+
+class TestD1D2D3TrainingStep:
+    """Drive a real ``SPDNetModule.training_step`` through each new branch
+    to catch (a) shape mismatches, (b) NaN/Inf, (c) missing MLflow log
+    keys, and (d) silent no-ops where a loss weight > 0 but the
+    corresponding branch never runs.
+    """
+
+    @staticmethod
+    def _run_one_step(
+        mod,
+        *,
+        monkeypatch,
+        seed: int = 0,
+        num_classes: int = 4,
+        image_size: int = 64,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        monkeypatch.setattr(
+            type(mod),
+            "current_epoch",
+            property(lambda self: getattr(self, "_test_epoch", 0)),
+            raising=False,
+        )
+        mod._test_epoch = 0
+        logged: dict[str, float] = {}
+
+        def _fake_log(name, value, *_, **__):
+            if hasattr(value, "item"):
+                try:
+                    logged[name] = float(value.item()); return
+                except Exception:
+                    pass
+            logged[name] = float(value)
+
+        monkeypatch.setattr(mod, "log", _fake_log, raising=False)
+
+        torch.manual_seed(seed)
+        B = 2
+        batch = {
+            "query_image": torch.randn(B, 3, image_size, image_size),
+            "ref_images": torch.randn(B, 3, image_size, image_size),
+            "query_label": _disjoint_labels(B, num_classes),
+        }
+        total = mod.training_step(batch, batch_idx=0)
+        assert torch.isfinite(total), f"non-finite total loss: {total.item()}"
+        return total, logged
+
+    def _mk(self, **losses):
+        from src.conf.spdnet import SPDNetSpatialLossesConfig
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        cfg = SPDNetSpatialLossesConfig(
+            online_loc_eval_enabled=False, **losses,
+        )
+        return SPDNetModule(
+            num_classes=4, fpn_channels=16, mse_reduction=4,
+            pretrained=False, learning_rate=1e-4, weight_decay=0.05,
+            warmup_epochs=0, min_lr=1e-5, fusion_mode="spatial",
+            losses_cfg=cfg, online_loc_metric=None, image_size=64,
+        )
+
+    def test_D1_ac_only_logs_L_ac_and_attn_mean(self, monkeypatch) -> None:
+        m = self._mk(lambda_eq=0.0, lambda_ac=0.5, lambda_con=0.0,
+                     lambda_mask=0.0, lambda_distill=0.0)
+        _, logged = self._run_one_step(m, monkeypatch=monkeypatch)
+        assert "train/L_ac" in logged, (
+            f"lambda_ac > 0 must cause L_ac to be logged. Keys: {sorted(logged)}"
+        )
+        assert "train/attn_mean" in logged
+        # L_ac should be in [-1, 0] since attn_map is in [0, 1].
+        assert -1.0 <= logged["train/L_ac"] <= 0.0
+        assert "train/L_eq" not in logged, (
+            "lambda_eq=0 must not produce an L_eq log"
+        )
+
+    def test_D1_ac_triggers_want_attn_even_with_lambda_eq_zero(
+        self, monkeypatch,
+    ) -> None:
+        """Regression: in the old code path, ``want_attn`` was gated on
+        ``lambda_eq > 0`` only. D1 enables attention via ``lambda_ac > 0``
+        even when ``lambda_eq == 0``; if the guard is wrong, attn_map is
+        missing and L_ac never fires."""
+        m = self._mk(lambda_eq=0.0, lambda_ac=0.5, lambda_con=0.0,
+                     lambda_mask=0.0, lambda_distill=0.0)
+        # Fail loudly if the SCA's return_attn branch is skipped.
+        import src.wsss.spdnet.model as model_mod
+        calls = {"n": 0}
+        orig_attn = model_mod.SpatialCrossAttention.forward
+
+        def spy(self, q, kv, return_attn=False):
+            if return_attn:
+                calls["n"] += 1
+            return orig_attn(self, q, kv, return_attn=return_attn)
+
+        monkeypatch.setattr(
+            model_mod.SpatialCrossAttention, "forward", spy, raising=True,
+        )
+        self._run_one_step(m, monkeypatch=monkeypatch)
+        assert calls["n"] > 0, (
+            "lambda_ac>0 must request return_attn=True from the SCA forward"
+        )
+
+    def test_D2_mask_only_logs_L_mask(self, monkeypatch) -> None:
+        m = self._mk(lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.0,
+                     lambda_mask=1.0, lambda_distill=0.0)
+        _, logged = self._run_one_step(m, monkeypatch=monkeypatch)
+        assert "train/L_mask" in logged
+        assert logged["train/L_mask"] >= 0.0, (
+            f"L_mask (MSE) must be >= 0; got {logged['train/L_mask']}"
+        )
+        assert "train/lambda_mask_eff" in logged
+        assert logged["train/lambda_mask_eff"] == pytest.approx(1.0)
+        assert "train/L_ac" not in logged and "train/L_eq" not in logged
+
+    def test_D2_warmup_zero_skips_L_mask(self, monkeypatch) -> None:
+        """When the warmup schedule returns 0, the L_mask block must not
+        run (save compute) but ``train/lambda_mask_eff`` must still log."""
+        m = self._mk(lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.0,
+                     lambda_mask=1.0, mask_warmup_start_epoch=5,
+                     mask_warmup_epochs=3, lambda_distill=0.0)
+        # Epoch 0 is before the ramp starts -> lam_mask_eff = 0.
+        _, logged = self._run_one_step(m, monkeypatch=monkeypatch)
+        assert "train/lambda_mask_eff" in logged
+        assert logged["train/lambda_mask_eff"] == 0.0
+        assert "train/L_mask" not in logged, (
+            "L_mask must not be logged pre-warmup"
+        )
+
+    def test_D1_ac_warmup_pre_ramp_zero_effective(
+        self, monkeypatch,
+    ) -> None:
+        """During pre-ramp, ``lam_ac_eff == 0``: L_ac and attn_mean are
+        still logged as *diagnostics* (operator must see attn_mean to watch
+        for collapse), but L_ac's contribution to the total loss must vanish.
+        """
+        m = self._mk(lambda_eq=0.0, lambda_ac=0.5, lambda_con=0.0,
+                     lambda_mask=0.0, lambda_distill=0.0,
+                     ac_warmup_start_epoch=15, ac_warmup_epochs=5)
+        _, logged = self._run_one_step(m, monkeypatch=monkeypatch)
+        # Effective weight is 0 at epoch 0.
+        assert "train/lambda_ac_eff" in logged
+        assert logged["train/lambda_ac_eff"] == 0.0, (
+            f"Expected lam_ac_eff=0 pre-ramp, got {logged['train/lambda_ac_eff']}"
+        )
+        # L_ac and attn_mean still logged so operators can watch for the
+        # attn_mean > 0.95 collapse even during the cls-only warmup phase.
+        assert "train/L_ac" in logged
+        assert "train/attn_mean" in logged
+
+    def test_D1_ac_warmup_post_ramp_full_lambda(
+        self, monkeypatch,
+    ) -> None:
+        """After the ramp ends, ``lam_ac_eff == lambda_ac`` and the total
+        loss must include the full L_ac contribution. We assert that the
+        total loss at epoch 10 (post-ramp) differs from epoch 0 (pre-ramp)
+        by approximately ``lambda_ac * L_ac``, using identical weights and
+        batch so L_ac itself is constant.
+        """
+        losses_kwargs = dict(
+            lambda_eq=0.0, lambda_ac=0.5, lambda_con=0.0,
+            lambda_mask=0.0, lambda_distill=0.0,
+            ac_warmup_start_epoch=5, ac_warmup_epochs=5,
+        )
+        m_pre = self._mk(**losses_kwargs)
+        m_post = self._mk(**losses_kwargs)
+        # Match the weights so L_ac's raw value is identical.
+        m_post.load_state_dict(m_pre.state_dict())
+
+        # Monkeypatch ``current_epoch`` property for both modules on their
+        # shared class (SPDNetModule) and vary per-instance via _test_epoch.
+        monkeypatch.setattr(
+            type(m_pre),
+            "current_epoch",
+            property(lambda self: getattr(self, "_test_epoch", 0)),
+            raising=False,
+        )
+        m_pre._test_epoch = 0       # pre-ramp
+        m_post._test_epoch = 10     # post-ramp (start=5, ramp=5)
+
+        log_pre: dict[str, float] = {}
+        log_post: dict[str, float] = {}
+
+        def _mklog(tgt):
+            def _fake_log(name, value, *_, **__):
+                if hasattr(value, "item"):
+                    try:
+                        tgt[name] = float(value.item()); return
+                    except Exception:
+                        pass
+                tgt[name] = float(value)
+            return _fake_log
+
+        monkeypatch.setattr(m_pre, "log", _mklog(log_pre), raising=False)
+        monkeypatch.setattr(m_post, "log", _mklog(log_post), raising=False)
+
+        torch.manual_seed(17)
+        B = 2
+        batch = {
+            "query_image": torch.randn(B, 3, 64, 64),
+            "ref_images": torch.randn(B, 3, 64, 64),
+            "query_label": _disjoint_labels(B, 4),
+        }
+        # Reseed before each forward so MHA / dropout RNG is identical
+        # across the two passes (otherwise stochastic ops consume different
+        # slices of the global RNG and the raw L_ac values drift).
+        torch.manual_seed(42)
+        total_pre = m_pre.training_step(batch, batch_idx=0)
+        torch.manual_seed(42)
+        total_post = m_post.training_step(batch, batch_idx=0)
+
+        assert log_pre["train/lambda_ac_eff"] == 0.0
+        assert log_post["train/lambda_ac_eff"] == pytest.approx(0.5)
+        # Raw L_ac is the same because weights + batch match.
+        assert log_post["train/L_ac"] == pytest.approx(
+            log_pre["train/L_ac"], rel=1e-5,
+        )
+        # Total_post - Total_pre should equal 0.5 * L_ac (the only term
+        # that was gated off in the pre case).
+        expected_delta = 0.5 * log_pre["train/L_ac"]
+        got_delta = float(total_post.item()) - float(total_pre.item())
+        assert got_delta == pytest.approx(expected_delta, abs=1e-5), (
+            f"Expected total_post - total_pre == 0.5 * L_ac = "
+            f"{expected_delta:g}; got {got_delta:g}"
+        )
+
+    def test_D3_union_con_logs_same_keys_as_classifier(
+        self, monkeypatch,
+    ) -> None:
+        m = self._mk(lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.2,
+                     lambda_mask=0.0, lambda_distill=0.0,
+                     con_anchor_source="union_cls_chvar")
+        _, logged = self._run_one_step(m, monkeypatch=monkeypatch)
+        assert "train/L_con" in logged, (
+            "union anchor_source must still log train/L_con"
+        )
+        assert "train/lambda_con_eff" in logged
+
+    def test_D1_plus_D2_plus_D3_all_fire(self, monkeypatch) -> None:
+        """Combined D1+D2+D3 must produce all four log keys and a finite
+        total loss."""
+        m = self._mk(lambda_eq=0.0, lambda_ac=0.3, lambda_con=0.1,
+                     lambda_mask=0.5, lambda_distill=0.0,
+                     con_anchor_source="union_cls_chvar")
+        total, logged = self._run_one_step(m, monkeypatch=monkeypatch)
+        for k in ("train/L_cls", "train/L_ac", "train/L_mask", "train/L_con"):
+            assert k in logged, f"missing {k}; got keys {sorted(logged)}"
+        assert total.item() > 0.0, (
+            "total loss should be positive (L_cls dominates, L_ac is -0.xx "
+            "but small-weighted)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# D4: attention marginal-entropy loss + argmax-share backup
+# ---------------------------------------------------------------------------
+
+
+class TestAttentionMarginalEntropyLoss:
+    """Fixed-point / gradient / range invariants for L_marg_H.
+
+    See ``reports/notes/rq2_attention_regularizer_analysis.md`` for the
+    mathematical setup and
+    ``src/wsss/spdnet/spatial_losses.py::attention_marginal_entropy_loss``
+    for the implementation.
+    """
+
+    @staticmethod
+    def _random_attn_w(
+        B: int = 2, P: int = 16, N: int = 12, seed: int = 0,
+    ) -> torch.Tensor:
+        torch.manual_seed(seed)
+        return torch.softmax(torch.randn(B, P, N), dim=-1)
+
+    def test_uniform_attention_gives_near_zero_loss(self) -> None:
+        """Uniform attn_w: M = 0 (no concentration) and mu is already
+        uniform so KL = 0. Therefore L_marg_H ≈ 0 regardless of beta."""
+        B, P, N = 2, 16, 12
+        attn_w = torch.full((B, P, N), 1.0 / N)
+        loss = attention_marginal_entropy_loss(attn_w, beta=0.25)
+        assert loss.item() == pytest.approx(0.0, abs=1e-6)
+
+    def test_mode_collapse_is_penalised(self) -> None:
+        """All queries peak on the same key -> marginal is delta on that
+        key -> KL(mu || U) = log N. Per-query M = 1 so -mean(M) = -1.
+        With beta = 0.25 and N = 12, expected loss ≈ -1 + 0.25·log(12)
+        ≈ -0.38, which is strictly greater than the structured-state
+        minimum of -1 (proving the KL term is working)."""
+        B, P, N = 2, 16, 12
+        attn_w = torch.full((B, P, N), 1e-12)
+        attn_w[..., 0] = 1.0 - (N - 1) * 1e-12
+        loss = attention_marginal_entropy_loss(attn_w, beta=0.25)
+        expected = -1.0 + 0.25 * math.log(N)
+        assert loss.item() == pytest.approx(expected, abs=1e-3), (
+            f"mode-collapse loss {loss.item():.4f} != expected {expected:.4f}"
+        )
+        # Must be strictly greater than the structured-state optimum
+        # (that optimum is -1, achieved at "each query picks a distinct
+        # key"). This is the D4 no-collapse invariant.
+        structured_optimum = -1.0
+        assert loss.item() > structured_optimum + 0.5, (
+            f"mode-collapse loss {loss.item():.4f} must be much larger "
+            f"than the structured-state optimum {structured_optimum:.4f}"
+        )
+
+    def test_structured_state_is_minimised(self) -> None:
+        """Each query peaks on a DISTINCT key (permutation with B*P = N).
+        -> M ≈ 1 (sharp queries), mu uniform (every key picked once).
+        => loss ≈ -1 + beta * 0 = -1, the global minimum."""
+        B, P = 2, 6
+        N = B * P  # so B*P queries can cover N keys exactly once
+        attn_w = torch.full((B, P, N), 1e-12)
+        # Assign each (b, q) a unique key index.
+        flat_idx = torch.arange(B * P).view(B, P)
+        attn_w.scatter_(2, flat_idx.unsqueeze(-1), 1.0 - (N - 1) * 1e-12)
+        loss = attention_marginal_entropy_loss(attn_w, beta=0.25)
+        # Loss ≈ -1 (minimum): concentration term hits -1, KL term ≈ 0.
+        assert loss.item() == pytest.approx(-1.0, abs=1e-3), (
+            f"structured-state loss {loss.item():.4f} should be ≈ -1"
+        )
+
+    def test_gradient_flows_to_attn_w(self) -> None:
+        """Backward through attn_w must produce finite grads of matching
+        shape. This is the gradient path that reaches back into the SCA's
+        in-projection."""
+        attn_w = self._random_attn_w().requires_grad_(True)
+        loss = attention_marginal_entropy_loss(attn_w, beta=0.25)
+        loss.backward()
+        assert attn_w.grad is not None
+        assert attn_w.grad.shape == attn_w.shape
+        assert torch.isfinite(attn_w.grad).all()
+        assert attn_w.grad.abs().sum().item() > 0.0
+
+    def test_beta_zero_reduces_to_L_ac(self) -> None:
+        """At beta=0 the marginal term drops out and L_marg_H equals
+        attention_concentration_loss(attn_map) where attn_map is the
+        head-averaged per-query concentration map derived from attn_w.
+
+        This is the reduction that keeps L_marg_H a strict generalisation
+        of L_ac and motivates re-using the same gradient-budget
+        calibration from RQ1."""
+        attn_w = self._random_attn_w(B=2, P=16, N=12, seed=7)
+        N = attn_w.shape[-1]
+        log_N = math.log(N)
+        attn_p = attn_w.clamp_min(1e-12)
+        neg_ent = (attn_p * attn_p.log()).sum(dim=-1)
+        attn_map = (1.0 + neg_ent / log_N).view(2, 4, 4)
+
+        L_marg = attention_marginal_entropy_loss(attn_w, beta=0.0)
+        L_ac = attention_concentration_loss(attn_map)
+        assert L_marg.item() == pytest.approx(L_ac.item(), abs=1e-6)
+
+    def test_invalid_beta_raises(self) -> None:
+        attn_w = self._random_attn_w()
+        with pytest.raises(ValueError, match="beta"):
+            attention_marginal_entropy_loss(attn_w, beta=-0.1)
+
+    def test_invalid_shape_raises(self) -> None:
+        with pytest.raises(ValueError, match="B, P, N"):
+            attention_marginal_entropy_loss(torch.randn(4, 4), beta=0.25)
+
+
+class TestAttentionArgmaxShareLoss:
+    """Backup attention regulariser: same four patterns as L_marg_H,
+    plus a sanity check on the soft-argmax surrogate gradient.
+    """
+
+    @staticmethod
+    def _random_attn_w(seed: int = 0) -> torch.Tensor:
+        torch.manual_seed(seed)
+        return torch.softmax(torch.randn(2, 16, 12), dim=-1)
+
+    def test_uniform_share_is_small(self) -> None:
+        """Uniform attn_w: max soft-share is close to the uniform mean
+        1/N, and -mean(M) = 0. So the loss is roughly beta/N."""
+        B, P, N = 2, 16, 12
+        attn_w = torch.full((B, P, N), 1.0 / N)
+        loss = attention_argmax_share_loss(attn_w, beta=2.0)
+        assert loss.item() == pytest.approx(2.0 / N, abs=1e-4)
+
+    def test_mode_collapse_is_penalised(self) -> None:
+        """Single-key dominance drives dominance -> 1 and M = 1.
+        So loss ≈ -1 + beta. With beta=2, expect ≈ +1."""
+        B, P, N = 2, 16, 12
+        attn_w = torch.full((B, P, N), 1e-12)
+        attn_w[..., 0] = 1.0 - (N - 1) * 1e-12
+        loss = attention_argmax_share_loss(attn_w, beta=2.0)
+        assert loss.item() == pytest.approx(1.0, abs=1e-3)
+
+    def test_structured_state_is_minimised(self) -> None:
+        """Distinct peaks per query -> dominance ≈ 1/(B*P) ≈ 1/N, M ≈ 1.
+        Loss ≈ -1 + beta/N -- strictly less than mode-collapse."""
+        B, P = 2, 6
+        N = B * P
+        attn_w = torch.full((B, P, N), 1e-12)
+        flat_idx = torch.arange(B * P).view(B, P)
+        attn_w.scatter_(2, flat_idx.unsqueeze(-1), 1.0 - (N - 1) * 1e-12)
+        loss = attention_argmax_share_loss(attn_w, beta=2.0)
+        # Soft-argmax smears a little, but loss must be close to -1 + 2/N
+        # and clearly below the mode-collapse value of ~+1.
+        assert loss.item() < -0.8
+        assert loss.item() < 1.0  # strictly better than collapse
+
+    def test_gradient_flows_to_attn_w(self) -> None:
+        """Both the concentration term and the soft-argmax surrogate give
+        non-zero gradients to attn_w."""
+        attn_w = self._random_attn_w().requires_grad_(True)
+        loss = attention_argmax_share_loss(attn_w, beta=2.0)
+        loss.backward()
+        assert attn_w.grad is not None
+        assert torch.isfinite(attn_w.grad).all()
+        assert attn_w.grad.abs().sum().item() > 0.0
+
+    def test_invalid_beta_raises(self) -> None:
+        attn_w = self._random_attn_w()
+        with pytest.raises(ValueError, match="beta"):
+            attention_argmax_share_loss(attn_w, beta=-1.0)
+
+    def test_invalid_shape_raises(self) -> None:
+        with pytest.raises(ValueError, match="B, P, N"):
+            attention_argmax_share_loss(torch.randn(4, 4), beta=2.0)
+
+
+# ---------------------------------------------------------------------------
+# D4: L_mask combiner ("union") and deprecated alias
+# ---------------------------------------------------------------------------
+
+
+class TestMaskCombinerUnion:
+    """The ``mask_combiner`` argument of :func:`cam_pseudo_mask_loss`
+    exposes three positive-mask construction modes:
+
+    * ``"intersection"`` == chvar_top AND cam_top
+    * ``"chvar_only"``   == chvar_top
+    * ``"union"``        == chvar_top OR cam_top   (D4 new path)
+
+    Legacy ``use_intersection`` keeps working as a deprecated alias.
+    """
+
+    @staticmethod
+    def _inputs(B: int = 2, Cin: int = 4, Hf: int = 8):
+        torch.manual_seed(31)
+        p3 = torch.randn(B, Cin, Hf, Hf)
+        p4 = torch.randn(B, Cin, Hf, Hf)
+        cls_w = torch.randn(4, Cin)
+        labels = _disjoint_labels(B, 4)
+        return p3, p4, cls_w, labels
+
+    @staticmethod
+    def _replay_positive_masks(
+        p3: torch.Tensor,
+        p4: torch.Tensor,
+        cls_w: torch.Tensor,
+        labels: torch.Tensor,
+        alpha_pos: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct the (chvar_top, cam_top) masks that the loss
+        builds internally, so we can assert set-inclusion between the
+        three combiners without relying on private helpers."""
+        from src.wsss.spdnet.spatial_losses import _kth_threshold
+        B, _, Hf, _ = p3.shape
+        chvar = p3.detach().var(dim=1, unbiased=False).flatten(1)
+        P = chvar.shape[1]
+        k_pos = max(1, int(round(alpha_pos * P)))
+        thr_chv = _kth_threshold(chvar, k_pos, largest=True)
+        chvar_top = (chvar >= thr_chv).view(B, Hf, Hf).float()
+        S = torch.einsum("nc,bchw->bnhw", cls_w, p4)
+        active = labels.argmax(dim=1)
+        idx = active[:, None, None, None].expand(-1, 1, Hf, Hf)
+        cam_act = torch.gather(S, 1, idx).squeeze(1).flatten(1)
+        mn = cam_act.amin(dim=1, keepdim=True)
+        mx = cam_act.amax(dim=1, keepdim=True)
+        cam_norm = (cam_act - mn) / (mx - mn + 1e-8)
+        thr_cam = _kth_threshold(cam_norm, k_pos, largest=True)
+        cam_top = (cam_norm >= thr_cam).view(B, Hf, Hf).float()
+        return chvar_top, cam_top
+
+    def test_union_is_superset_of_intersection_and_chvar_only(self) -> None:
+        """Algebraic identity: (chvar_top OR cam_top) must contain both
+        (chvar_top AND cam_top) and (chvar_top alone)."""
+        p3, p4, cls_w, labels = self._inputs()
+        alpha = 0.25
+        chvar_top, cam_top = self._replay_positive_masks(
+            p3, p4, cls_w, labels, alpha,
+        )
+        inter = chvar_top * cam_top
+        union = torch.maximum(chvar_top, cam_top)
+        # Set-inclusion checks: every pixel set in a subset mode must
+        # also be set in union mode.
+        assert (union >= inter).all()
+        assert (union >= chvar_top).all()
+        assert (union >= cam_top).all()
+        # Non-trivial: on random inputs we expect some pixels in union
+        # that are not in intersection (otherwise the combiner choice
+        # would be meaningless).
+        assert union.sum().item() >= inter.sum().item()
+        assert union.sum().item() >= chvar_top.sum().item()
+
+    def test_union_loss_differs_from_intersection(self) -> None:
+        """The three combiners must produce measurably different losses
+        on generic inputs (sanity: our new branch isn't secretly calling
+        the old code path)."""
+        p3, p4, cls_w, labels = self._inputs()
+        l_inter = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels,
+            alpha_pos=0.25, beta_neg=0.5, mask_combiner="intersection",
+        )
+        l_chvar = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels,
+            alpha_pos=0.25, beta_neg=0.5, mask_combiner="chvar_only",
+        )
+        l_union = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels,
+            alpha_pos=0.25, beta_neg=0.5, mask_combiner="union",
+        )
+        vals = {l_inter.item(), l_chvar.item(), l_union.item()}
+        assert len(vals) >= 2, (
+            f"at least two of the three combiners should give different "
+            f"losses; got {vals}"
+        )
+        for v in (l_inter, l_chvar, l_union):
+            assert torch.isfinite(v), f"combiner loss not finite: {v}"
+
+    def test_legacy_use_intersection_alias_maps_to_intersection(
+        self,
+    ) -> None:
+        """use_intersection=True must behave identically to
+        mask_combiner='intersection'; False must match 'chvar_only'."""
+        p3, p4, cls_w, labels = self._inputs()
+        l_true = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels, use_intersection=True,
+        )
+        l_int = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels, mask_combiner="intersection",
+        )
+        assert l_true.item() == pytest.approx(l_int.item(), abs=1e-6)
+
+        l_false = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels, use_intersection=False,
+        )
+        l_chv = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels, mask_combiner="chvar_only",
+        )
+        assert l_false.item() == pytest.approx(l_chv.item(), abs=1e-6)
+
+    def test_legacy_alias_wins_over_mask_combiner(self) -> None:
+        """When BOTH the deprecated flag and the new kwarg are supplied,
+        the explicit legacy value takes precedence so pre-D4 configs
+        keep their original semantics untouched."""
+        p3, p4, cls_w, labels = self._inputs()
+        # use_intersection=True overrides mask_combiner="union".
+        l_override = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels,
+            use_intersection=True, mask_combiner="union",
+        )
+        l_int = cam_pseudo_mask_loss(
+            p3, p4, cls_w, labels, mask_combiner="intersection",
+        )
+        assert l_override.item() == pytest.approx(l_int.item(), abs=1e-6)
+
+    def test_invalid_combiner_raises(self) -> None:
+        p3, p4, cls_w, labels = self._inputs()
+        with pytest.raises(ValueError, match="mask_combiner"):
+            cam_pseudo_mask_loss(
+                p3, p4, cls_w, labels, mask_combiner="bogus",
+            )
+
+
+# ---------------------------------------------------------------------------
+# D4: training_step integration for L_marg_H and mask_combiner='union'
+# ---------------------------------------------------------------------------
+
+
+class TestD4TrainingStep:
+    """End-to-end check that L_marg_H and mask_combiner='union' integrate
+    cleanly into ``SPDNetModule.training_step`` -- covers the same
+    invariants as ``TestD1D2D3TrainingStep`` for the new D4 recipe.
+    """
+
+    # Reuse the helpers from the D1-D3 class via composition.
+    _runner = TestD1D2D3TrainingStep()
+
+    def _mk(self, **losses):
+        return self._runner._mk(**losses)
+
+    def _run(self, mod, monkeypatch):
+        return self._runner._run_one_step(mod, monkeypatch=monkeypatch)
+
+    def test_lambda_marg_H_logs_and_is_finite(self, monkeypatch) -> None:
+        """lambda_marg_H > 0 must log ``train/L_marg_H`` and keep the
+        total loss finite (no NaN/inf from the KL term)."""
+        m = self._mk(
+            lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.0,
+            lambda_mask=0.0, lambda_distill=0.0,
+            lambda_marg_H=0.15, marg_H_beta=0.25,
+        )
+        total, logged = self._run(m, monkeypatch)
+        assert "train/L_marg_H" in logged, (
+            f"lambda_marg_H>0 must log train/L_marg_H. Keys: {sorted(logged)}"
+        )
+        assert torch.isfinite(total)
+        # L_marg_H at init is near 0 (attention is near-uniform).
+        assert abs(logged["train/L_marg_H"]) < 1.0
+
+    def test_lambda_marg_H_triggers_want_attn_even_with_lambda_ac_zero(
+        self, monkeypatch,
+    ) -> None:
+        """Regression: ``want_attn`` must now also flip on for
+        lambda_marg_H alone, otherwise ``feats['attn_w']`` is absent and
+        the new branch KeyErrors."""
+        m = self._mk(
+            lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.0,
+            lambda_mask=0.0, lambda_distill=0.0,
+            lambda_marg_H=0.15, marg_H_beta=0.25,
+        )
+        import src.wsss.spdnet.model as model_mod
+        calls = {"n": 0}
+        orig = model_mod.SpatialCrossAttention.forward
+
+        def spy(self, q, kv, return_attn=False):
+            if return_attn:
+                calls["n"] += 1
+            return orig(self, q, kv, return_attn=return_attn)
+
+        monkeypatch.setattr(
+            model_mod.SpatialCrossAttention, "forward", spy, raising=True,
+        )
+        self._run(m, monkeypatch)
+        assert calls["n"] > 0, (
+            "lambda_marg_H>0 must request return_attn=True from the SCA forward"
+        )
+
+    def test_D4_full_recipe_fires_all_components(self, monkeypatch) -> None:
+        """D4-main recipe: lambda_marg_H>0, lambda_mask>0 (union combiner).
+        Both new log keys must appear; legacy keys must not."""
+        m = self._mk(
+            lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.0,
+            lambda_distill=0.0,
+            lambda_marg_H=0.15, marg_H_beta=0.25,
+            lambda_mask=0.10, mask_alpha_pos=0.25, mask_beta_neg=0.50,
+            mask_combiner="union",
+        )
+        total, logged = self._run(m, monkeypatch)
+        for k in ("train/L_cls", "train/L_marg_H", "train/L_mask"):
+            assert k in logged, f"missing {k}; got {sorted(logged)}"
+        # D4 drops L_eq, L_con, L_ac by construction.
+        for dropped in ("train/L_eq", "train/L_ac", "train/L_con"):
+            assert dropped not in logged, (
+                f"D4 recipe should not log {dropped}"
+            )
+        assert torch.isfinite(total)
+
+    def test_D4_int_variant_differs_from_D4_main(self, monkeypatch) -> None:
+        """D4-int uses ``mask_combiner='intersection'`` with the same
+        lambdas as D4-main; the loss values must differ because the
+        pseudo-mask target is different (sanity check that Hydra override
+        actually reaches the loss)."""
+        torch.manual_seed(123)
+        m_union = self._mk(
+            lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.0,
+            lambda_distill=0.0,
+            lambda_marg_H=0.15, marg_H_beta=0.25,
+            lambda_mask=0.10, mask_alpha_pos=0.25, mask_beta_neg=0.50,
+            mask_combiner="union",
+        )
+        _, logged_union = self._run(m_union, monkeypatch)
+
+        torch.manual_seed(123)
+        m_int = self._mk(
+            lambda_eq=0.0, lambda_ac=0.0, lambda_con=0.0,
+            lambda_distill=0.0,
+            lambda_marg_H=0.15, marg_H_beta=0.25,
+            lambda_mask=0.10, mask_alpha_pos=0.25, mask_beta_neg=0.50,
+            mask_combiner="intersection",
+        )
+        _, logged_int = self._run(m_int, monkeypatch)
+        assert logged_union["train/L_mask"] != pytest.approx(
+            logged_int["train/L_mask"], abs=1e-6,
+        ), (
+            "mask_combiner='union' vs 'intersection' must produce "
+            "different L_mask values on the same batch"
+        )

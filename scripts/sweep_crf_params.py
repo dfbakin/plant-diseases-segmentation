@@ -104,6 +104,14 @@ def _worker_wrapper(args: tuple) -> dict:
     )
 
 
+# Per-config timeout default for the CAM-resolution CRF sweep. CAM-res
+# CRF runs on 56x56 or 112x112 maps, so a healthy config finishes a
+# 250-img sweep in <60 s; 900 s is a safe 15x ceiling for worker
+# anomalies (swap storms, rare pydensecrf pathological inputs block-
+# averaged into wedge cases). 0 disables the timeout (legacy behaviour).
+SWEEP_CRF_CFG_TIMEOUT_SEC_DEFAULT = 900.0
+
+
 def sweep_crf_params(
     seed_dir: Path,
     image_dir: Path,
@@ -117,8 +125,21 @@ def sweep_crf_params(
     max_images: int = 0,
     num_workers: int = 1,
     seed: int = 42,
+    per_config_timeout_sec: float = SWEEP_CRF_CFG_TIMEOUT_SEC_DEFAULT,
 ) -> list[dict]:
-    """Run CRF parameter sweep and return sorted results."""
+    """Run CRF parameter sweep and return sorted results.
+
+    Parallelism: each (srgb, bg, sc) config is independent and is
+    dispatched via ``multiprocessing.Pool.apply_async`` with per-config
+    ``.get(timeout=per_config_timeout_sec)``. A pathological config (one
+    where pydensecrf hangs) is dropped from the ranking instead of
+    stalling the whole sweep -- same mechanism used in the fullres
+    sweep of ``eval_d4_localization.py`` and the per-image full-CRF
+    refinement of ``eval_seg_probes.py``.
+
+    Set ``per_config_timeout_sec=0`` to disable the cap (legacy behaviour;
+    use only for attended debugging).
+    """
     npy_files = sorted(seed_dir.glob("*.npy"))
     names = [f.stem for f in npy_files]
 
@@ -143,17 +164,68 @@ def sweep_crf_params(
         for srgb, bg_thr, sf in grid
     ]
 
-    results = []
-    if num_workers > 1 and len(grid) > 1:
+    from tqdm import tqdm
+
+    results: list[dict] = []
+    skipped: list[dict] = []
+    use_pool = num_workers > 1 and len(grid) > 1
+    if use_pool:
+        from multiprocessing import TimeoutError as MPTimeoutError
+
         with Pool(num_workers) as pool:
-            from tqdm import tqdm
-            for r in tqdm(pool.imap_unordered(_worker_wrapper, tasks),
-                          total=len(tasks), desc="CRF sweep"):
-                results.append(r)
+            asyncs = [pool.apply_async(_worker_wrapper, (t,)) for t in tasks]
+            pbar = tqdm(total=len(asyncs), desc="CRF sweep")
+            for ar, t in zip(asyncs, tasks):
+                srgb, bg_thr, sf = t[7], t[8], t[9]
+                try:
+                    if per_config_timeout_sec and per_config_timeout_sec > 0:
+                        r = ar.get(timeout=per_config_timeout_sec)
+                    else:
+                        r = ar.get()
+                    results.append(r)
+                except MPTimeoutError:
+                    skipped.append({
+                        "srgb": srgb, "bg_threshold": bg_thr,
+                        "scale_factor": sf, "reason": "timeout",
+                    })
+                    log.warning(
+                        "[crf-sweep] timeout >%.0fs on srgb=%s bg=%s sc=%s -- skipping",
+                        per_config_timeout_sec, srgb, bg_thr, sf,
+                    )
+                except Exception as e:
+                    skipped.append({
+                        "srgb": srgb, "bg_threshold": bg_thr,
+                        "scale_factor": sf, "reason": f"error: {e!r}",
+                    })
+                    log.warning(
+                        "[crf-sweep] worker error on srgb=%s bg=%s sc=%s: %r -- skipping",
+                        srgb, bg_thr, sf, e,
+                    )
+                pbar.update(1)
+            pbar.close()
+            # ``with Pool(...)`` -> __exit__ -> terminate() SIGKILLs any
+            # worker still spinning on a timed-out config; required because
+            # pydensecrf does not honour Python signals.
     else:
-        from tqdm import tqdm
         for t in tqdm(tasks, desc="CRF sweep"):
-            results.append(_worker_wrapper(t))
+            try:
+                results.append(_worker_wrapper(t))
+            except Exception as e:
+                srgb, bg_thr, sf = t[7], t[8], t[9]
+                skipped.append({
+                    "srgb": srgb, "bg_threshold": bg_thr,
+                    "scale_factor": sf, "reason": f"error: {e!r}",
+                })
+                log.warning(
+                    "[crf-sweep] error on srgb=%s bg=%s sc=%s: %r -- skipping",
+                    srgb, bg_thr, sf, e,
+                )
+
+    if skipped:
+        log.warning(
+            "[crf-sweep] skipped %d/%d configs; ranking over %d completed",
+            len(skipped), len(grid), len(results),
+        )
 
     results.sort(key=lambda r: r["disease_iou"], reverse=True)
     return results

@@ -1,0 +1,352 @@
+---
+title: "SPDNet Auxiliary Spatial Losses"
+subtitle: "Equivariance, Contrastive, and the D1/D2/D3 Interventions"
+author: "Plant Disease Segmentation Project"
+date: "April 2026"
+format:
+  beamer:
+    theme: Madrid
+    colortheme: dolphin
+    fonttheme: professionalfonts
+    pdf-engine: xelatex
+    aspectratio: 169
+    incremental: false
+    slide-level: 2
+    include-in-header:
+      text: |
+        \usepackage{booktabs}
+        \usepackage{graphicx}
+        \usepackage{amsmath}
+        \usepackage{tikz}
+        \usetikzlibrary{arrows.meta, positioning, calc}
+        \setbeamertemplate{navigation symbols}{}
+        \setbeamerfont{footnote}{size=\tiny}
+---
+
+## Motivation: Classification Alone Gives No Localization
+
+### Finding from report 06
+SPDNet spatial cross-attention is \emph{used} by the classifier ($\gamma$ learned to $0.33$), yet produces no localization signal:
+
+- Fused features $\approx$ unfused features on channel statistics
+- Validation Disease IoU no better than pre-fusion backbone
+- Classification loss has no gradient pushing spatial correspondence
+
+### Approach
+Inject **auxiliary spatial losses** without dense labels:
+
+- $L_{\text{eq}}$ (equivariance): attention map consistency under augmentation
+- $L_{\text{con}}$ (InfoNCE on patches): same-class anchors vs. different-class negatives
+- $L_{\text{ac}}$, $L_{\text{mask}}$ (new, this report): attention concentration + pseudo-mask
+
+\footnotesize
+All runs share the same backbone, heavy augmentation, PlantSeg + PlantVillage (115 classes), AdamW ($\text{lr}=3.1\text{e-}5$, wd $=0.05$), 5-ep LR warmup, $448\times 448$ inputs, $N=1$ reference.
+
+## Part 1 --- Aux-Loss Runs: Setups
+
+\footnotesize
+\begin{center}
+\begin{tabular}{lcccl}
+\toprule
+\textbf{Run} & \textbf{From ckpt} & \textbf{Epochs} & \textbf{Losses} & \textbf{Notes} \\
+\midrule
+\texttt{eq\_only} (04-24) & --- (scratch) & 80 & $L_{cls} + L_{eq}$ & Baseline \\
+\texttt{eq\_con} (04-23) & --- (scratch) & 76 (died) & $L_{cls} + L_{eq} + L_{con}$ & No warmup \\
+\texttt{eq\_con\_warmup} (04-25) & --- (scratch) & 80 & $+L_{con}$, 20-ep ramp & Linear warmup \\
+\texttt{eq\_con\_warmstart} (04-25) & \texttt{eq\_only} ckpt & 40 & $+L_{con}$, 10-ep ramp & Best $L_{con}$ recipe \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.2cm}
+
+### Hyperparameters common to all
+
+- $\lambda_{eq} = 1.0$; MSE on head-averaged attention map under random flips/rotations
+- $\lambda_{con} = 0.5$; InfoNCE with $\tau=0.07$, $K=8$ anchors/image, $M=16$ cross-image negatives
+- Anchors: top-$K$ positions of classifier CAM of the active class
+- "Warmstart" = load weights, \emph{reset} optimizer + scheduler, continue training
+
+## Part 1 --- Aux-Loss Runs: Final-Epoch Metrics
+
+\small
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Run} & \textbf{val/mAP} & \textbf{val/cam\_iou\_best} & \textbf{val/cam\_iou\_auc} & \textbf{train/mAP} \\
+\midrule
+\texttt{eq\_only} (80 ep) & \textbf{0.843} & 0.246 @ thr $= 0.30$ & 0.173 & 0.956 \\
+\texttt{eq\_con} (76 ep, died) & 0.614 & 0.205 @ thr $= 0.40$ & 0.158 & 0.596 \\
+\texttt{eq\_con\_warmup} (80 ep) & 0.776 & 0.225 @ thr $= 0.35$ & 0.159 & 0.703 \\
+\texttt{eq\_con\_warmstart} (40 ep) & 0.841 & \textbf{0.252} @ thr $= 0.30$ & \textbf{0.181} & 0.906 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3cm}
+
+### Reading
+- Adding $L_{con}$ **from scratch** destroys classification: $-22.9$ pp mAP
+- Linear warmup softens the damage but still $-6.7$ pp vs.\ eq-only
+- Only the **warmstart** recipe holds classification at parity; localization gain is $+0.6$ pp (noise-level)
+- $L_{con}$ alone did not unlock localization in any configuration
+
+## Why $L_{con}$ Fails: Self-Reference Collapse
+
+$L_{con}$ selects anchors from the classifier CAM top-$K$ and optimizes InfoNCE among them. The same anchor-selection function is used by \emph{every} step.
+
+\vspace{0.2cm}
+
+$L_{con}$ training trajectory across runs (epoch-averaged):
+
+\footnotesize
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Run} & \textbf{ep start} & \textbf{ep mid} & \textbf{ep final} \\
+\midrule
+\texttt{eq\_con\_warmstart} & 0.028 & 0.005 & 0.003 \\
+\texttt{eq\_con\_warmup} & 0.042 & 0.006 & 0.003 \\
+\texttt{D3} (ahead) & 0.277 & 0.002 & 0.0006 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\normalsize
+
+\vspace{0.2cm}
+
+\begin{center}
+\fbox{\parbox{0.82\textwidth}{\centering
+\textbf{Failure mode FM1}: anchors come from the network's own features. Once it embeds the top-$K$ positions consistently, InfoNCE is satisfied \emph{without carrying any localization signal}. Pull-apart pressure on diseased vs.\ healthy patches is absent.
+}}
+\end{center}
+
+## Part 2 --- D1, D2, D3: Three New Interventions
+
+Targets two diagnosed failure modes:
+
+- **FM1** (non-circular signal): supervise CAM with an \emph{external} pseudo-mask
+- **FM2** (attention entropy $\approx \log HW$): force attention to concentrate
+
+\vspace{0.2cm}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+\textbf{Name} & \textbf{Targets} & \textbf{Mechanism} \\
+\midrule
+D1 & FM2 & $L_{ac} = -\text{mean}(\text{attn\_map}) \in [-1, 0]$ \\
+D2 & FM1 & $L_{mask}$: MSE(CAM, pseudo-mask from $p_3$-channel-variance) \\
+D3 & FM1+ & D2 $+$ union-of-ranks anchors for $L_{con}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.2cm}
+
+- All three **warmstart** from the \texttt{eq\_only} checkpoint (start: val/mAP $= 0.862$)
+- All three run 40 epochs, same data, same $L_{cls} + L_{eq}$ base
+- Pseudo-mask teacher: $p_3$ channel-variance top-25\% intersected with CAM top-25\%
+- `attn_map` is head-averaged, normalized attention concentration in $[0, 1]$
+
+## D1 --- Attention Concentration
+
+### Setup
+- Add $L_{ac} = -\text{mean}(\text{attn\_map})$, $\lambda_{ac} = 0.5$
+- `attn_map`: per-query softmax concentration, range $[0, 1]$
+
+### Trajectory: rapid saturation
+`train/attn_mean`: $0.365 \to 0.806 \to 0.954 \to 0.983 \to \dots \to 0.999$ (ep 1 $\to$ 2 $\to$ 3 $\to$ 5 $\to \dots \to$ 40)
+
+### Result
+
+\footnotesize
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{val/mAP} & \textbf{val/cam\_iou\_best} & \textbf{val/cam\_iou\_auc} & \textbf{train/L\_ac} \\
+\midrule
+baseline (eq-only) & 0.843 & 0.246 & 0.173 & --- \\
+D1 (40 ep) & 0.822 ($\mathbf{-2.1}$) & 0.243 ($-0.3$) & 0.163 ($-1.0$) & $-0.999$ (floor) \\
+\bottomrule
+\end{tabular}
+\end{center}
+\normalsize
+
+\begin{center}
+\fbox{\parbox{0.88\textwidth}{\centering
+\textbf{Mode collapse}: every query peaks on the \emph{same} key. $L_{ac}$ has no dispersion term; val/mAP dropped to $0.566$ at ep 2 and only partially recovered.
+}}
+\end{center}
+
+## D2 --- CAM Pseudo-Mask Supervision
+
+### Setup
+
+- Pseudo-mask from $p_3$ (pre-fusion FPN) channel variance: pos $=$ top-25\%, neg $=$ bottom-25\%
+- Intersect positives with CAM top-25\% (robust to noisy $p_3$)
+- $L_{mask} = \text{MSE}(\text{CAM}, \text{binary mask})$, weighted by $(\text{pos}+\text{neg})$
+- $\lambda_{mask} = 1.0$ with 10-ep linear warmup
+
+### Trajectory
+- $L_{mask}$: $0.140 \to 0.007$ in 5 epochs $\to 0.002$ final (CAM matches teacher fast)
+- $\text{val/cam\_iou\_best}$: $0.251 \to \mathbf{0.284}$ @ ep 2--3 $\to 0.262$ final
+
+### Result
+
+\footnotesize
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{val/mAP} & \textbf{val/cam\_iou\_best} & \textbf{val/cam\_iou\_auc} & \textbf{best\_thr} \\
+\midrule
+baseline (eq-only) & 0.843 & 0.246 & 0.173 & 0.30 \\
+D2 (40 ep) & 0.853 ($+1.0$) & 0.262 ($+1.6$) & \textbf{0.248 ($+7.5$)} & 0.45 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\normalsize
+
+## D2 --- Interpreting the AUC Jump and the Pseudo-Mask Ceiling
+
+Single-threshold best IoU moves $+1.6$ pp. CAM AUC over threshold sweep jumps $+7.5$ pp ($+43\%$ relative).
+
+\vspace{0.2cm}
+
+\begin{center}
+\begin{tabular}{lcccl}
+\toprule
+\textbf{Run} & \textbf{best} & \textbf{auc} & \textbf{ratio} & \textbf{interpretation} \\
+\midrule
+eq-only & 0.246 & 0.173 & 1.42 & sharp; only 1 threshold works \\
+D2 & 0.262 & 0.248 & 1.06 & robust; mostly-flat across sweep \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.2cm}
+
+### Why the headline did not move more
+
+Measured pseudo-mask IoU on val: $p_3$-chvar $\cap$ CAM teacher $\approx 0.32$.
+
+CAM reaches teacher ceiling in $\sim 5$ epochs; further training can only track the teacher's errors.
+
+\vspace{0.1cm}
+
+\begin{center}
+\fbox{\parbox{0.85\textwidth}{\centering
+\textbf{Pseudo-mask ceiling}: learner cannot exceed teacher. Next unlock = better teacher (Phase-3 probe head at 60\%, or WeakCLIP external masks).
+}}
+\end{center}
+
+## D3 --- Mask + Union-of-Ranks Anchors
+
+### Setup
+Build on D2; replace classifier-only anchors for $L_{con}$ with **union of top-$K$ ranks**: $\text{anchor\_idx} = \text{top-}K(\max(\text{rank}_{\text{cls}}, \text{rank}_{\text{chvar}}))$
+
+\footnotesize
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+& \textbf{val/mAP} & \textbf{val/cam\_iou\_best} & \textbf{val/cam\_iou\_auc} & \textbf{train/L\_con} \\
+\midrule
+baseline (eq-only) & 0.843 & 0.246 & 0.173 & --- \\
+D2 (40 ep) & 0.853 & 0.262 & 0.248 & --- \\
+D3 (40 ep) & \textbf{0.862 ($+1.8$)} & \textbf{0.267 ($+2.1$)} & 0.247 & 0.0006 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\normalsize
+
+### Reading
+$L_{con}$ collapsed again ($0.277 \to 0.0006$): union anchors did \emph{not} break self-reference. All D3 gain comes from $L_{mask}$; $L_{con}$ is free but dead.
+
+## Warmstart Artifact: Same Ep-2 Peak in All Three D-Runs
+
+\footnotesize
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Run} & \textbf{ep 1} & \textbf{ep 2} & \textbf{ep 3} & \textbf{ep 40} \\
+\midrule
+D1 & 0.250 & 0.282 & 0.272 & 0.243 \\
+D2 & 0.251 & 0.284 & \textbf{0.284} & 0.262 \\
+D3 & 0.251 & 0.282 & 0.282 & 0.266 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\normalsize
+
+\vspace{0.2cm}
+
+All three runs hit essentially identical $\text{val/cam\_iou\_best}$ peaks at ep 2--3, \emph{regardless} of which aux loss is active (D1 is already corrupting attention by then).
+
+- Most likely cause: fresh-optimizer LR-from-0 warmup + BN stats re-fitting PS$\to$PS+PV distribution
+- `ModelCheckpoint` monitored `val/mAP`, not `val/cam_iou_best` --- these peaks were not saved
+- Need to re-run D2 with \texttt{monitor="val/cam\_iou\_best"} to verify if peak is sticky
+
+## Consolidated Results
+
+\scriptsize
+\begin{center}
+\begin{tabular}{lccccl}
+\toprule
+\textbf{Run} & \textbf{val/mAP} & \textbf{val/cam\_iou\_best} & \textbf{val/cam\_iou\_auc} & \textbf{$\Delta$ base} & \textbf{Verdict} \\
+\midrule
+\texttt{eq\_only} (baseline) & 0.843 & 0.246 & 0.173 & --- & reference \\
+\texttt{eq\_con} (scratch, died) & 0.614 & 0.205 & 0.158 & $-4.1$ & diverged \\
+\texttt{eq\_con\_warmup} & 0.776 & 0.225 & 0.159 & $-2.1$ & still hurts \\
+\texttt{eq\_con\_warmstart} & 0.841 & 0.252 & 0.181 & $+0.6$ & parity \\
+\midrule
+D1 ($L_{ac}$) & 0.822 & 0.243 & 0.163 & $-0.3$ & attn.\ collapse \\
+D2 ($L_{mask}$) & 0.853 & 0.262 & \textbf{0.248} & $+1.6$ & modest win \\
+\textbf{D3 ($L_{mask}$ + union)} & \textbf{0.862} & \textbf{0.267} & 0.247 & \textbf{$+2.1$} & best so far \\
+\bottomrule
+\end{tabular}
+\end{center}
+\normalsize
+
+\vspace{0.2cm}
+
+\footnotesize
+$\Delta$ base = $\text{val/cam\_iou\_best}$ change vs.\ \texttt{eq\_only} (in pp). All D-runs are 40-ep warmstarts from the \texttt{eq\_only} checkpoint.
+
+## What We Learned and What's Next
+
+\begin{columns}
+\begin{column}{0.48\textwidth}
+\textbf{What worked:}
+\begin{itemize}
+\item $L_{mask}$ (D2/D3): CAM becomes threshold-robust (+7.5 pp AUC, +43\% relative)
+\item Warmstart from eq-only ckpt is essential --- scratch diverges
+\item D3 best overall: +1.8 pp mAP, +2.1 pp best IoU
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{What did not work:}
+\begin{itemize}
+\item $L_{con}$: self-reference collapse in \emph{every} configuration
+\item $L_{ac}$: attention mode collapse, classifier damaged
+\item $L_{con}$ from scratch: classification diverges
+\end{itemize}
+\end{column}
+
+\begin{column}{0.48\textwidth}
+\textbf{Binding constraints:}
+\begin{itemize}
+\item Pseudo-mask teacher IoU $\approx 0.32$ caps D2/D3
+\item Checkpoint monitor (val/mAP) misses ep 2--3 CAM peaks ($\sim 0.284$)
+\end{itemize}
+
+\vspace{0.2cm}
+\textbf{Proposed next experiments:}
+\begin{enumerate}
+\item \texttt{control\_warmstart} ($\lambda_{ac}=\lambda_{mask}=0$) --- isolate pure warmstart effect
+\item Switch \texttt{ModelCheckpoint} to \texttt{val/cam\_iou\_best}
+\item Teacher swap: Phase-3 probe head ($\approx 60\%$ IoU) as pseudo-mask source
+\item Redesign $L_{ac}$ with dispersion / locality term to prevent collapse
+\item Replace $L_{con}$ with non-self-referential positives
+\end{enumerate}
+\end{column}
+\end{columns}

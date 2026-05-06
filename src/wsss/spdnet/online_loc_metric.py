@@ -343,8 +343,21 @@ class OnlineCAMIoU:
             query_labels.append(label)
 
             # Resize image+GT mask jointly so they're aligned at training res.
+            # ``interpolation=1`` applies only to the image; albumentations'
+            # ``Resize`` uses ``mask_interpolation=cv2.INTER_NEAREST`` by
+            # default for masks (verified against albumentations 1.x source,
+            # 2026-05). This is the right behaviour: bilinear on a binary
+            # mask would produce grey values that the IoU sweep can't
+            # interpret. We pass ``mask_interpolation=0`` explicitly to
+            # protect the metric's contract from any future albumentations
+            # default change. A defensive ``clamp(0, 1)`` after stack also
+            # guards against any non-{0,1} values introduced upstream
+            # (see RESEARCH_CONTEXT.md §5.14.2 Trap 4 verification).
             tfm = A.Compose([
-                A.Resize(self.image_size, self.image_size, interpolation=1),
+                A.Resize(
+                    self.image_size, self.image_size,
+                    interpolation=1, mask_interpolation=0,
+                ),
                 A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
                 ToTensorV2(),
             ], additional_targets={"mask": "mask"})
@@ -353,7 +366,7 @@ class OnlineCAMIoU:
             mask_t = out["mask"]
             if isinstance(mask_t, np.ndarray):
                 mask_t = torch.from_numpy(mask_t)
-            query_masks.append(mask_t.float())
+            query_masks.append(mask_t.float().clamp_(0.0, 1.0))
 
             # Pick the first active class as the reference key. This is
             # deterministic given the labels, so the metric is repeatable.

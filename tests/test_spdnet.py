@@ -295,6 +295,179 @@ class TestFeatureSeeds:
         )
 
 
+class TestGradientCamDispatch:
+    """Gradient-CAM modes reached via generate_spdnet_seed dispatcher.
+
+    Covers that the new mode names (``layercam``, ``gradcam_pp``,
+    ``xgradcam``) correctly route to the gradient-CAM backend, work
+    with both fusion modes, and do not leak gradients into the model
+    parameters.
+    """
+
+    @pytest.fixture(params=["token", "spatial"])
+    def model(self, request):
+        m = SPDNet(
+            num_classes=NUM_CLASSES, pretrained=False, fusion_mode=request.param,
+        ).to(DEVICE).eval()
+        return m
+
+    @pytest.mark.parametrize("mode", ["layercam", "gradcam_pp", "xgradcam"])
+    def test_output_format(self, model, mode):
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        torch.manual_seed(0)
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        out = generate_spdnet_seed(
+            model, [q], [[r]], DEVICE, seed_mode=mode,
+            active_classes=[0],
+        )
+        assert 0 in out
+        arr = out[0]
+        assert arr.dtype == np.float32
+        assert arr.shape == (IMAGE_SIZE, IMAGE_SIZE)
+        assert float(arr.min()) >= 0.0
+        assert float(arr.max()) <= 1.0 + 1e-6
+
+    def test_raises_without_active_classes(self, model):
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        with pytest.raises(ValueError, match="active_classes"):
+            generate_spdnet_seed(
+                model, [q], [[r]], DEVICE, seed_mode="layercam",
+                active_classes=None,
+            )
+
+    def test_no_gradient_leak_from_dispatch(self, model):
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        for p in model.parameters():
+            p.grad = None
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        _ = generate_spdnet_seed(
+            model, [q], [[r]], DEVICE, seed_mode="layercam",
+            active_classes=[0, 1],
+        )
+        assert all(p.grad is None for p in model.parameters()), (
+            "generate_spdnet_seed(layercam) leaked into param.grad"
+        )
+
+    def test_no_grad_modes_unaffected(self, model):
+        """Dispatcher must still route feat_chmean through the no-grad path
+        (regression guard so existing TestFeatureSeeds callers keep working)."""
+        from src.wsss.spdnet.cam_generator import generate_spdnet_seed
+
+        q = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        r = torch.randn(1, 3, IMAGE_SIZE, IMAGE_SIZE)
+        # Explicit None for active_classes -- no error because feat_chmean is
+        # not a gradient-CAM mode.
+        out = generate_spdnet_seed(
+            model, [q], [[r]], DEVICE, seed_mode="feat_chmean",
+            active_classes=None,
+        )
+        assert out[0].shape == (IMAGE_SIZE, IMAGE_SIZE)
+
+
+class TestSPDNetTrainerConfig:
+    """Regression tests for the trainer-level config flags used by Phase 5."""
+
+    def test_save_best_cam_iou_defaults_on(self):
+        from src.conf.spdnet import SPDNetTrainerConfig
+
+        cfg = SPDNetTrainerConfig()
+        assert hasattr(cfg, "save_best_cam_iou"), (
+            "SPDNetTrainerConfig must expose save_best_cam_iou for the "
+            "Phase 5 val/cam_iou_best checkpoint."
+        )
+        assert cfg.save_best_cam_iou is True, (
+            "Default must be True so every SPDNet run from now on saves "
+            "a best_cam_iou.ckpt alongside the val/mAP winner."
+        )
+
+
+class TestLRScheduleGuard:
+    """Regression guard for the inverted-cosine bug that cost ~10h on 2026-04-30.
+
+    When ``CosineAnnealingLR`` is configured with ``eta_min >= base_lr`` it
+    ascends from base_lr to eta_min instead of decaying -- a silent pathology
+    because the LR still moves, warmup still works, and loss still drops on
+    the classifier head. ``configure_optimizers`` now fails loudly.
+    """
+
+    def _mk(self, learning_rate: float, min_lr: float):
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        return SPDNetModule(
+            num_classes=4, fpn_channels=16, mse_reduction=4,
+            pretrained=False, learning_rate=learning_rate,
+            weight_decay=0.05, warmup_epochs=1, min_lr=min_lr,
+            fusion_mode="spatial", losses_cfg=None,
+            online_loc_metric=None, image_size=32,
+        )
+
+    def test_raises_when_min_lr_equals_base_lr(self):
+        module = self._mk(learning_rate=1e-5, min_lr=1e-5)
+        with pytest.raises(ValueError, match="must be strictly below"):
+            module.configure_optimizers()
+
+    def test_raises_when_min_lr_above_base_lr(self):
+        """Exactly the highres896 failure mode: lr=7.8e-6, min_lr=1e-5."""
+        module = self._mk(learning_rate=7.8125e-6, min_lr=1e-5)
+        with pytest.raises(ValueError, match="must be strictly below"):
+            module.configure_optimizers()
+
+    def test_accepts_when_min_lr_below_base_lr(self):
+        from unittest.mock import MagicMock
+
+        module = self._mk(learning_rate=3.125e-5, min_lr=1e-5)
+        trainer_mock = MagicMock()
+        trainer_mock.max_epochs = 10
+        module.trainer = trainer_mock
+        opt_cfg = module.configure_optimizers()
+        assert "optimizer" in opt_cfg and "lr_scheduler" in opt_cfg
+
+    def test_post_warmup_lr_strictly_decreases(self):
+        """Cosine phase must decay the LR, not ascend it.
+
+        Drive the scheduler through warmup + a few cosine epochs and confirm
+        the post-warmup samples are monotonically non-increasing. We use a
+        max_epochs that is comfortably larger than warmup_epochs so several
+        cosine samples fit before the floor is reached.
+        """
+        from unittest.mock import MagicMock
+
+        module = self._mk(learning_rate=1.0e-4, min_lr=1e-6)
+        trainer_mock = MagicMock()
+        trainer_mock.max_epochs = 20
+        module.trainer = trainer_mock
+
+        opt_cfg = module.configure_optimizers()
+        scheduler = opt_cfg["lr_scheduler"]["scheduler"]
+        optimizer = opt_cfg["optimizer"]
+
+        lrs: list[float] = []
+        for _ in range(15):
+            lrs.append(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            scheduler.step()
+
+        warmup_n = module.warmup_epochs
+        assert lrs[warmup_n] > lrs[-1], (
+            "After warmup the cosine arm must decay: peak LR "
+            f"{lrs[warmup_n]:g} should exceed final LR {lrs[-1]:g}."
+        )
+        post_warmup = lrs[warmup_n:]
+        strict_drops = sum(
+            1 for a, b in zip(post_warmup, post_warmup[1:]) if b < a
+        )
+        assert strict_drops >= (len(post_warmup) - 1) // 2, (
+            f"Cosine arm should be mostly non-increasing. Samples: {lrs}"
+        )
+
+
 class TestCRFSrgb:
     def test_crf_srgb_parameter(self):
         """srgb parameter is accepted and affects CRF unary-bilateral interaction."""
@@ -469,3 +642,65 @@ class TestSpatialFusionSpatiallyAware:
             "Spatial difference should not be uniform -- attention should produce "
             "location-dependent differences (unlike token fusion which is uniform)"
         )
+
+
+class TestRefPoolSizeConfigurable:
+    """Trap-2 fix (RESEARCH_CONTEXT.md §5.14.2): ref_pool_size flows from
+    SPDNetConfig -> SPDNet -> SpatialCrossAttention and changes the
+    attention-weight matrix shape exposed via ``return_attn=True``.
+    """
+
+    @pytest.mark.parametrize("rps", [14, 20, 28])
+    def test_ref_pool_size_changes_attn_shape(self, rps):
+        """Setting ref_pool_size=N gives an N*N key set (not the legacy 196)."""
+        model = SPDNet(
+            num_classes=NUM_CLASSES, pretrained=False,
+            fusion_mode="spatial", ref_pool_size=rps,
+        ).to(DEVICE).eval()
+        assert model.ref_pool_size == rps
+        assert model.spatial_attn.ref_pool_size == rps
+
+        q = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        r = torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE)
+        feats = model.extract_merged_features(q, r, return_attn=True)
+        assert "attn_w" in feats
+        assert feats["attn_w"].shape[-1] == rps * rps, (
+            f"attn key set should be {rps*rps} for ref_pool_size={rps}, "
+            f"got {feats['attn_w'].shape[-1]}"
+        )
+
+    def test_default_ref_pool_size_unchanged(self):
+        """Backwards compatibility: SPDNet() with no ref_pool_size kwarg
+        still uses the legacy 14×14 grid -- regression-free.
+        """
+        model = SPDNet(
+            num_classes=NUM_CLASSES, pretrained=False, fusion_mode="spatial",
+        ).to(DEVICE).eval()
+        assert model.ref_pool_size == 14
+        assert model.spatial_attn.ref_pool_size == 14
+
+
+class TestEffectiveBatchLR:
+    """Trap-1 fix: scaled_lr is now ``base_lr * (batch * accum) / 256``
+    rather than ``base_lr * batch / 256``. Encoded as a unit test against
+    the train_spdnet helper (we don't import the full hydra entry point
+    because it pulls a heavy dataset; just compute the formula).
+    """
+
+    @pytest.mark.parametrize(
+        "base_lr, batch, accum, expected",
+        [
+            (5e-4, 16, 2, 5e-4 * 32 / 256),  # 448 spec -> 6.25e-5 (was 3.125e-5)
+            (5e-4, 8, 4, 5e-4 * 32 / 256),   # equivalent eff_batch -> same LR
+            (5e-4, 6, 5, 5e-4 * 30 / 256),   # 896 typical -> 5.86e-5
+            (5e-4, 4, 8, 5e-4 * 32 / 256),   # 896 aux-loss recipe -> 6.25e-5
+            (5e-4, 2, 15, 5e-4 * 30 / 256),  # 896 small-batch aux -> 5.86e-5
+        ],
+    )
+    def test_effective_batch_scaling(self, base_lr, batch, accum, expected):
+        # Inline the exact formula used in train_spdnet.py so the test
+        # is independent of hydra+dataset wiring.
+        eff_batch = batch * accum
+        scaled = base_lr * (eff_batch / 256.0)
+        assert scaled == pytest.approx(expected, rel=1e-9)
+

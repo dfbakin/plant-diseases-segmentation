@@ -1,0 +1,6 @@
+outs:
+- md5: 1fc7952e6f75271dbb9dc61e6f84d2d1.dir
+  size: 3922211241
+  nfiles: 16
+  hash: md5
+  path: phase5_highres

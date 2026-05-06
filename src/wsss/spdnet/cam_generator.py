@@ -20,6 +20,12 @@ from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision import transforms
 from tqdm import tqdm
 
+from src.wsss.spdnet.gradient_cam_methods import (
+    MAX_CLASSES_PER_IMAGE,
+    generate_gradient_spdnet_seed,
+    is_gradient_cam_mode,
+    list_methods as list_gradient_cam_methods,
+)
 from src.wsss.spdnet.model import SPDNet
 
 log = logging.getLogger(__name__)
@@ -143,56 +149,172 @@ def generate_spdnet_cam(
     return cam_dict
 
 
-@torch.no_grad()
 def generate_spdnet_seed(
     model: SPDNet,
     query_images: list[torch.Tensor],
     ref_image_lists: list[list[torch.Tensor]],
     device: torch.device,
     seed_mode: str = "feat_chmean",
+    active_classes: list[int] | None = None,
+    target_layer: str = "query_merged",
+    max_classes_per_image: int = MAX_CLASSES_PER_IMAGE,
 ) -> dict[int, np.ndarray]:
-    """Generate a feature-based seed map (no classifier projection).
+    """Generate a seed map from one image with multi-scale / flip TTA.
+
+    Dispatches between three code paths:
+
+      * **Feature / attention readouts** (``feat_*``, ``fused_*``,
+        ``spatial_proto``, ``attn_map``, ``attn_max``): pure no-grad
+        channel-wise aggregations of intermediate tensors. This is the
+        original implementation and is unchanged.
+      * **Classifier CAM** (``cam_max``): produced by
+        ``generate_spdnet_cam`` / ``generate_all_cams`` elsewhere; not
+        routed through this function.
+      * **Gradient-based CAMs** (``layercam``, ``gradcam_pp``,
+        ``xgradcam``): require gradients w.r.t. a captured intermediate
+        activation and an explicit active-class list. Delegated to
+        ``generate_gradient_spdnet_seed``.
 
     Args:
-        query_images: list of (1, 3, H_s, W_s) tensors at different scales/flips
-        ref_image_lists: for each scale/flip, list of N reference tensors
-        device: computation device
-        seed_mode: one of "feat_chmean", "feat_chmax", "spatial_proto"
+        query_images: list of (1, 3, H_s, W_s) tensors at different scales/flips.
+        ref_image_lists: for each scale/flip, list of N reference tensors.
+        device: computation device.
+        seed_mode: one of:
+            * ``feat_chmean``, ``feat_neg_chmean``, ``feat_chvar``,
+              ``feat_chmax``, ``feat_l2norm``   (pre-fusion ``query_merged``)
+            * ``fused_<any of above>``         (post-fusion ``fused``)
+            * ``spatial_proto``                (cosine to ref prototype)
+            * ``attn_map``, ``attn_max``       (spatial attention read-outs;
+              the direct targets of ``L_ac`` / ``L_marg_H``). Only valid when
+              the model runs in spatial-attention fusion mode.
+            * ``layercam``, ``gradcam_pp``, ``xgradcam``  (gradient CAMs;
+              require ``active_classes`` to be set).
+        active_classes: foreground class indices to aggregate for
+            gradient-CAM modes. Ignored by all other modes. Required
+            (non-empty) when ``seed_mode`` is a gradient-CAM mode.
+        target_layer: target layer for gradient-CAM modes; one of
+            ``"query_merged"`` (default, probe P3), ``"fused"`` (P4),
+            ``"layer4"`` (P1).
+        max_classes_per_image: cap on gradient-CAM active-class count
+            (one backward per class).
 
     Returns:
-        {0: float32_2d_array} min-max normalized to [0, 1]
+        {0: float32_2d_array} min-max normalized to [0, 1].
+    """
+    # Normalise aliases: users often type "fused_chvar" meaning the post-fusion
+    # channel variance. Internally we keep the "fused_feat_*" canonical form.
+    _FUSED_ALIASES = {
+        "fused_chmean": "fused_feat_chmean",
+        "fused_neg_chmean": "fused_feat_neg_chmean",
+        "fused_chvar": "fused_feat_chvar",
+        "fused_chmax": "fused_feat_chmax",
+        "fused_l2norm": "fused_feat_l2norm",
+    }
+    seed_mode = _FUSED_ALIASES.get(seed_mode, seed_mode)
+
+    # Gradient-CAM dispatch. Uses ``torch.enable_grad()`` internally
+    # (the @torch.no_grad() decorator is gone from this function so
+    # the dispatch branch below is free to set its own grad context).
+    if is_gradient_cam_mode(seed_mode):
+        if not active_classes:
+            raise ValueError(
+                f"seed_mode={seed_mode!r} is a gradient-CAM method "
+                f"({list_gradient_cam_methods()}) and requires a non-empty "
+                f"active_classes list (got {active_classes!r}). "
+                f"generate_all_seeds passes it automatically from the "
+                f"per-image label_dict."
+            )
+        return generate_gradient_spdnet_seed(
+            model=model,
+            query_images=query_images,
+            ref_image_lists=ref_image_lists,
+            active_classes=active_classes,
+            device=device,
+            method=seed_mode,  # type: ignore[arg-type]
+            target_layer=target_layer,  # type: ignore[arg-type]
+            max_classes_per_image=max_classes_per_image,
+        )
+
+    # Non-gradient path: unchanged, wrap in an explicit no_grad block.
+    with torch.no_grad():
+        return _no_grad_seed(
+            model=model,
+            query_images=query_images,
+            ref_image_lists=ref_image_lists,
+            device=device,
+            seed_mode=seed_mode,
+        )
+
+
+def _no_grad_seed(
+    model: SPDNet,
+    query_images: list[torch.Tensor],
+    ref_image_lists: list[list[torch.Tensor]],
+    device: torch.device,
+    seed_mode: str,
+) -> dict[int, np.ndarray]:
+    """Original no-grad seed generation (feat_* / fused_* / attn_* / spatial_proto).
+
+    Separated out from ``generate_spdnet_seed`` so the dispatcher can
+    route gradient-CAM modes through an ``enable_grad`` path without
+    duplicating logic. Callers should prefer ``generate_spdnet_seed``.
     """
     h_orig = query_images[0].shape[2]
     w_orig = query_images[0].shape[3]
     seed_2d_list = []
+    needs_attn = seed_mode in {"attn_map", "attn_max"}
 
     for s, (q_img, r_imgs) in enumerate(zip(query_images, ref_image_lists)):
         q_img = q_img.to(device)
         refs = [r.to(device) for r in r_imgs]
 
-        feats = model.extract_merged_features(q_img, refs if len(refs) > 1 else refs[0])
+        feats = model.extract_merged_features(
+            q_img, refs if len(refs) > 1 else refs[0],
+            return_attn=needs_attn,
+        )
 
-        feat_src = feats.get("fused", feats["query_merged"]) if seed_mode.startswith("fused_") else feats["query_merged"]
-        mode_key = seed_mode.removeprefix("fused_")
-
-        if mode_key == "feat_chmean":
-            feat_map = feat_src.mean(dim=1, keepdim=True)
-        elif mode_key == "feat_neg_chmean":
-            feat_map = -feat_src.mean(dim=1, keepdim=True)
-        elif mode_key == "feat_chvar":
-            feat_map = feat_src.var(dim=1, keepdim=True)
-        elif mode_key == "feat_chmax":
-            feat_map = feat_src.amax(dim=1, keepdim=True)
-        elif mode_key == "feat_l2norm":
-            feat_map = feat_src.norm(dim=1, keepdim=True)
-        elif mode_key == "spatial_proto":
-            ref_merged = feats["ref_merged"]
-            proto = F.normalize(ref_merged.mean(dim=[2, 3]), dim=1)  # (B, C)
-            query_norm = F.normalize(feats["query_merged"], dim=1)   # (B, C, H, W)
-            sim = (query_norm * proto[:, :, None, None]).sum(dim=1, keepdim=True)
-            feat_map = sim
+        if needs_attn:
+            if "attn_map" not in feats:
+                raise ValueError(
+                    f"seed_mode={seed_mode!r} requires spatial-attention fusion "
+                    "but the model did not return attn_map (is fusion_mode='spatial'?)"
+                )
+            if seed_mode == "attn_map":
+                # (B, H_q, W_q) in [0, 1], already head-averaged normalized
+                # negative entropy (higher = more concentrated).
+                feat_map = feats["attn_map"].unsqueeze(1)  # (B, 1, H_q, W_q)
+            else:  # attn_max
+                # attn_w: (B, P, N_k). Max attention weight per query position.
+                attn_w = feats["attn_w"]
+                q_hw = feats["query_merged"].shape[-2:]
+                peak = attn_w.max(dim=-1).values                  # (B, P)
+                feat_map = peak.view(-1, 1, *q_hw)                # (B, 1, H_q, W_q)
         else:
-            raise ValueError(f"Unknown seed_mode: {seed_mode!r}")
+            feat_src = (
+                feats.get("fused", feats["query_merged"])
+                if seed_mode.startswith("fused_")
+                else feats["query_merged"]
+            )
+            mode_key = seed_mode.removeprefix("fused_")
+
+            if mode_key == "feat_chmean":
+                feat_map = feat_src.mean(dim=1, keepdim=True)
+            elif mode_key == "feat_neg_chmean":
+                feat_map = -feat_src.mean(dim=1, keepdim=True)
+            elif mode_key == "feat_chvar":
+                feat_map = feat_src.var(dim=1, keepdim=True)
+            elif mode_key == "feat_chmax":
+                feat_map = feat_src.amax(dim=1, keepdim=True)
+            elif mode_key == "feat_l2norm":
+                feat_map = feat_src.norm(dim=1, keepdim=True)
+            elif mode_key == "spatial_proto":
+                ref_merged = feats["ref_merged"]
+                proto = F.normalize(ref_merged.mean(dim=[2, 3]), dim=1)  # (B, C)
+                query_norm = F.normalize(feats["query_merged"], dim=1)   # (B, C, H, W)
+                sim = (query_norm * proto[:, :, None, None]).sum(dim=1, keepdim=True)
+                feat_map = sim
+            else:
+                raise ValueError(f"Unknown seed_mode: {seed_mode!r}")
 
         feat_2d = F.interpolate(
             feat_map, size=(h_orig, w_orig), mode="bilinear", align_corners=False
@@ -227,6 +349,8 @@ def generate_all_seeds(
     ref_pool: dict[int, list[str]] | None = None,
     ref_image_dir: Path | None = None,
     query_class_resolver=None,
+    target_layer: str = "query_merged",
+    max_classes_per_image: int = MAX_CLASSES_PER_IMAGE,
 ) -> list[str]:
     """Generate feature-based seed maps for all images.
 
@@ -247,6 +371,10 @@ def generate_all_seeds(
             when the query labels are a binary fallback (label[0]=1) but
             the true class can be parsed from the filename. If ``None``,
             falls back to ``label_dict[name].argmax()``.
+        target_layer: (gradient-CAM modes only) ``"query_merged"``
+            (default, probe P3), ``"fused"`` (P4), or ``"layer4"`` (P1).
+        max_classes_per_image: (gradient-CAM modes only) hard cap on the
+            number of active classes per image (one backward per class).
     """
     random.seed(SEED)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -331,7 +459,10 @@ def generate_all_seeds(
             ref_img_lists.append([torch.flip(rt, [-1]) for rt in r_tensors])
 
         seed_dict = generate_spdnet_seed(
-            model, query_imgs, ref_img_lists, device, seed_mode
+            model, query_imgs, ref_img_lists, device, seed_mode,
+            active_classes=active_classes,
+            target_layer=target_layer,
+            max_classes_per_image=max_classes_per_image,
         )
 
         if seed_dict:

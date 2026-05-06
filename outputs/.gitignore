@@ -10,3 +10,6 @@
 
 /spdnet_plantseg
 /visualizations
+/phase5_lr_fix
+/phase5_highres
+/spdnet_aux_losses

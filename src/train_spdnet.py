@@ -143,10 +143,59 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         collate_fn=siamese_collate_fn,
     )
 
-    scaled_lr = cfg.model.learning_rate * dcfg.batch_size / 256.0
-    log.info(f"LR scaling: {cfg.model.learning_rate} * {dcfg.batch_size}/256 = {scaled_lr}")
+    # ----- Learning-rate calibration (Trap 1 fix; see RESEARCH_CONTEXT.md
+    # §5.14.2). The legacy formula ``base_lr * batch_size / 256``
+    # silently ignored ``accumulate_grad_batches``: the optimizer step
+    # actually sees an effective batch of ``batch_size * accum``, but the
+    # scaling rule was applied to the *micro*-batch only. So a config
+    # that bumped accum to halve the per-step batch (typical when
+    # scaling image_size with a fixed VRAM cap) ended up with HALF the
+    # appropriate LR at the same effective batch -- the H4 highres run
+    # was a textbook example. The fixed rule uses ``eff_batch / 256``,
+    # which is the linear-scaling rule applied to what the optimizer
+    # actually sees. NOTE this DOES change the absolute LR for 448 runs
+    # that previously used accum>1: those runs were also gradient-
+    # starved (just less than H4) and the new LR is the right target.
+    # Pass ``model.learning_rate_override`` to pin the LR directly and
+    # bypass the rule (useful for reproducing legacy runs or for
+    # explicit hyperparameter sweeps).
+    accum = max(1, int(getattr(cfg.trainer, "accumulate_grad_batches", 1)))
+    eff_batch = dcfg.batch_size * accum
+    auto_scaled_lr = cfg.model.learning_rate * (eff_batch / 256.0)
+
+    lr_override = float(getattr(cfg.model, "learning_rate_override", 0.0) or 0.0)
+    if lr_override > 0.0:
+        scaled_lr = lr_override
+        log.info(
+            f"LR override: model.learning_rate_override={lr_override} -> "
+            f"scaled_lr={scaled_lr} (auto would have been {auto_scaled_lr:.6g})"
+        )
+    else:
+        scaled_lr = auto_scaled_lr
+        log.info(
+            f"LR scaling: base={cfg.model.learning_rate} * eff_batch="
+            f"{eff_batch}({dcfg.batch_size}*{accum})/256 = {scaled_lr:.6g} "
+            f"(legacy: per_step_batch/256 = "
+            f"{cfg.model.learning_rate * dcfg.batch_size / 256.0:.6g})"
+        )
 
     fusion_mode = getattr(cfg.model, "fusion_mode", "token")
+    # ----- Trap 2 fix: scale ref_pool_size with image_size when "auto"
+    # (model.ref_pool_size=0). The 44x divisor preserves the legacy
+    # ref_pool_size=14 at 448² (regression-free for previously-tuned
+    # checkpoints) and bumps to 20 at 896² (Q:K = 224²:20² = 125:1 vs
+    # the legacy 256:1 at rps=14). See SPDNetModelConfig.ref_pool_size
+    # docstring + scripts/smoke_test_spdnet_highres.py for the VRAM
+    # envelope that motivated this choice.
+    raw_ref_pool = int(getattr(cfg.model, "ref_pool_size", 0) or 0)
+    if raw_ref_pool <= 0:
+        ref_pool_size = max(14, image_size // 44)
+        log.info(
+            f"ref_pool_size auto: max(14, {image_size}//44) = {ref_pool_size}"
+        )
+    else:
+        ref_pool_size = raw_ref_pool
+        log.info(f"ref_pool_size override: {ref_pool_size}")
 
     losses_cfg = getattr(cfg, "losses", None)
     online_metric: OnlineCAMIoU | None = None
@@ -187,6 +236,7 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         losses_cfg=losses_cfg,
         online_loc_metric=online_metric,
         image_size=image_size,
+        ref_pool_size=ref_pool_size,
     )
     total_params = sum(p.numel() for p in module.parameters())
     log.info(f"Model parameters: {total_params:,}  fusion_mode={fusion_mode}")
@@ -268,6 +318,29 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         LearningRateMonitor(logging_interval="epoch"),
         RichProgressBar(),
     ]
+
+    # Optional second checkpoint: track val/cam_iou_best (online macro
+    # disease-IoU emitted by OnlineCAMIoU). Added as a sibling to the
+    # val/mAP checkpoint rather than replacing it, since classification
+    # and localization performance can and do diverge mid-training. The
+    # resulting file is ``checkpoints/best_cam_iou.ckpt`` (deterministic
+    # filename -- eval scripts can hardcode it).
+    # Gated on cfg.trainer.save_best_cam_iou so legacy configs without
+    # OnlineCAMIoU (which never log val/cam_iou_best) can opt out. If the
+    # metric is never logged the callback silently keeps save_top_k=1
+    # slot empty; that is preferable to crashing on missing metric.
+    if getattr(cfg.trainer, "save_best_cam_iou", True):
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=output_dir / "checkpoints",
+                filename="best_cam_iou",
+                monitor="val/cam_iou_best",
+                mode="max",
+                save_top_k=1,
+                save_last=False,
+                auto_insert_metric_name=False,
+            )
+        )
 
     trainer = L.Trainer(
         max_epochs=cfg.trainer.max_epochs,

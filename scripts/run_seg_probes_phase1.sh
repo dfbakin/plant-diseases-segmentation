@@ -28,6 +28,14 @@
 #       the token (5) and spatial-baseline (6) loops, and skips their
 #       preflight file checks. Useful when the original baseline ckpts
 #       have been pruned / aren't available locally.
+#
+#   AUX_ONLY=1 AUX_POSITIONS="P1_layer4 P3_query_merged P4_fused" \
+#       CKPT_AUX=... AUX_TAG=... bash scripts/run_seg_probes_phase1.sh
+#       Further narrows the aux leg to the positions named in
+#       AUX_POSITIONS (space-separated). Used by the Phase 5 launch
+#       guide to probe only the 3 most informative positions on
+#       d4_ac_safe / highres-896 checkpoints, cutting the aux leg
+#       from 6 probes to 3 (~3 h vs ~6 h on a single 5090).
 ###############################################################################
 
 set -euo pipefail
@@ -60,6 +68,28 @@ AUX_ONLY="${AUX_ONLY:-0}"
 ALL_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier P6_attn_map)
 TOKEN_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier)
 SPATIAL_POSITIONS=(P1_layer4 P2_fpn_p2 P3_query_merged P4_fused P5_cam_classifier P6_attn_map)
+
+# AUX_POSITIONS override: when set, replaces the position list used for
+# the aux-only leg. Accepts a space-separated list inside one string so
+# the env var is easy to pass from the launch guide. Validated against
+# ALL_POSITIONS below to catch typos before any probe training starts.
+AUX_POSITIONS_RAW="${AUX_POSITIONS:-}"
+if [[ -n "$AUX_POSITIONS_RAW" ]]; then
+    read -r -a AUX_POSITIONS_ARR <<< "$AUX_POSITIONS_RAW"
+    for pos in "${AUX_POSITIONS_ARR[@]}"; do
+        found=0
+        for valid in "${ALL_POSITIONS[@]}"; do
+            if [[ "$pos" == "$valid" ]]; then found=1; break; fi
+        done
+        if [[ "$found" -eq 0 ]]; then
+            echo "ERROR: AUX_POSITIONS contains unknown position '$pos'." >&2
+            echo "       Valid: ${ALL_POSITIONS[*]}" >&2
+            exit 1
+        fi
+    done
+else
+    AUX_POSITIONS_ARR=("${SPATIAL_POSITIONS[@]}")
+fi
 
 # ----------------------------------------------------------------------------
 # Smoke vs full
@@ -216,10 +246,11 @@ fi
 if [[ -n "$CKPT_AUX" ]]; then
     echo ""
     echo "============================================================"
-    echo "  Aux-loss spatial checkpoint -- 6 positions  (tag=$AUX_TAG)"
+    echo "  Aux-loss spatial checkpoint -- ${#AUX_POSITIONS_ARR[@]} positions  (tag=$AUX_TAG)"
+    echo "  positions: ${AUX_POSITIONS_ARR[*]}"
     echo "  (set via CKPT_AUX=$CKPT_AUX)"
     echo "============================================================"
-    for pos in "${SPATIAL_POSITIONS[@]}"; do
+    for pos in "${AUX_POSITIONS_ARR[@]}"; do
         run_one_probe "$AUX_TAG" "$CKPT_AUX" "$pos" 2>&1 | tee -a "$LOG_FILE"
     done
 fi

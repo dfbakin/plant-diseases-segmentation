@@ -1,0 +1,6 @@
+outs:
+- md5: f569a02773026157ef7b11a067b91580.dir
+  size: 7848114661
+  nfiles: 35
+  hash: md5
+  path: spdnet_aux_losses
