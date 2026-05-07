@@ -5,8 +5,11 @@ Example:
     python src/train_spdnet.py trainer.max_epochs=5 data.batch_size=8
 """
 
+import datetime
 import logging
+import os
 from pathlib import Path
+from typing import Any
 
 import hydra
 import lightning as L
@@ -18,6 +21,7 @@ from lightning.pytorch.callbacks import (
     RichProgressBar,
 )
 from lightning.pytorch.loggers import MLFlowLogger
+from lightning.pytorch.strategies import DDPStrategy
 from omegaconf import DictConfig, OmegaConf
 from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -34,6 +38,60 @@ log = logging.getLogger(__name__)
 
 cs = ConfigStore.instance()
 cs.store(name="spdnet_config", node=SPDNetConfig)
+
+
+def _resolve_trainer_strategy(
+    strategy: str,
+    devices: Any,
+    find_unused_parameters: bool,
+    ddp_timeout_seconds: int = 0,
+) -> Any:
+    """Translate the ``trainer.strategy`` config knob into a Lightning argument.
+
+    SPDNet's training step is conditionally branched (``proj_head`` only
+    when ``lambda_con > 0``, ``ema_teacher`` only when ``lambda_distill > 0``,
+    attention-buffer compute only when ``want_attn``). Lightning's default
+    ``DDPStrategy`` constructed via ``strategy="auto"`` runs with
+    ``find_unused_parameters=False`` and DDP raises "expected to have
+    finished reduction in the prior iteration" the first time rank 1
+    touches a parameter rank 0 didn't exercise.
+
+    The contract:
+
+    * ``devices in (None, 0, 1)`` -> pass the string through verbatim
+      (Lightning will pick a single-device runtime; ``"auto"`` -> single
+      GPU when one is available, CPU otherwise).
+    * ``devices > 1`` AND ``strategy in {"auto", "ddp"}`` -> return a
+      fully-constructed ``DDPStrategy`` with the SPDNet-safe options
+      (``find_unused_parameters`` from config, ``gradient_as_bucket_view``
+      always on for the small memory + perf win, ``timeout`` from
+      ``ddp_timeout_seconds`` so future cross-rank deadlocks fail in
+      minutes instead of the 30-min NCCL default).
+    * ``devices > 1`` AND ``strategy not in {"auto", "ddp"}`` -> pass
+      the string through (forwarded verbatim to Lightning, lets users
+      pick ``"deepspeed"`` / ``"fsdp"`` / etc. without code changes).
+
+    Returns either a ``DDPStrategy`` instance or the original string.
+    """
+    if devices is None:
+        return strategy
+    try:
+        n_devices = int(devices)
+    except (TypeError, ValueError):
+        return strategy
+    if n_devices <= 1:
+        return strategy
+    if strategy not in ("auto", "ddp"):
+        return strategy
+    kwargs: dict[str, Any] = dict(
+        find_unused_parameters=bool(find_unused_parameters),
+        gradient_as_bucket_view=True,
+    )
+    # ddp_timeout_seconds=0 -> use Lightning's default (1800 s).
+    timeout_s = int(ddp_timeout_seconds or 0)
+    if timeout_s > 0:
+        kwargs["timeout"] = datetime.timedelta(seconds=timeout_s)
+    return DDPStrategy(**kwargs)
 
 
 def build_train_transform(image_size: int, augmentation: str = "heavy") -> transforms.Compose:
@@ -302,9 +360,19 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         },
     )
 
-    config_path = output_dir / "config.yaml"
-    OmegaConf.save(cfg, config_path)
-    mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(config_path))
+    # Persist a copy of the resolved config alongside the run output and
+    # ship it to MLflow as an artifact. Only rank 0 needs to write the
+    # YAML to disk (the file is identical across ranks, but multiple
+    # writers racing on the same path can produce a partial file in
+    # rare cases). ``mlflow_logger.experiment`` is wrapped by
+    # ``@rank_zero_experiment`` so the ``log_artifact`` call is already
+    # a no-op on non-rank-0 ranks; we still gate it inside the same
+    # branch for symmetry and to skip the os-level stat() round-trip.
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("NODE_RANK", "0")))
+    if local_rank == 0:
+        config_path = output_dir / "config.yaml"
+        OmegaConf.save(cfg, config_path)
+        mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(config_path))
 
     callbacks = [
         ModelCheckpoint(
@@ -342,10 +410,31 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
             )
         )
 
+    # ----- DDP strategy resolution. See ``_resolve_trainer_strategy`` at
+    # module top for the full rationale. The short version: Lightning's
+    # default ``"auto"`` constructs a ``DDPStrategy`` with
+    # ``find_unused_parameters=False``, which crashes the moment SPDNet
+    # enters one of its conditional aux-loss branches on a single rank.
+    strategy_arg = _resolve_trainer_strategy(
+        strategy=cfg.trainer.strategy,
+        devices=cfg.trainer.devices,
+        find_unused_parameters=cfg.trainer.find_unused_parameters,
+        ddp_timeout_seconds=int(getattr(cfg.trainer, "ddp_timeout_seconds", 0) or 0),
+    )
+
+    # ``trainer.sync_batchnorm`` is silently no-op'd by Lightning when
+    # ``devices <= 1`` so the cast is safe across the single-card and
+    # DDP code paths. See ``SPDNetTrainerConfig.sync_batchnorm`` for
+    # the rationale (small per-rank BN batch under 5090 DDP).
+    sync_bn = bool(getattr(cfg.trainer, "sync_batchnorm", False))
+
     trainer = L.Trainer(
         max_epochs=cfg.trainer.max_epochs,
         accelerator=cfg.trainer.accelerator,
         devices=cfg.trainer.devices,
+        strategy=strategy_arg,
+        use_distributed_sampler=True,
+        sync_batchnorm=sync_bn,
         precision=cfg.trainer.precision,
         accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
         gradient_clip_val=cfg.trainer.gradient_clip_val or None,

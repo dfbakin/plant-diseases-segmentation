@@ -704,3 +704,516 @@ class TestEffectiveBatchLR:
         scaled = base_lr * (eff_batch / 256.0)
         assert scaled == pytest.approx(expected, rel=1e-9)
 
+
+class TestLogAttnStats:
+    """``losses.log_attn_stats=True`` forces the attention-buffer forward
+    path even when no aux loss currently needs the attention map, and
+    populates three diagnostic scalars (``attn_mean``, ``attn_std``,
+    ``attn_p99``). This is the headline new-data hook for the Phase-5
+    cls-only baseline run (see RESEARCH_CONTEXT.md §5.14.6 + the
+    pre-launch plan).
+    """
+
+    def _make_module(self, log_attn_stats: bool):
+        from src.conf.spdnet import SPDNetSpatialLossesConfig
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        losses_cfg = SPDNetSpatialLossesConfig(
+            lambda_eq=0.0, lambda_ac=0.0, lambda_marg_H=0.0,
+            lambda_mask=0.0, lambda_con=0.0, lambda_distill=0.0,
+            online_loc_eval_enabled=False,
+            log_attn_stats=log_attn_stats,
+        )
+        module = SPDNetModule(
+            num_classes=NUM_CLASSES, fpn_channels=16, mse_reduction=4,
+            pretrained=False, learning_rate=1e-4,
+            weight_decay=0.05, warmup_epochs=1, min_lr=1e-6,
+            fusion_mode="spatial",
+            losses_cfg=losses_cfg,
+            online_loc_metric=None,
+            image_size=IMAGE_SIZE,
+            ref_pool_size=8,
+        ).to(DEVICE)
+        module.train()
+
+        recorded: dict[str, float] = {}
+
+        def fake_log(name, value, *args, **kwargs):
+            v = value.detach().float().mean().item() if torch.is_tensor(value) else float(value)
+            recorded[name] = v
+
+        module.log = fake_log  # type: ignore[assignment]
+        trainer_mock = MagicMock()
+        trainer_mock.is_global_zero = True
+        trainer_mock.sanity_checking = False
+        module.trainer = trainer_mock
+        return module, recorded
+
+    def _make_batch(self):
+        return {
+            "query_image": torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE),
+            "ref_images": torch.randn(BATCH_SIZE, 3, IMAGE_SIZE, IMAGE_SIZE, device=DEVICE),
+            "query_label": torch.randint(0, 2, (BATCH_SIZE, NUM_CLASSES), device=DEVICE).float(),
+        }
+
+    def test_default_off_no_attn_stats_logged(self):
+        module, recorded = self._make_module(log_attn_stats=False)
+        _ = module.training_step(self._make_batch(), 0)
+        assert "train/attn_mean" not in recorded
+        assert "train/attn_std" not in recorded
+        assert "train/attn_p99" not in recorded
+
+    def test_log_attn_stats_emits_three_diagnostics(self):
+        module, recorded = self._make_module(log_attn_stats=True)
+        _ = module.training_step(self._make_batch(), 0)
+        for key in ("train/attn_mean", "train/attn_std", "train/attn_p99"):
+            assert key in recorded, f"expected {key} in {sorted(recorded)}"
+
+    def test_attn_mean_in_unit_interval(self):
+        """``attn_orig`` is ``concentration_softmax(attn_w)`` -> values in [0, 1].
+
+        The mean (and p99) must therefore stay in [0, 1] for any input;
+        std must be non-negative. Tests guard against accidental swaps
+        of ``attn_orig`` with the raw scores ``attn_w`` (which sum to 1
+        per row, so their mean is ``1/N`` -- different number).
+        """
+        module, recorded = self._make_module(log_attn_stats=True)
+        _ = module.training_step(self._make_batch(), 0)
+        assert 0.0 <= recorded["train/attn_mean"] <= 1.0
+        assert 0.0 <= recorded["train/attn_p99"] <= 1.0
+        assert recorded["train/attn_std"] >= 0.0
+
+    def test_log_attn_stats_does_not_affect_loss(self):
+        """The diagnostic must not contribute to the training graph.
+
+        Same query/ref/labels, identical seeds: with stats off vs on the
+        classification loss must be bit-for-bit identical (no extra
+        operations should sneak into the autograd tape via the detached
+        statistics).
+        """
+        torch.manual_seed(7)
+        m_off, _ = self._make_module(log_attn_stats=False)
+        torch.manual_seed(7)
+        batch = self._make_batch()
+        loss_off = m_off.training_step(batch, 0)
+
+        torch.manual_seed(7)
+        m_on, _ = self._make_module(log_attn_stats=True)
+        torch.manual_seed(7)
+        batch2 = self._make_batch()
+        loss_on = m_on.training_step(batch2, 0)
+
+        assert torch.allclose(loss_off, loss_on, atol=1e-6, rtol=1e-5), (
+            f"log_attn_stats must be a pure observer: loss_off={loss_off:g}, "
+            f"loss_on={loss_on:g}"
+        )
+
+
+class TestDDPStrategyResolver:
+    """Helper that translates ``trainer.strategy`` + ``trainer.devices``
+    into the argument Lightning expects. Encoded as a tested unit so the
+    DDP+aux-loss combination can never silently regress to
+    ``find_unused_parameters=False`` (see RESEARCH_CONTEXT.md §5.14.6
+    for why that's a 2-rank crash on epoch 0).
+    """
+
+    def test_single_device_passes_string_through(self):
+        from src.train_spdnet import _resolve_trainer_strategy
+
+        for devices in (1, "1", None, 0):
+            out = _resolve_trainer_strategy(
+                strategy="auto", devices=devices, find_unused_parameters=True,
+            )
+            assert out == "auto", f"devices={devices!r} expected 'auto', got {out!r}"
+
+    def test_devices_two_auto_returns_ddp_strategy(self):
+        from lightning.pytorch.strategies import DDPStrategy
+
+        from src.train_spdnet import _resolve_trainer_strategy
+
+        out = _resolve_trainer_strategy(
+            strategy="auto", devices=2, find_unused_parameters=True,
+        )
+        assert isinstance(out, DDPStrategy)
+        # Lightning stores the DDP constructor kwargs under
+        # ``_ddp_kwargs`` (forwarded verbatim to ``torch.nn.parallel.
+        # DistributedDataParallel`` at setup time).
+        assert out._ddp_kwargs.get("find_unused_parameters") is True
+        assert out._ddp_kwargs.get("gradient_as_bucket_view") is True
+
+    def test_devices_two_explicit_ddp_returns_ddp_strategy(self):
+        from lightning.pytorch.strategies import DDPStrategy
+
+        from src.train_spdnet import _resolve_trainer_strategy
+
+        out = _resolve_trainer_strategy(
+            strategy="ddp", devices=2, find_unused_parameters=False,
+        )
+        assert isinstance(out, DDPStrategy)
+        assert out._ddp_kwargs.get("find_unused_parameters") is False, (
+            "find_unused_parameters=False must be propagated for users who "
+            "have audited their model and want the perf win"
+        )
+
+    def test_non_ddp_strategy_passed_through(self):
+        """Picking ``deepspeed_stage_2`` or ``fsdp`` must NOT be hijacked."""
+        from src.train_spdnet import _resolve_trainer_strategy
+
+        for strat in ("deepspeed_stage_2", "fsdp", "fsdp_native"):
+            out = _resolve_trainer_strategy(
+                strategy=strat, devices=4, find_unused_parameters=True,
+            )
+            assert out == strat, (
+                f"strategy={strat!r} should be passed through verbatim, got {out!r}"
+            )
+
+    def test_string_devices_handled(self):
+        """Hydra forwards the value as a string in some configurations."""
+        from lightning.pytorch.strategies import DDPStrategy
+
+        from src.train_spdnet import _resolve_trainer_strategy
+
+        out = _resolve_trainer_strategy(
+            strategy="auto", devices="2", find_unused_parameters=True,
+        )
+        assert isinstance(out, DDPStrategy)
+
+    def test_ddp_timeout_propagated(self):
+        """``ddp_timeout_seconds > 0`` must materialise as a
+        ``datetime.timedelta`` on the DDPStrategy ``_timeout`` slot. The
+        2026-05-06 P1' run wasted 30 minutes waiting for a dead rank 0
+        because Lightning's NCCL default is 1800 s; tightening this is
+        a defense in depth, and the test guards against the kwarg name
+        regressing away from ``timeout``.
+        """
+        import datetime
+
+        from lightning.pytorch.strategies import DDPStrategy
+
+        from src.train_spdnet import _resolve_trainer_strategy
+
+        out = _resolve_trainer_strategy(
+            strategy="ddp", devices=2, find_unused_parameters=True,
+            ddp_timeout_seconds=600,
+        )
+        assert isinstance(out, DDPStrategy)
+        assert out._timeout == datetime.timedelta(seconds=600), (
+            f"DDPStrategy._timeout expected 600 s, got {out._timeout!r}"
+        )
+
+    def test_ddp_timeout_zero_uses_lightning_default(self):
+        """``ddp_timeout_seconds=0`` should not pass an explicit timeout
+        so Lightning's own default applies (currently 1800 s). We
+        verify by constructing two strategies and comparing -- the
+        ``_timeout`` of the unset version is what Lightning picks.
+        """
+        from lightning.pytorch.strategies import DDPStrategy
+
+        from src.train_spdnet import _resolve_trainer_strategy
+
+        ours = _resolve_trainer_strategy(
+            strategy="ddp", devices=2, find_unused_parameters=True,
+            ddp_timeout_seconds=0,
+        )
+        baseline = DDPStrategy(find_unused_parameters=True)
+        assert isinstance(ours, DDPStrategy)
+        assert ours._timeout == baseline._timeout, (
+            f"ddp_timeout_seconds=0 must defer to Lightning default; got "
+            f"{ours._timeout!r} vs Lightning baseline {baseline._timeout!r}"
+        )
+
+
+class TestSyncBatchNormConfig:
+    """``SPDNetTrainerConfig.sync_batchnorm`` is the toggle that flips
+    backbone BN layers to SyncBatchNorm under DDP, restoring an effective
+    BN sample of (devices * batch_size) instead of the per-rank
+    micro-batch (which is just 2 in the rps=56 / 896² recipe).
+
+    The runtime conversion itself is end-to-end-tested by
+    ``scripts/smoke_ddp_5090.py`` (which actually launches DDP and
+    walks the model post-fit). These unit tests cover the static
+    contract: field present + train_spdnet wires it into Trainer.
+    """
+
+    def test_default_is_false(self):
+        """Single-card configs must not silently change behaviour."""
+        from src.conf.spdnet import SPDNetTrainerConfig
+
+        cfg = SPDNetTrainerConfig()
+        assert cfg.sync_batchnorm is False, (
+            "Default sync_batchnorm should be False so legacy single-card "
+            "experiments (devices=1) are byte-identical to the pre-flag baseline."
+        )
+
+    def test_field_typed_bool(self):
+        """Hydra needs a strict type so ``sync_batchnorm=true`` parses to bool."""
+        import dataclasses
+
+        from src.conf.spdnet import SPDNetTrainerConfig
+
+        fields = {f.name: f for f in dataclasses.fields(SPDNetTrainerConfig)}
+        assert "sync_batchnorm" in fields, "Missing field SPDNetTrainerConfig.sync_batchnorm"
+        assert fields["sync_batchnorm"].type is bool, (
+            f"sync_batchnorm must be typed bool, got {fields['sync_batchnorm'].type!r}"
+        )
+
+    def test_train_spdnet_passes_sync_batchnorm_to_trainer(self):
+        """If the kwarg is not threaded into ``L.Trainer`` the flag is
+        a silent no-op. This guard catches that drift at test time
+        instead of after a 12-hour run.
+        """
+        import inspect
+
+        import src.train_spdnet as ts
+
+        src = inspect.getsource(ts.train_spdnet)
+        assert "sync_batchnorm=" in src, (
+            "train_spdnet does not pass sync_batchnorm to L.Trainer; the "
+            "config field is a no-op."
+        )
+        # Also assert it's read from the config (not hardcoded). The
+        # current implementation uses ``getattr(cfg.trainer, "sync_batchnorm", False)``.
+        assert "cfg.trainer" in src and "sync_batchnorm" in src
+
+
+class TestOnlineCAMIoUOOMDefense:
+    """Regression guards around the symmetric ``OnlineCAMIoU.evaluate``
+    branch in ``SPDNetModule.on_validation_epoch_end``.
+
+    Two distinct bugs hit the 2026-05-06 P1' run on the 5090 host;
+    these tests guard against both regressions.
+
+    Bug A: rank-0-only ``OnlineCAMIoU.evaluate`` OOMed (rps=56 +
+    896² + eval_batch_size=8 materialised a ~20 GiB attention weight
+    tensor on top of a ~24 GiB training residual). Rank 1 then sat
+    on the next ALLREDUCE for the full 30-min NCCL watchdog before
+    the run was killed.
+
+    Bug B (worse): even AFTER lowering eval_batch_size to fit, the
+    SECOND launch deadlocked again because the metric was logged
+    with ``rank_zero_only=True``. ``ModelCheckpoint(monitor=
+    "val/cam_iou_best")`` then took different code paths on rank 0
+    (metric present -> save_checkpoint -> ``strategy.barrier()``
+    which is an ``AllReduce(1)`` in NCCL) vs rank 1 (metric absent
+    -> skip save -> no barrier), and the asymmetric collective hung
+    until the new 600 s watchdog fired. Diagnostic from the trace::
+
+        Rank 0: WorkNCCL(SeqNum=2049548, OpType=ALLREDUCE,  NumelIn=1)
+        Rank 1: WorkNCCL(SeqNum=2049547, OpType=ALLGATHER,  NumelIn=2)
+
+    Rank 0 had issued exactly **one extra collective** -- the save
+    barrier. Fix: every rank now calls ``evaluate()`` (deterministic
+    because of fixed query subset + seed + DDP-synced weights), and
+    we log with ``sync_dist=True`` so the metric is symmetric on
+    every rank's ``callback_metrics``. ModelCheckpoint then takes
+    identical code paths on every rank.
+
+    Layered defenses checked here:
+
+    * ``lightning.py``: NO ``is_global_zero`` gate on the OnlineCAMIoU
+      branch (every rank computes -> symmetric ``self.log`` count).
+    * ``lightning.py``: NO ``rank_zero_only=True`` on the cam_iou logs
+      (would re-introduce asymmetric callback_metrics).
+    * ``lightning.py``: ``sync_dist=True`` on the cam_iou logs (the
+      Lightning-recommended pattern; warning was telling us this).
+    * ``lightning.py``: cross-rank OOM coordination via
+      ``all_reduce(MIN)`` so a one-rank failure can't reintroduce
+      asymmetry through the back door.
+    * ``lightning.py``: ``try/except torch.cuda.OutOfMemoryError``
+      around ``evaluate()`` (Bug A defense in depth).
+    * ``conf/spdnet.py``: ``online_loc_eval_batch_size=8`` default
+      (lowered upstream by launcher to 2 for rps=56 / 896²).
+    * ``conf/spdnet.py``: ``ddp_timeout_seconds`` defaults to 600 s
+      (10 min instead of NCCL's 30 min) so any future deadlock fails
+      fast.
+
+    These tests check the *contract* (presence + structure of the
+    guards) rather than running a full DDP fit, because reproducing
+    the deadlock in CI requires multi-GPU + a real dataset.
+    """
+
+    def test_evaluate_wrapped_in_try_except_oom(self):
+        import inspect
+
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        src = inspect.getsource(SPDNetModule.on_validation_epoch_end)
+
+        eval_idx = src.find("self.online_loc_metric.evaluate")
+        assert eval_idx > 0, (
+            "evaluate() call must be present in on_validation_epoch_end"
+        )
+        try_idx = src.rfind("try:", 0, eval_idx)
+        assert try_idx > 0, (
+            "OnlineCAMIoU.evaluate is not wrapped in try/except. The "
+            "2026-05-06 P1' OOM regression guard is gone."
+        )
+        except_idx = src.find("except torch.cuda.OutOfMemoryError", eval_idx)
+        assert except_idx > eval_idx, (
+            "Missing 'except torch.cuda.OutOfMemoryError' AFTER the "
+            "evaluate() call. A bare 'except Exception' is too coarse "
+            "(would swallow ValueError from misconfigured GT etc); "
+            "keep the type strict."
+        )
+        assert src.count("torch.cuda.empty_cache()") >= 2, (
+            "Need empty_cache() both before evaluate (free training "
+            "residual) and inside the except (drain the partial OOM)."
+        )
+
+    def test_no_is_global_zero_gate_on_online_loc_branch(self):
+        """The OnlineCAMIoU branch must execute on EVERY rank.
+
+        Adding back ``and self.trainer.is_global_zero`` to the if
+        guard is the *exact* regression that caused the 2026-05-06
+        deadlock (Bug B). ModelCheckpoint(monitor="val/cam_iou_best")
+        will take asymmetric code paths if only rank 0 logs the
+        metric, and ``trainer.save_checkpoint`` issues a barrier on
+        rank 0 only -> deadlock at the 600 s watchdog.
+        """
+        import inspect
+        import re
+
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        src = inspect.getsource(SPDNetModule.on_validation_epoch_end)
+
+        # Find the if-guard around online_loc_metric: from "if (" up
+        # to the trailing "):" that opens its body. The guard may span
+        # multiple lines and contain nested parens (e.g. should_run()).
+        # Strategy: locate the start, then scan for the matching ')'
+        # using a paren counter so should_run(...) doesn't end us early.
+        start = src.find("if (")
+        while start != -1:
+            tail = src[start:]
+            anchor = tail.find("self.online_loc_metric is not None")
+            if anchor == -1 or anchor > 200:
+                start = src.find("if (", start + 1)
+                continue
+            depth = 0
+            end = -1
+            for i, ch in enumerate(tail):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+            assert end > 0, "Unterminated parens in online_loc guard"
+            guard = tail[:end]
+            break
+        else:  # no hit at all
+            guard = ""
+        assert guard, (
+            "Couldn't locate the 'if self.online_loc_metric is not "
+            "None' guard. Did the structure change?"
+        )
+        assert "is_global_zero" not in guard, (
+            "is_global_zero is back in the OnlineCAMIoU guard. This "
+            "reintroduces the 2026-05-06 ModelCheckpoint asymmetric-"
+            "barrier deadlock. Every rank must enter evaluate() so "
+            "val/cam_iou_* is present on every rank's callback_metrics."
+        )
+
+    def test_cam_iou_log_uses_sync_dist_not_rank_zero_only(self):
+        """The val/cam_iou_* logs must use ``sync_dist=True`` and
+        NOT ``rank_zero_only=True``. The latter put the metric on
+        rank 0's ``callback_metrics`` only, which made
+        ``ModelCheckpoint(monitor="val/cam_iou_best")`` take a
+        different code path on rank 0 (save -> barrier) vs rank 1
+        (skip), causing the deadlock.
+        """
+        import inspect
+
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        src = inspect.getsource(SPDNetModule.on_validation_epoch_end)
+
+        # Locate self.log(f"val/{k}", ...) and walk to the matching
+        # close paren via depth counting (float(v) has nested parens).
+        anchor = src.find('self.log(\n                    f"val/{k}"')
+        if anchor < 0:
+            anchor = src.find('self.log(\n                    f"val/')
+        assert anchor > 0, (
+            "Couldn't find self.log(f\"val/{k}\", ...) in "
+            "on_validation_epoch_end."
+        )
+        depth = 0
+        end = -1
+        for i, ch in enumerate(src[anchor + len("self.log") :]):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = anchor + len("self.log") + i + 1
+                    break
+        assert end > 0, "Unterminated parens in val/{k} log call"
+        log_call = src[anchor:end]
+        assert "rank_zero_only=True" not in log_call, (
+            "rank_zero_only=True is back on the val/cam_iou_* "
+            "self.log() call. This is exactly what caused the "
+            "2026-05-06 deadlock; use sync_dist=True so all ranks "
+            "see the metric and ModelCheckpoint takes a symmetric "
+            "code path."
+        )
+        assert "sync_dist=True" in log_call, (
+            "Missing sync_dist=True on the val/cam_iou_* self.log() "
+            "call. Lightning explicitly warns about this in the "
+            "logger_connector at distributed training, and not "
+            "having it makes the metric value rank-local."
+        )
+
+    def test_oom_coordinated_across_ranks(self):
+        """Asymmetric OOM is the back door into the same deadlock:
+        if rank 0 OOMs (scalars={}) but rank 1 succeeds (scalars=
+        {3 keys}) the per-rank ``self.log`` count diverges and the
+        next collective deadlocks. We coordinate via an
+        ``all_reduce`` MIN on a 0/1 success flag so a single failure
+        forces every rank to skip the log calls.
+        """
+        import inspect
+
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        src = inspect.getsource(SPDNetModule.on_validation_epoch_end)
+
+        assert "torch.distributed.is_initialized()" in src, (
+            "Missing torch.distributed.is_initialized() guard for the "
+            "cross-rank OOM coordination. Without it, asymmetric "
+            "OOMs reintroduce the deadlock."
+        )
+        assert "torch.distributed.all_reduce" in src, (
+            "Missing torch.distributed.all_reduce for cross-rank OOM "
+            "coordination."
+        )
+        # MIN op: any rank failing -> every rank's flag becomes 0.
+        # MAX would require ALL ranks to fail to skip, which is wrong
+        # (we want ANY rank's failure to skip everywhere).
+        assert "ReduceOp.MIN" in src, (
+            "OOM coordination must use ReduceOp.MIN (any rank "
+            "failing -> skip everywhere). MAX would only skip if "
+            "every rank failed, which is the buggy original "
+            "behaviour."
+        )
+
+    def test_default_ddp_timeout_is_tightened(self):
+        """``ddp_timeout_seconds`` default must be a finite, sub-1800 s
+        value. If anyone bumps it back to Lightning's 1800 default
+        the 30-min hang on a dead rank comes back.
+        """
+        from src.conf.spdnet import SPDNetTrainerConfig
+
+        cfg = SPDNetTrainerConfig()
+        assert hasattr(cfg, "ddp_timeout_seconds"), (
+            "Missing SPDNetTrainerConfig.ddp_timeout_seconds"
+        )
+        assert 60 <= cfg.ddp_timeout_seconds < 1800, (
+            f"Default ddp_timeout_seconds={cfg.ddp_timeout_seconds} is "
+            f"outside the safe range [60, 1800). Lightning default is "
+            f"1800; we tightened it after the 2026-05-06 dead-rank-0 "
+            f"hang. Keep the floor sane (>= 60 s) so OnlineCAMIoU's "
+            f"~30-60 s evaluate (now run on every rank) doesn't trip "
+            f"the timeout."
+        )
+

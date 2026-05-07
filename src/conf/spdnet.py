@@ -90,6 +90,72 @@ class SPDNetTrainerConfig:
     # as well).
     save_best_cam_iou: bool = True
 
+    # Lightning trainer ``strategy`` argument. ``"auto"`` (the default)
+    # leaves the choice to Lightning -- single GPU with ``devices=1``,
+    # DDP otherwise. Set explicitly to ``"ddp"`` to force the
+    # ``DDPStrategy`` constructor in ``src/train_spdnet.py`` (which then
+    # passes ``find_unused_parameters`` and ``gradient_as_bucket_view``);
+    # any other string (``"deepspeed"``, ``"fsdp"``, ...) is forwarded
+    # verbatim to Lightning for users who know what they're doing.
+    strategy: str = "auto"
+    # When DDP is selected (either because ``devices > 1`` and
+    # ``strategy in {"auto", "ddp"}``, or because the user explicitly
+    # set ``strategy="ddp"``), pass this flag to ``DDPStrategy``. Must
+    # stay ``True`` for SPDNet because several aux-loss branches are
+    # entered conditionally (``proj_head`` only when ``lambda_con > 0``,
+    # ``ema_teacher`` only when ``lambda_distill > 0``, attention buffers
+    # only when ``want_attn``). DDP otherwise raises "expected to have
+    # finished reduction in the prior iteration before starting a new
+    # one" because rank 1 receives parameters whose ``.grad`` was never
+    # touched on rank 0's batch.
+    find_unused_parameters: bool = True
+
+    # Convert all ``BatchNorm{1,2,3}d`` layers (in the ResNet-50 backbone
+    # and the FPN/MSE necks that inherit BN momentum) to
+    # ``torch.nn.SyncBatchNorm`` before DDP wraps the module. Lightning
+    # forwards this to ``torch.nn.SyncBatchNorm.convert_sync_batchnorm``
+    # in ``Strategy.setup``; per-step BN statistics + running stats then
+    # use the WORLD batch (per-rank batch * world size) instead of the
+    # noisy per-rank micro-batch.
+    #
+    # Why we want it on for the 5090 chain:
+    #   The Phase-5 5090 recipe runs at ``data.batch_size=2`` per rank
+    #   (eff_batch=32 via accum=8 across 2 GPUs) because rps=56 + 896²
+    #   only fits at 24.6 GiB when micro-batch <= 2. Per-rank BN sees
+    #   just 2 samples per forward, well below the ~16-32 micro-batch
+    #   range the ImageNet-pretrained ResNet-50 BN was tuned for.
+    #   ``sync_batchnorm=True`` restores an effective BN sample of 4
+    #   (2 ranks * batch 2) -- still small, but matches the lower end
+    #   of the single-card 448 baseline that produced val/mAP=0.888.
+    #
+    # Cost: roughly one extra all-reduce per BN forward and one per
+    # backward. On a 2-rank PCIe link this adds ~3-5% to step time;
+    # comfortably masked by the already-amortised gradient all-reduce
+    # at the end of the step.
+    #
+    # No effect when ``devices <= 1`` (Lightning silently skips the
+    # convert), so single-card configs stay unchanged. Default ``False``
+    # preserves all legacy behaviour; the launcher
+    # ``scripts/run_phase5_5090_chain.sh`` flips it on for P1'/P2'.
+    sync_batchnorm: bool = False
+
+    # NCCL collective timeout in seconds. Forwarded to
+    # ``DDPStrategy(timeout=...)`` (which itself maps to
+    # ``torch.distributed.init_process_group(timeout=...)``). The
+    # default Lightning value is 1800 s (30 min) and that's exactly
+    # how long the 2026-05-06 P1' run spent waiting on a dead rank
+    # 0 after an OOM in OnlineCAMIoU before NCCL finally tripped. We
+    # ship a tighter 600 s (10 min) default so future deadlocks fail
+    # fast: a healthy SPDNet step is 0.3-0.5 s on this hardware,
+    # OnlineCAMIoU.evaluate is ~30-60 s on rank 0, the longest
+    # legitimate inter-collective gap is a checkpoint save (which
+    # writes a few-hundred-MB ckpt to disk; ~5 s). 600 s leaves an
+    # order-of-magnitude headroom over any of those while still
+    # killing the run inside 10 min when something genuinely deadlocks.
+    # ``0`` falls back to Lightning's default. No effect when
+    # ``devices <= 1``.
+    ddp_timeout_seconds: int = 600
+
 
 @dataclass
 class SPDNetSpatialLossesConfig:
@@ -223,8 +289,59 @@ class SPDNetSpatialLossesConfig:
     online_loc_eval_subset_size: int = 100
     online_loc_eval_seed: int = 1234
     online_loc_eval_every_n_epochs: int = 1
+    # Per-batch size of the rank-0 ``OnlineCAMIoU.evaluate`` forward
+    # pass through the SPDNet. CRITICAL: this MUST be tuned together
+    # with ``model.ref_pool_size`` and ``data.image_size``, because the
+    # SCA attention weights are materialised in fp32 at
+    # ``(B, num_heads, Q, K)`` where ``Q = (image_size/4)^2`` and
+    # ``K = ref_pool_size^2``. The buffer dominates the eval VRAM
+    # footprint:
+    #
+    #   image_size=896, rps=56 (Q=224^2, K=56^2):
+    #     bs=2 -> ~5  GiB attention weights   PASS on 5090 (32 GiB)
+    #     bs=4 -> ~10 GiB                     PASS (tight)
+    #     bs=8 -> ~20 GiB                     OOM (training residual + this)
+    #
+    #   image_size=448, rps=14-20 (Q=112^2, K<=20^2):
+    #     bs=8 -> ~0.5 GiB                    PASS, plenty of headroom
+    #
+    # The 2026-05-06 P1' run on the 5090 chain crashed at end of epoch
+    # 0 because the launcher set rps=56 + image_size=896 but inherited
+    # this default of 8: the rank-0 evaluate() OOMed, rank 1 then sat
+    # on the next ALLREDUCE for 30 min waiting for a dead rank 0
+    # (NCCL watchdog default), and the 90-minute training run
+    # was discarded. The launcher
+    # ``scripts/run_phase5_5090_chain.sh`` now sets this explicitly to
+    # 2 via the ``ONLINE_LOC_EVAL_BS`` env knob; ``lightning.py``'s
+    # ``on_validation_epoch_end`` additionally wraps evaluate() in
+    # try/except OOM as defense in depth.
     online_loc_eval_batch_size: int = 8
     online_loc_gt_binary_dir: str = "outputs/plantseg_binary_mc115/gt_binary_val"
+
+    # ----- Always-on attention diagnostics -----
+    # Force the ``return_attn=True`` forward path even when no aux loss
+    # currently needs the attention map (in particular: pure classifier
+    # runs at ``lambda_eq = lambda_ac = lambda_marg_H = 0``). Logs three
+    # extra training scalars every step so the "pure" attention
+    # distribution can be compared directly against later aux-loss runs:
+    #
+    #   train/attn_mean  -- same number ``L_ac`` negates; saturation > 0.95
+    #                       reproduces the D1 mode-collapse signature.
+    #   train/attn_std   -- catches the "uniform attention" failure mode
+    #                       that ``attn_mean`` alone misses (mean stays
+    #                       near 0.5 while std collapses toward 0).
+    #   train/attn_p99   -- 99th-percentile concentration; rises faster
+    #                       than the mean once any subset of queries
+    #                       starts pinning on a single key.
+    #
+    # Memory cost is the SCA attention buffer
+    # ``(B, num_heads, Q, K)`` materialised in fp32 for the
+    # ``need_weights=True`` path. At 896² with batch=8, rps=56 this is
+    # ``8 * 1 * 50176 * 3136 * 4 bytes ~ 5 GiB`` per card before
+    # backprop graph; budget verified in §5 of the run plan. Default
+    # False so legacy classification-only experiments stay on the lean
+    # ``need_weights=False`` path.
+    log_attn_stats: bool = False
 
 
 @dataclass

@@ -228,12 +228,14 @@ class SPDNetModule(L.LightningModule):
 
         # Single forward through the student. Request the attention map only
         # when we actually need it (spatial fusion + any of: lambda_eq,
-        # lambda_ac, lambda_marg_H). This avoids the dense need_weights=True
-        # path on the baseline run.
+        # lambda_ac, lambda_marg_H, or the always-on log_attn_stats
+        # diagnostic). This avoids the dense need_weights=True path on the
+        # baseline run.
         want_attn = self._spatial_fusion and (
             self.losses_cfg.lambda_eq > 0
             or self.losses_cfg.lambda_ac > 0
             or self.losses_cfg.lambda_marg_H > 0
+            or self.losses_cfg.log_attn_stats
         )
         feats = self.model.extract_merged_features(q, refs, return_attn=want_attn)
         fused = feats["fused"]
@@ -247,6 +249,27 @@ class SPDNetModule(L.LightningModule):
         # ------------------ Equivariance (+ attention concentration) ------------------
         if want_attn:
             attn_orig = feats["attn_map"]
+            if self.losses_cfg.log_attn_stats:
+                # Always-on attention diagnostics. Detached so they never
+                # contribute to the training graph (compute is the cost of
+                # three reductions over the per-query concentration map,
+                # ``< 1ms`` at 224x224). Kept here -- inside ``if want_attn``
+                # but BEFORE any loss-coefficient branch -- so the stats
+                # are emitted whether or not L_ac / L_eq / L_marg_H is on,
+                # giving an apples-to-apples baseline against later
+                # aux-loss runs (see §5.14.6 in RESEARCH_CONTEXT.md).
+                #
+                # ``attn_mean`` mirrors L_ac's negation; ``attn_std``
+                # catches the uniform-attention failure mode that
+                # ``attn_mean`` alone misses; ``attn_p99`` rises sooner
+                # than the mean once any subset of queries pins on a
+                # single key. The L_ac branch also writes ``attn_mean``
+                # on its own; Lightning de-dupes by metric name on the
+                # same step so the duplicate write is harmless.
+                a = attn_orig.detach()
+                comp["attn_mean"] = a.mean()
+                comp["attn_std"] = a.std()
+                comp["attn_p99"] = a.flatten().quantile(0.99)
             if self.losses_cfg.lambda_eq > 0:
                 # Round-robin transform per batch (deterministic, batch-uniform
                 # so the per-step compute cost is constant).
@@ -380,14 +403,20 @@ class SPDNetModule(L.LightningModule):
         # ------------------ Logging + mAP ------------------
         preds = torch.sigmoid(logits.detach())
         self.train_mAP.update(preds, labels.int())
+        # ``sync_dist=True`` averages each scalar across DDP ranks before it
+        # reaches the MLflow logger. torchmetrics objects (``train_mAP``,
+        # ``val_mAP``) auto-sync via their internal ``.compute()`` and do
+        # NOT need this flag; setting it on them would double-count.
         self.log(
             "train/loss", total,
             prog_bar=True, on_step=True, on_epoch=True, batch_size=B,
+            sync_dist=True,
         )
         for name, val in comp.items():
             self.log(
                 f"train/{name}", val,
                 prog_bar=False, on_step=True, on_epoch=True, batch_size=B,
+                sync_dist=True,
             )
         return total
 
@@ -400,6 +429,9 @@ class SPDNetModule(L.LightningModule):
             self.ema_teacher.update(self.model)
 
     def on_train_epoch_end(self) -> None:
+        # torchmetrics' ``.compute()`` already gathers across DDP ranks;
+        # do NOT pass ``sync_dist=True`` here or the value would be
+        # averaged a second time.
         self.log("train/mAP", self.train_mAP.compute(), prog_bar=True)
         self.train_mAP.reset()
 
@@ -415,22 +447,115 @@ class SPDNetModule(L.LightningModule):
         self.log(
             "val/loss", loss,
             prog_bar=True, on_epoch=True, batch_size=logits.size(0),
+            sync_dist=True,
         )
 
     def on_validation_epoch_end(self) -> None:
+        # torchmetrics auto-syncs across ranks; no ``sync_dist`` here.
         self.log("val/mAP", self.val_mAP.compute(), prog_bar=True)
         self.val_mAP.reset()
 
+        # ``OnlineCAMIoU.evaluate`` runs on EVERY rank (lockstep) so
+        # that every metric logged through ``self.log`` is present on
+        # every rank's ``trainer.callback_metrics`` dict. The
+        # alternative (compute on rank 0 only, log with
+        # ``rank_zero_only=True``) caused a 2026-05-06 deadlock under
+        # DDP: ``ModelCheckpoint(monitor="val/cam_iou_best")`` took
+        # different code paths on rank 0 (metric present -> save ckpt
+        # -> ``strategy.barrier()``, which is an ``AllReduce(1)`` in
+        # NCCL) vs rank 1 (metric absent -> no save -> no barrier),
+        # and the asymmetric collective hung for 10 min before the
+        # NCCL watchdog killed both processes. Recomputing on every
+        # rank is safe because ``evaluate()`` is deterministic on the
+        # same query subset + seed + model weights; the 2x compute is
+        # parallelised across separate GPUs so wall-clock impact is
+        # negligible (~30-60 s on rank 0 and rank 1 simultaneously).
+        #
+        # OOM defense: ``evaluate()`` does its own forward pass through
+        # the SPDNet, which at high resolution + large rps materialises
+        # a ``(B, heads, Q, K)`` attention weight tensor in fp32. With
+        # the 5090 chain at rps=56 + 896², this is ~5 GiB at
+        # eval_batch_size=2 and ~20 GiB at the legacy default of 8 -- the
+        # 2026-05-06 P1' run died at the end of epoch 0 because rank 0
+        # OOMed here. The primary fix is calibrating
+        # ``online_loc_eval_batch_size`` to match training micro-batch
+        # (set in ``scripts/run_phase5_5090_chain.sh``); this try/except
+        # is defense-in-depth so an allocator-fragmentation OOM
+        # downgrades to a logged warning instead of killing the run.
+        # Free training-cached memory first to give the eval forward
+        # the largest possible budget; the cost (~tens of ms) is
+        # immaterial vs. a full run kill.
+        #
+        # Cross-rank OOM coordination: an OOM may strike one rank
+        # without the other (allocator state diverges across ranks
+        # because of empty_cache timing differences). If we let the
+        # asymmetry through, rank 0 might log 3 scalars while rank 1
+        # logs 0 -- exactly the rank-asymmetric ``self.log`` pattern
+        # that triggered the original deadlock. So we all-reduce a
+        # success flag (MIN: 1 only if every rank succeeded) and skip
+        # the log calls everywhere whenever any rank OOMed.
         if (
             self.online_loc_metric is not None
             and self.online_loc_metric.should_run(self.current_epoch)
-            and not self.trainer.sanity_checking  # skip the sanity-check run
+            and not self.trainer.sanity_checking
         ):
-            scalars = self.online_loc_metric.evaluate(self.model, self.device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                scalars = self.online_loc_metric.evaluate(self.model, self.device)
+            except torch.cuda.OutOfMemoryError as oom:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                import logging
+                rank = (
+                    self.trainer.global_rank
+                    if hasattr(self, "trainer") and self.trainer is not None
+                    else -1
+                )
+                logging.getLogger(__name__).warning(
+                    "OnlineCAMIoU.evaluate OOM at epoch %d (rank %s): %s. "
+                    "Skipping online metric for this epoch (all ranks); "
+                    "training continues. Lower "
+                    "losses.online_loc_eval_batch_size if this recurs.",
+                    self.current_epoch, rank, oom,
+                )
+                scalars = {}
+
+            # Cross-rank OOM coordination via MIN-reduce on a 1.0/0.0
+            # success flag. If torch.distributed isn't initialised we
+            # are running single-process so the flag passes through
+            # unmodified.
+            if (
+                torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            ):
+                succeeded = torch.tensor(
+                    [1.0 if scalars else 0.0],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                torch.distributed.all_reduce(
+                    succeeded, op=torch.distributed.ReduceOp.MIN
+                )
+                if succeeded.item() < 0.5:
+                    # At least one rank failed; force every rank to
+                    # skip the log so the per-rank ``self.log`` count
+                    # stays in lockstep.
+                    if scalars:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "OnlineCAMIoU: another rank OOMed at epoch "
+                            "%d; skipping log on this rank too to keep "
+                            "DDP collectives symmetric.",
+                            self.current_epoch,
+                        )
+                    scalars = {}
+
             for k, v in scalars.items():
                 self.log(
                     f"val/{k}", float(v),
                     prog_bar=False, on_epoch=True,
+                    sync_dist=True,
                 )
 
     # ------------------------------------------------------------------
