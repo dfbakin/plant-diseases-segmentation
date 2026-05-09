@@ -1139,13 +1139,21 @@ dvc pull outputs/spdnet_plantseg.dvc outputs/visualizations.dvc mlruns.dvc
 
 28. **Run seg-probe pipeline on the H4 cls-only highres ckpt (LOW EFFORT)**: the `spdnet_highres896_clsonly_20260502` checkpoint is the first SPDNet ckpt trained at 896². If the Phase-2 probe recipe (§5.12.2) lifts it to ≥ 65 % disease IoU (vs 448 ceiling 62 %), high resolution buys ~3 pp on the localisation upper bound *despite* the classifier being worse. If it lifts to only ~60 % then 896 is a dead end without the LR/SCA fixes (#26 + #27). Total compute: ~6 h for Ph1 + Ph2. **Now also worth running on the P1 ep 41 ckpt** (the LR-fixed cls-only) — comparing the probe ceiling on H4 vs P1 isolates the LR-fix contribution to the localisation upper bound.
 
-29. **Warm-start fine-tune from the P1 peak ckpt (HIGHEST PRIORITY for the localisation roadmap, §5.14.7)**: the P2 from-scratch run pays a 15-pp val/mAP cost during the L_mask warmup window because the classifier is still converging. Warm-starting from `outputs/phase5_lr_fix/phase5_lr_fix_P1_cls_only_20260504/checkpoints/epoch=epoch=40-val_mAP=val/mAP=0.8490.ckpt` (already saved by Lightning's top-k callback) avoids this Pareto fight: classifier is at its plateau, L_mask becomes additive regularisation, and the pseudo-mask teacher is sharper from step 0 (cam_iou_best ≈ 0.247 instead of 0.22). Existing `+checkpoint=<path>` Hydra override (`train_spdnet.py:253-271`) handles weights-only loading with fresh optimizer state — exactly the right semantics. Planned 3-config sweep (rps=20, 25 ep each, fine-tune LR ~ 1.2e-5): `WS_A` λ_mask=0.05, `WS_B` λ_mask=0.10, `WS_C` λ_mask=0.05+λ_marg_H=0.005. Predicted outcome: val/cam_iou_best ≈ 0.30–0.32, val/mAP within ±1 pp of P1 peak, val/cam_iou_auc 0.25–0.27. ~4–5 h per run on a 5090.
+29. **Warm-start fine-tune from the P1 peak ckpt (DONE, partially confirmed — May 7-9, 2026, §5.14.9)**: `phase5_5090_P2_warm_mask_rps56` warm-started from P1' ep33 ckpt with `λ_mask=0.05` (constant, no warmup), reached val/cam_iou_best peak 0.271 (vs §5.14.7 prediction 0.30-0.32 — under-predicted by ~3 pp), val/mAP peak 0.847 (within ±1 pp prediction CONFIRMED), val/cam_iou_auc peak 0.225 (vs prediction 0.25-0.27 — under-predicted by ~3 pp). The qualitative claim (warm-start removes the Pareto fight, no collapse, cam_iou_best ≥ P2 from-scratch) is confirmed. The quantitative prediction was over-optimistic by ~3 pp on iou metrics — the localisation ceiling at 896² rps=56 with cls+mask is around 0.27 cam_iou_best, not 0.30-0.32. The `WS_B` λ_mask=0.10 and `WS_C` +λ_marg_H sweep configs from §5.14.7 are now lower-priority because the iou ceiling is structural, not loss-coefficient-bound — see #34 below for the right next experiment.
 
 30. **`ref_pool_size` ablation sweep at 896² (parallel-friendly, §5.14.7)**: P1 vs H6 demonstrated rps=20 has only a +0.6 pp direct effect on iou, but the architectural argument is that ref-patch sizes 32 px (rps=28) and 22 px (rps=40) better match the natural disease-lesion scale (~30–80 px) than rps=20 (45 px). Run cls-only at 896² with rps ∈ {28, 40} for 30 epochs each, measure peak val/cam_iou_best vs P1's 0.247. If the gain is ≥ 1 pp at rps=40, fold it into the warm-start sweep. If the gain is < 0.5 pp, conclude rps is a saturated knob at 896 and freeze it at 20. ~12 h per run on a 5090. *Naturally pairs with the warm-start sweep on a 2× 5090 host: rps ablation on one card, warm-start sweep on the other.*
 
 31. **Cosine schedule too long for the small dataset (LOW EFFORT, applies to ALL future runs)**: P1 lost 3 pp val/mAP during the cosine tail (ep 41 peak 0.849 → ep 60 final 0.823) while train/mAP kept climbing 0.85 → 0.92. Classic small-dataset overfitting under shrinking LR. **Action**: in all future highres runs, use either (a) `max_epochs=50` with `min_lr=1e-6`, or (b) `max_epochs=80` with `EarlyStopping(monitor='val/mAP', patience=15, mode='max')`. Cheap fix; saves both compute and metric drift.
 
-32. **Architectural ceiling at 896² classification ≈ 0.85 val/mAP — implications for resolution scaling (NEW HYPOTHESIS, §5.14.6)**: P1's val/mAP plateau at 0.849 is well below the 448 baseline of 0.888, even with the LR rule fixed. The information-bottleneck argument: the FPN's deepest level (`backbone.layer4`) is at /32 stride = 28×28 at 896² — same number of *deep semantic* tokens as 14×14 at 448². The merged FPN feature at /4 has 4× more tokens but those tokens are mostly low-level features (the /4 and /8 FPN levels). For *classification* (which is GAP-pooled across all spatial positions), the deep-token bottleneck is what matters, and it doesn't change with input resolution. **If this holds**, then 896 is fundamentally a localisation knob, not a classification knob, and scaling further to 1024 / 1280 will hit the same wall at the same val/mAP. **Falsifiable test**: train a 1024² cls-only run (24 h on a 5090) — if it also plateaus at 0.84–0.85, the ceiling is confirmed and we should stop scaling input resolution and instead consider freezing the backbone + training a higher-res FPN-only stub.
+32. **Architectural ceiling at 896² classification ≈ 0.85 val/mAP — CONFIRMED at rps=56 (UPGRADED HYPOTHESIS → ESTABLISHED, §5.14.9)**: P1' (rps=56, fully LR-corrected) plateaued at **val/mAP 0.851** — within 0.2 pp of P1's 0.849 from §5.14.6 (rps=20). Doubling SCA bandwidth from 400 keys to 3136 keys had **no measurable effect on the classification ceiling**. The `phase5_5090_P1_cls_only_rps56` run is the strongest evidence that the ceiling is upstream of SCA — likely at the FPN /32 deepest level as predicted. Scaling resolution further (1024², 1280²) without changing the backbone is now expected to hit the same ~0.85 wall. **Action**: stop treating 896² as a classification scaling knob; treat it strictly as a localisation knob. For closing the 5-pp gap to the 448 baseline (`val/mAP=0.888`), the only remaining levers are: (a) backbone change (DeiT-Base, ConvNeXt), (b) freezing pretrained backbone + training a higher-res FPN stub on the existing P1' weights, (c) accepting 0.85 as the new ceiling and focusing all remaining compute on the localisation pipeline downstream.
+
+33. **Equivariance loss (`L_eq`) has the same trivial-fixed-point pathology as `L_ac` — DON'T USE WITHOUT ANTI-FLATTENING REGULARISER (NEW NULL RESULT, §5.14.9.d)**: P3' (`phase5_5090_P3_warm_mask_eq_rps56`, warm-start from P2' best-cam, +`λ_eq=0.1`, transforms=[1,2,3,4]) showed clean convergence of `train/L_eq` (-85% in 9 epochs) **achieved through attention flattening, not through learning equivariant attention**: `train/attn_std` collapsed -71% (0.107 → 0.031), `train/attn_p99` collapsed -30% (0.356 → 0.248), and `val/mAP` regressed -5 pp (0.847 → 0.799) while `val/cam_iou_best` stayed flat at the P2' plateau (~0.27). The L_eq objective `MSE(T(attn(q)), attn(T(q)))` has a trivial minimum at any spatially-uniform attention map (std=0 globally satisfies any geometric transform), exactly analogous to L_ac's trivial minimum at attn_mean=1 (§5.13.6). The rps=56 enlargement does not change this — the trivial-fixed-point exists regardless of key-set size. **Implication**: any future L_eq experiment needs an anti-flattening regulariser to prevent the degenerate solution: an attention entropy *floor* (e.g. `max(0, H_target - H(attn))`), an explicit `attn_std` lower bound, or a localisation-anchored loss term that requires non-uniform attention to satisfy. Without that, L_eq optimisation is unsafe by construction.
+
+34. **Mask supervision is a robustness tool, not a peak-IoU tool — CRF baseline reveals trade-off (NEW FINDING, §5.14.9.c)**: 200-image CRF parameter sweep on P1' (cls-only, rps=56) vs P2' (cls+mask, rps=56) shows P1' wins on **peak** disease_iou (37.73% at bg_thr=0.10 vs P2's 35.29% at bg_thr=0.20, **-2.4 pp delta**) but P2' wins on **robustness** across CRF parameter space (P1's disease_iou cliff -22 pp from peak to bg_thr=0.30 vs P2's cliff of only -1 pp). The user's intuition that "AUC-up → better CRF refinement" is **partially confirmed (robustness sense)** but **contradicted at the optimum config (peak sense)**. The mechanism: cls-only CAMs are peakier with steeper boundary gradients that align with the CRF's pairwise-color-discontinuity term — in a narrow CRF sweet spot CRF propagates beautifully from these high-confidence seeds. Mask-supervised CAMs are *spread out*: they cover the whole lesion at moderate amplitude, so CRF works adequately over a wide range of bg_thr but never gets the steep-boundary signal needed for the optimum. **Practical recommendation**: in the production WSSS pipeline (fixed CRF params across ckpts), use mask-supervised ckpts for robustness; in any per-distribution-tuned setting, use cls-only ckpts for peak. **Add a 200-image CRF sweep to the post-training acceptance gate of every future SPDNet run** — `val/cam_iou_best` alone is misleading for ckpt selection when a CRF stage follows.
+
+35. **Run seg-probe pipeline on P1'/P2' ckpts (NEW HIGHEST PRIORITY for localisation, supersedes #28)**: the seg-probe pipeline (§5.12) lifted SPDNet localisation from 32 % to 62 % disease IoU at 448 — a ~25× larger gain than the entire phase-5 highres + LR-fix + warm-start campaign achieved (~5-pp lift on cam_iou_best, ~2-pp lift on CRF disease_iou). With P1' (val/mAP=0.851 cls-only) and P2' (cam_iou_best=0.271 mask-supervised) as starting ckpts at 896² rps=56, the probe could potentially push localisation to ≥65 % disease IoU. Total compute: ~6 h Ph1 + Ph2 per ckpt. **Two-ckpt comparison**: (a) does mask supervision *help* or *hurt* the probe ceiling? — i.e., is P2's broader-CAM regime a better feature substrate for downstream segmentation than P1's peakier regime? (b) does rps=56 lift the probe ceiling vs the §5.12 result at rps=14? Both are answerable in one weekend.
+
+36. **Pseudo-mask distillation from probe teacher into SCA attention (NEW, supersedes #24)**: with the segmentation probe pipeline producing 60 % disease IoU on the same architecture family, the strongest signal we could add to the SPDNet auxiliary-loss family is to distill the probe head's binary prediction into the attention map via masked MSE. This avoids the L_eq / L_ac trivial-fixed-point pathology because the teacher prediction is *non-uniform* by construction — collapsing to uniform attention now incurs strict positive loss. Concrete formulation: `L_distill = MSE(attn_map, sg(probe_mask_resized))` where `attn_map` is the head-averaged SCA attention pre-softmax-resize and `probe_mask_resized` is the frozen probe head's foreground prediction at the same resolution as the attention map. λ_distill = 0.1 as a starting point. Predicted outcome: cam_iou_best ≥ 0.32 (substantially above the §5.14.9 plateau of 0.27), no attention collapse (the teacher is non-uniform), and the cls+mask base remains intact. ~6 h per run on a 5090.
 
 ---
 
@@ -1835,9 +1843,17 @@ If the diagnostics confirm both mechanisms, the design knobs to flip (in priorit
 
 ---
 
-### 5.14 Phase-5 High-Resolution Training (April 30 – May 3, 2026)
+### 5.14 Phase-5 High-Resolution Training (April 30 – May 9, 2026)
 
 **Hypothesis**: Doubling the training resolution from 448 to 896 should reduce the localisation floor by a factor of two (the merged FPN feature map at /8 jumps from 56×56 to 112×112) and let `cam_classifier` resolve disease lesions at the natural scale of plant disease spots (~30–80 px in the original image vs the ~4–10 px representation at 448²).
+
+**Campaign timeline & subsections**:
+
+- §5.14.1-5 — initial highres campaign on a single 24-32 GiB GPU (Apr 30 – May 3); identifies four scale traps; concludes 896 + legacy LR + rps=14 is strictly worse than 448.
+- §5.14.6 — LR-fix verification campaign (May 4-6) on the same single-GPU host. P1 (cls-only, eff-batch LR fix, rps=20 auto) lifts val/mAP from 0.838 → 0.849 peak; P2 (warm-start mask) lifts cam_iou_best to 0.284. Establishes warm-start as the right recipe.
+- §5.14.7 — the original 2× RTX 5090 warm-start sweep plan (PARTIALLY OBSOLETE; superseded by the 4× RTX 5090 chain in §5.14.9).
+- §5.14.8 — host-selection rationale (also obsolete: the host changed to 4× RTX 5090 mid-campaign).
+- §5.14.9 — **the 4× RTX 5090 chain** (May 7-9): P1' (cls-only rps=56), P2' (warm-mask rps=56), P3' (warm-mask-eq rps=56). CRF baseline reveals mask supervision is a robustness/peak trade-off, not a Pareto win. L_eq trivially-fixed-points into uniform attention.
 
 **Experiment design** (`outputs/phase5_highres/`, MLflow experiment `phase5_highres` ID `115309098075776200`, 7 logged runs):
 
@@ -2075,9 +2091,124 @@ The current host (single 24-32 GB GPU) has run all of §5.13 + §5.14 to complet
 - [ ] Commit code changes for the four trap fixes + smoke tests + new launcher (see git-staging plan below the §14 update).
 - [ ] On the new host, `dvc pull outputs/phase5_lr_fix.dvc` is the only critical pull for warm-start; the rest are reference baselines.
 
----
+#### 5.14.9 4× RTX 5090 chain — P1' / P2' / P3' (May 7–9, 2026)
 
-## 11. How to Reproduce Key Results
+**Setup change**: switched from the 2× RTX 5090 plan in §5.14.8 to a 4× RTX 5090 host (PCIe-only topology, NVLink absent). All three runs use Lightning DDP across 4 ranks with `eff_batch_global = batch * accumulate_grad_batches * devices = 32` matched to §5.14.6's eff_batch=32, *but* with two architectural changes:
+
+- `ref_pool_size=56` (vs. P2's `rps=20`), giving 56² = 3136 reference keys → query:key ratio 16:1 at 896². The `// 44` heuristic from §5.14.6 was overridden because the 5090's 32 GiB allowed the full bandwidth headroom that the 24 GB host couldn't.
+- `mask_warmup_epochs=0` (vs. P2's `15→20` ramp) — P2's empirical evidence was that the ramp was a workaround for fresh-classifier optimisation pressure; warm-starting from a saturated classifier removes that pressure, so `λ_mask=0.05` is constant from step 0.
+
+MLflow experiment `phase5_5090_chain` (ID `821047238167612067`):
+
+| Tag | Run name | Status | Epochs | Aux losses | Best `val/mAP` | Best `val/cam_iou_best` | Best `val/cam_iou_auc` | Wall clock |
+|-----|----------|-------:|-------:|-----------|---------------:|------------------------:|-----------------------:|-----------:|
+| **P1'** | `phase5_5090_P1_cls_only_rps56_20260508_0711` | stopped at ep 35 (early) | 35 | none (cls-only) | **0.851** (ep 33) | 0.242 (ep 14) | 0.166 (ep 17) | ~9.9 h |
+| **P2'** | `phase5_5090_P2_warm_mask_rps56_20260508_1721` (warm-start P1' ep33) | FINISHED | 30 | `λ_mask=0.05` (constant, union combiner) | 0.847 (ep 12), final 0.838 | **0.271** (ep 20) | **0.225** (ep 24) | 8.6 h |
+| **P3'** | `phase5_5090_P3_warm_mask_eq_rps56_20260508_1721` (warm-start P2' best-cam) | RUNNING (ep 9 / 25) | 9 | `λ_mask=0.05` + `λ_eq=0.1`, transforms=[1,2,3,4] | 0.823 (ep 2), latest 0.799 | 0.273 (ep 4) — flat | 0.225 (ep 4) — flat | ~5 h so far |
+
+There was also a precursor P1 run (`phase5_5090_P1_cls_only_rps56_20260507_2045`, run `1f17289…`) that hit a learning-rate scaling bug — `eff_batch` formula in `train_spdnet.py` was missing the `devices` factor, so the 4-GPU run was effectively training at LR=1.5625e-5 instead of the intended 6.25e-5 (4× too low). Diagnosed at ep 36 when val/mAP was still climbing slowly toward 0.65; killed and restarted as P1' after the fix. The fix landed in `src/train_spdnet.py` with a regression test (`tests/test_spdnet.py:TestEffBatchLRScaling`) and a pre-flight assertion in `scripts/run_phase5_5090_chain.sh`.
+
+##### 5.14.9.a P1' headline — pure classifier with rps=56 hits the 0.85 ceiling
+
+P1' confirmed §5.14.6's "architectural ceiling at 896² ≈ 0.85 val/mAP" hypothesis: peak at ep 33 was 0.851, identical (within noise) to P1's 0.849 from §5.14.6. **Doubling the SCA bandwidth from 400 keys to 3136 keys did not move the classification ceiling**. The rps=56 vs rps=20 cls-only iou_best peak was 0.242 vs 0.247 — within noise.
+
+The user stopped P1' at ep 35 (instead of the planned 50) once the val/mAP plateau was visually confirmed, freeing compute for P2' / P3'. The `best_mAP_epoch33.ckpt` (val/mAP=0.851) became the warm-start source for P2'.
+
+##### 5.14.9.b P2' headline — mask supervision lifts iou ~as predicted, with a small mAP cost
+
+| Metric | P1' end (ep 33) | P2' peak | P2' final (ep 30) | Δ vs P1' end |
+|---|---:|---:|---:|---:|
+| `val/mAP` | 0.851 | 0.847 (ep 12) | 0.838 | -0.013 (-1.5%) |
+| `val/cam_iou_best` | 0.242 (ep 14, P1') | **0.271** (ep 20) | 0.267 | **+0.029 (+12%)** |
+| `val/cam_iou_auc` | 0.166 (ep 17, P1') | **0.225** (ep 24) | 0.222 | **+0.059 (+36%)** |
+| `train/L_mask` | n/a | 0.221 → **0.025** | 0.025 | -89% |
+| `train/attn_std` (epoch) | 0.054 (P1' ep 35) | 0.108 (steady ep 5+) | 0.107 | **+98%** (sharper, healthier) |
+| `train/attn_p99` (epoch) | 0.276 (P1' ep 35) | 0.356 (ep 30) | 0.356 | **+29%** |
+
+**This is the cleanest "mask supervision works at high resolution" datapoint we have.** Trajectories:
+
+- The classifier warm-start dipped one epoch into P2' (val/mAP 0.851 → 0.808 by ep 6) under the mask gradient, then re-converged inside the same run (back to 0.847 by ep 12). No aux-loss collapse signature: `train/attn_std` *increased* from 0.054 to 0.108 across the warmup, and `attn_p99` increased from 0.276 to 0.356. Mask supervision is making the attention map *sharper*, not flatter — the opposite of the §5.13 D1/D4 collapse.
+- `cam_iou_best` rose synchronously with `train/L_mask` decay across epochs 1-19, plateaued at ~0.27 from ep 19 onward. `cam_iou_auc` has a longer ramp (still climbing slightly through ep 24) before plateauing.
+- The +36% relative gain on cam_iou_auc dwarfs the +12% relative gain on cam_iou_best — mask supervision's effect is asymmetric: it broadens the threshold-IoU curve more than it lifts the peak.
+
+The user's interpretation ("CAM becomes potentially better for refinement because AUC went up more than the best") motivated the CRF baseline eval below.
+
+##### 5.14.9.c CRF baseline eval — P1' (cls-only) vs P2' (mask) on 200 val images
+
+`scripts/run_phase5_5090_followup.sh` Phase A: generated single-scale CAMs at training resolution (image_size=896, rps=56, scales=[1.0], `binary_aggregate=max`) on a stable 500-image val subset (seeded RNG), then swept DenseCRF parameters with `scripts/sweep_crf_params.py` on 200 of those images (8 workers).
+
+**Best-of-sweep per checkpoint** (this is the headline number):
+
+| Checkpoint | best CRF config | bg_iou | **disease_iou** | mIoU |
+|---|---|---:|---:|---:|
+| P1' best-mAP (ep 33, cls-only) | srgb=13, bg_thr=**0.10**, sf=1.0 | 75.32% | **37.73%** | 56.53% |
+| P2' best-cam (ep 20, +mask) | srgb=13, bg_thr=**0.20**, sf=1.0 | 75.88% | **35.29%** | 55.58% |
+| **Δ (P2' - P1')** | bg_thr 0.10 → 0.20 | +0.55 pp | **-2.43 pp** | -0.94 pp |
+
+**Surprise — at the peak of each ckpt's CRF sweep, the cls-only P1' beats the mask-supervised P2' by 2.4 pp on disease IoU.** Mask supervision, despite improving raw `val/cam_iou_best` by 12% and `val/cam_iou_auc` by 36%, *hurts* disease IoU after CRF refinement at the optimum CRF config. The user's intuition (AUC-up → better post-CRF refinement) is **only partially confirmed**: the optimum-config peak goes the other way.
+
+But the picture is richer than the headline. The matched-config grid (50+ identical (srgb, bg_thr, sf) settings on both ckpts) reveals two complementary regimes:
+
+```
+                       P1'_disease_iou   P2'_disease_iou   delta
+  Low bg_thr (0.05-0.10), sf=1   34.7-37.7%      33.1-34.4%      -3.3 to -3.4 pp
+  Mid bg_thr (0.15-0.20), sf=1   33.0-30.3%      34.9-35.3%      +1.9 to +7.7 pp
+  High bg_thr (0.30), sf=1       15.7-19.5%      34.3-34.5%      +14.8 to +18.6 pp
+```
+
+**Two regimes**:
+
+1. **Sweet-spot regime (low bg_thr)**: P1' wins. Pure-classifier CAMs are *peaky* — they put high mass on a small set of pixels that are confidently disease (sharp, high-contrast boundary in the CAM). At low bg_thr, that peakedness aligns perfectly with the CRF's pairwise-color-discontinuity term: the CRF gets a clean, high-confidence seed and propagates outward. P1's disease_iou peaks at 37.73% in a narrow CRF-param sweet spot, but **collapses to 15.7% at bg_thr=0.30** because the threshold rises above the CAM's own peak amplitude in many disease pixels.
+
+2. **Robust regime (mid-high bg_thr)**: P2' wins, often by huge margins. Mask-supervised CAMs are *spread out* — they cover the whole lesion at moderate amplitude. At high bg_thr, this spread keeps the disease region active where P1's sharp CAM has already fallen below threshold. P2's disease_iou is 35.29% at its sweet spot, **34.3% at bg_thr=0.30**, **30.7% at bg_thr=0.30, sf=12** — much smaller cliff.
+
+So: **mask supervision trades sweet-spot peak for robustness across CRF parameter space.** AUC-up does translate to "the CAM is more usable across CRF configs" — P2's worst-bg_thr=0.30 result (34.3%) is *very close to its best-bg_thr=0.20 result* (35.3%, only -1 pp), whereas P1's worst-bg_thr=0.30 (15.7%) is **22 pp below** its best-bg_thr=0.10 (37.7%). The user's intuition about AUC and refinement is *correct in the robustness sense* but *wrong about the peak*.
+
+**Practical implication**: the CRF parameters were tuned per-distribution here (200-image sweep finds the per-ckpt optimum). In the production WSSS pipeline, CRF parameters are typically frozen across runs and ckpts. With a *fixed* bg_thr in the 0.15-0.20 range (a reasonable default that brackets both ckpts' sweet spots), P2' would consistently outperform P1' by 1-7 pp. With a fixed bg_thr=0.10 (the legacy default from §5.10's spatial campaign), P1' would dominate. **This is configuration-dependent**, not a clean win for either ckpt.
+
+##### 5.14.9.d P3' in-flight (cls + mask + eq) — equivariance is collapsing the attention map
+
+P3' was launched after P2' completed, warm-starting from `outputs/phase5_5090_chain/phase5_5090_P2_warm_mask_rps56_20260508_1721/checkpoints/best_cam_iou.ckpt` (val/cam_iou_best=0.271). Knobs: `λ_mask=0.05` (kept), `λ_eq=0.1` (new), `equivariance_transforms=[1,2,3,4]` (rot90/180/270 + hflip), `lr_override=1.2e-5` (same as P2'). Per-rank batch dropped from 2 to 1 with accum=8 to keep eff_batch=32 (the L_eq second forward pass needed +5 GiB peak VRAM on the 32 GiB cards). Smoke-tested at 21.5 GiB peak; running stably at 27.8 GiB live.
+
+**Trajectory through ep 9** (run `f4ee492c…`, currently RUNNING):
+
+```
+epoch  val/mAP   val/iou_best  val/iou_auc   train/L_eq   train/attn_std  train/attn_p99
+P2 end 0.838     0.267         0.222         (n/a)        0.107           0.356
+1      0.822     0.268         0.220         0.0062       0.107           0.357      ← step 0: still resembles P2
+2      0.823     0.268         0.215         0.0039       0.088           0.328
+3      0.821     0.270         0.220         0.0019       0.059           0.293
+4      0.788     0.273         0.225         0.0013       0.044           0.272
+5      0.813     0.272         0.216         0.0011       0.038           0.262
+6      0.781     0.268         0.219         0.0010       0.035           0.255
+7      0.783     0.269         0.212         0.0010       0.033           0.252
+8      0.788     0.272         0.222         0.0009       0.032           0.249
+9      0.799     0.271         0.223         0.0009       0.031           0.248
+```
+
+**Diagnosis — equivariance is collapsing attention into a near-uniform map**:
+
+- `train/L_eq` decays cleanly from 0.0062 → 0.0009 (-85% in 9 epochs). The optimisation is *working*.
+- But `train/attn_std` is in **free fall**: 0.107 → 0.031 (**-71%**). Combined with `attn_p99` collapsing 0.356 → 0.248 (**-30%**) and `attn_mean` essentially flat at ~0.177, this is a clear flattening signature: the attention distribution is becoming *spatially uniform*, not *spatially equivariant*.
+- The math explains it: the L_eq objective `MSE(T(attn(q)), attn(T(q)))` has a **trivial minimum at any spatially-constant attention map**. If `attn(q)[i] = c` for all spatial positions `i`, then `T(attn(q)) = attn(T(q)) = c` regardless of the transform `T`. This is the same family of failure as §5.13's D1 collapse for L_ac, just expressed differently — instead of "every query attends to one key" (mean → 1), this is "every query attends uniformly across all keys" (std → 0). Both are degenerate equivariance solutions.
+- The classifier is paying for it: `val/mAP` regressed from 0.838 (P2' final) / 0.847 (P2' peak) to 0.799, with high variance epoch-to-epoch (oscillating 0.78 - 0.82). Mask + spreading attention is making classification harder.
+- `val/cam_iou_best` (peak 0.273 at ep 4) and `val/cam_iou_auc` (peak 0.225 at ep 4) are within noise of P2' end. **The L_eq cost is being paid in mAP and attention-shape coherence, with no localisation gain.**
+
+The pattern matches the §5.14.5 prediction "Don't run aux-loss highres until fix 1 + fix 2 are in" — except those fixes *are* in. The new lesson is that **L_eq itself has a trivial-fixed-point pathology analogous to L_ac**, and the rps=56 enlargement does not protect against it. With 3136 keys and a uniform attention map, the L_eq gradient is zero and L_mask's spatially-localising gradient is the only thing keeping the model honest. But L_mask alone (P2') was already at the cam_iou_best plateau, so the combined run has nothing to gain and a real cost in classifier integrity.
+
+**Decision pending** (user's call): stop P3' now to save ~12 h of compute on a degenerating run, or let it complete to ep 25 to catalogue the steady-state for the §5.13 / §5.14 follow-up table. Recommendation: **stop and reallocate**. The signal is unambiguous after 9 epochs and matches the §5.13.6 "trivial fixed point" pathology of L_ac.
+
+##### 5.14.9.e What this changes about our localisation roadmap
+
+The combined P1'/P2'/P3' + CRF result re-frames the priorities (and obsoletes part of §5.14.7 / Open-Problems #29):
+
+1. **Mask supervision is real but it's a robustness tool, not a peak tool.** P2' beats P1' on raw cam_iou metrics (+12% best, +36% AUC) and on robustness across CRF parameter space (-22 pp cliff vs -1 pp cliff at high bg_thr), but loses to P1' by 2.4 pp on the *peak* CRF disease_iou. The "right" choice depends on whether the downstream pipeline tunes CRF per-distribution (use P1') or uses fixed CRF params (use P2').
+2. **Equivariance loss is broken on this architecture for the same structural reason L_ac was broken.** L_eq's MSE-on-transformed-attention has a trivial minimum at uniform attention (std=0 globally satisfies any equivariance constraint). The rps=56 enlargement does not change this; nothing about increasing the key-set size eliminates the uniform-attention fixed point. **Don't run any future L_eq experiment without first adding an explicit anti-flattening regulariser** (e.g. an entropy floor on attn distribution, or a lower bound on `attn_std`).
+3. **The next leverage is *not* combining cls+mask+eq at scale.** The P3' run is empirical proof that the obvious extension fails. The right next step is either (a) the segmentation-probe pipeline run on the P1' / P2' ckpts (cf. Open-Problems #28), which previously lifted spatial cls-only ckpts from 32% → 62% disease IoU at 448 — a ~25× larger gain than anything mask supervision or equivariance has produced; or (b) pseudo-mask distillation from a frozen probe-head teacher (Open-Problems #24), which avoids the trivial-fixed-point issue by giving the model a real localisation target instead of a self-consistency target.
+4. **CRF is a sharper instrument than `val/cam_iou_best` for choosing between checkpoints.** The cam_iou metrics ranked P2' > P1', but CRF disease_iou at the per-distribution sweet spot ranks P1' > P2'. For ckpt selection in any future run with a downstream CRF stage, the *only* trustworthy metric is the actual CRF sweep. Add a 200-image CRF sweep to the post-training acceptance gate of every future SPDNet run.
+5. **Sweep-once-per-distribution discipline matters more than we thought.** P2's optimal bg_thr=0.20 vs P1's optimal bg_thr=0.10 is a 2× shift in CRF param space — the same legacy CRF settings (used since §5.10 with bg_thr=0.10) are *unfair* to mask-supervised ckpts. The §5.8 finding that "feature seeds need their own CRF tuning" generalises to "every checkpoint with a meaningfully different CAM distribution needs its own CRF tuning". **Action**: re-tune CRF on every ckpt comparison going forward.
+
+---
 
 ### Binary pipeline
 ```bash
@@ -2219,6 +2350,36 @@ python scripts/visualize_spdnet_activations.py \
 
 # Run unit tests
 pytest tests/test_spdnet.py -v
+```
+
+### Phase-5 4× RTX 5090 chain (P1' / P2' / P3' + CRF baseline)
+```bash
+# Pre-flight only (no GPU usage)
+bash scripts/run_phase5_5090_followup.sh --preflight-only
+
+# CRF baseline eval only (P1' best-mAP vs P2' best-cam, 200-image sweep)
+# - generates outputs/_phase5_followup/crf_eval_<DATE>/sweep_p{1,2}_*.json
+# - prints disease_iou delta + verdict; ~50 min on a 5090
+bash scripts/run_phase5_5090_followup.sh --skip-p3
+
+# CRF eval + P3' training (full followup, ~14 h on 4× 5090)
+nohup bash scripts/run_phase5_5090_followup.sh \
+  > logs/phase5_5090_chain/followup_$(date +%Y%m%d_%H%M).log 2>&1 &
+disown
+
+# Re-run only P3' (skip CRF, e.g. with a different λ_eq)
+LAMBDA_EQ_P3=0.05 bash scripts/run_phase5_5090_followup.sh --skip-crf
+
+# Manually compare two existing CRF sweep JSONs at matched configs
+python -c "
+import json
+p1 = json.load(open('outputs/_phase5_followup/crf_eval_<TAG>/sweep_p1_best_map.json'))['all_results']
+p2 = json.load(open('outputs/_phase5_followup/crf_eval_<TAG>/sweep_p2_best_cam.json'))['all_results']
+g = lambda rs: {(r['srgb'], r['bg_threshold'], r['scale_factor']): r['disease_iou'] for r in rs}
+g1, g2 = g(p1), g(p2)
+for k in sorted(set(g1) & set(g2)):
+    print(f'srgb={k[0]:>2} bg_thr={k[1]:>4.2f} sf={k[2]:>4.1f}  P1={g1[k]:6.2f}  P2={g2[k]:6.2f}  delta={g2[k]-g1[k]:+.2f}')
+"
 ```
 
 ### Generate reports

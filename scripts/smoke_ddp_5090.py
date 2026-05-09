@@ -180,6 +180,18 @@ def main() -> int:
                         help="Tighter NCCL watchdog timeout for the smoke. "
                              "Default 180 s; the symmetric path should clear in "
                              "under a minute, so 3x that catches deadlocks fast.")
+    # Aux-loss knobs. Default 0 keeps the legacy classifier-only smoke;
+    # set non-zero to verify the cls + mask + eq stack (P3' P3'-equivalent
+    # on synthetic data, which is the cheapest possible VRAM + DDP +
+    # second-forward verification before launching a 5-7 h real run).
+    parser.add_argument("--lambda-mask", type=float, default=0.0,
+                        help="L_mask coefficient. Non-zero exercises "
+                             "cam_pseudo_mask_loss in training_step.")
+    parser.add_argument("--lambda-eq", type=float, default=0.0,
+                        help="L_eq coefficient. Non-zero exercises the "
+                             "second-forward attention_map(q_aug) path AND "
+                             "the equivariance_loss MSE -- adds ~30%% per-step "
+                             "VRAM at the train-time SCA buffer scale.")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -214,8 +226,16 @@ def main() -> int:
     val_loader = DataLoader(val_ds, shuffle=False, **common_loader)
 
     losses_cfg = SPDNetSpatialLossesConfig(
-        lambda_eq=0.0, lambda_con=0.0, lambda_distill=0.0,
-        lambda_ac=0.0, lambda_marg_H=0.0, lambda_mask=0.0,
+        lambda_eq=float(args.lambda_eq),
+        lambda_con=0.0, lambda_distill=0.0,
+        lambda_ac=0.0, lambda_marg_H=0.0,
+        lambda_mask=float(args.lambda_mask),
+        # ``mask_combiner=union`` matches the P2'/P3' production recipe.
+        # ``mask_warmup_*=0`` keeps the loss at full strength from epoch
+        # 0 so a 2-epoch smoke actually exercises the full L_mask path.
+        mask_combiner="union",
+        mask_warmup_start_epoch=0,
+        mask_warmup_epochs=0,
         online_loc_eval_enabled=bool(args.with_online_loc),
         log_attn_stats=True,
     )
@@ -374,6 +394,10 @@ def main() -> int:
 
     expected = ["train/attn_mean", "train/attn_std", "train/attn_p99",
                 "train/loss", "train/L_cls", "val/loss", "val/mAP"]
+    if float(args.lambda_mask) > 0:
+        expected.append("train/L_mask")
+    if float(args.lambda_eq) > 0:
+        expected.append("train/L_eq")
     missing = [k for k in expected if not _has(k)]
     if missing:
         print(f"[smoke] FAIL: missing keys in trainer.logged_metrics: {missing}",

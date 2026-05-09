@@ -202,23 +202,48 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
     )
 
     # ----- Learning-rate calibration (Trap 1 fix; see RESEARCH_CONTEXT.md
-    # §5.14.2). The legacy formula ``base_lr * batch_size / 256``
-    # silently ignored ``accumulate_grad_batches``: the optimizer step
-    # actually sees an effective batch of ``batch_size * accum``, but the
-    # scaling rule was applied to the *micro*-batch only. So a config
-    # that bumped accum to halve the per-step batch (typical when
-    # scaling image_size with a fixed VRAM cap) ended up with HALF the
-    # appropriate LR at the same effective batch -- the H4 highres run
-    # was a textbook example. The fixed rule uses ``eff_batch / 256``,
-    # which is the linear-scaling rule applied to what the optimizer
-    # actually sees. NOTE this DOES change the absolute LR for 448 runs
-    # that previously used accum>1: those runs were also gradient-
-    # starved (just less than H4) and the new LR is the right target.
-    # Pass ``model.learning_rate_override`` to pin the LR directly and
-    # bypass the rule (useful for reproducing legacy runs or for
-    # explicit hyperparameter sweeps).
+    # §5.14.2). The textbook linear-scaling rule says
+    # ``LR = base_lr * eff_batch_global / 256``, where ``eff_batch_global``
+    # is what the OPTIMIZER actually integrates over per step. With
+    # gradient accumulation AND DDP, a single optimizer step accumulates
+    # over ``batch_size * accum * devices`` samples (each rank does its
+    # own forward+backward for ``accum`` micro-batches before all-reduce
+    # averages gradients across the ``devices`` ranks; AdamW then steps
+    # on the averaged gradient).
+    #
+    # History of bugs at this site (regression context for future humans):
+    #   1. The original formula ``base_lr * batch_size / 256``
+    #      silently ignored ``accumulate_grad_batches``: configs that
+    #      halved the per-step batch (e.g. when scaling image_size at a
+    #      fixed VRAM cap) ran at HALF the appropriate LR. The H4
+    #      highres run was the textbook example.
+    #   2. The first fix (2026-05-04) changed the formula to
+    #      ``eff_batch / 256`` with ``eff_batch = batch * accum``, which
+    #      is correct for SINGLE-GPU but still ignores ``devices``. On
+    #      the 4x 5090 host (2026-05-07 P1' run) this gave LR=1.56e-5
+    #      instead of the correct 6.25e-5 -- 4x too low. The run got
+    #      val/mAP=0.51 at epoch 36 vs 0.79 in the equivalent single-
+    #      card baseline at the same epoch (peak LR 5.86e-5).
+    #
+    # Current rule: multiply by ``devices`` as well. This holds whether
+    # the user runs single-card (devices=1, no behavior change), DDP
+    # 2-GPU, DDP 4-GPU, or any other topology. ``learning_rate_override``
+    # bypasses the rule entirely (useful for reproducing legacy runs or
+    # explicit hyperparameter sweeps that pin the LR directly).
     accum = max(1, int(getattr(cfg.trainer, "accumulate_grad_batches", 1)))
-    eff_batch = dcfg.batch_size * accum
+    devices_cfg = getattr(cfg.trainer, "devices", 1)
+    if isinstance(devices_cfg, str):
+        # Hydra may pass ``devices: "auto"``; resolve to GPU count.
+        # ``"auto"`` on a 4-GPU host means 4. ``"-1"`` (Lightning idiom)
+        # also means all visible GPUs.
+        try:
+            devices_int = int(devices_cfg)
+        except ValueError:
+            devices_int = max(1, torch.cuda.device_count())
+        devices = max(1, devices_int) if devices_int > 0 else max(1, torch.cuda.device_count())
+    else:
+        devices = max(1, int(devices_cfg))
+    eff_batch = dcfg.batch_size * accum * devices
     auto_scaled_lr = cfg.model.learning_rate * (eff_batch / 256.0)
 
     lr_override = float(getattr(cfg.model, "learning_rate_override", 0.0) or 0.0)
@@ -226,14 +251,18 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         scaled_lr = lr_override
         log.info(
             f"LR override: model.learning_rate_override={lr_override} -> "
-            f"scaled_lr={scaled_lr} (auto would have been {auto_scaled_lr:.6g})"
+            f"scaled_lr={scaled_lr} (auto would have been {auto_scaled_lr:.6g} "
+            f"= {cfg.model.learning_rate} * eff_batch={eff_batch}"
+            f"({dcfg.batch_size}*{accum}*{devices})/256)"
         )
     else:
         scaled_lr = auto_scaled_lr
         log.info(
             f"LR scaling: base={cfg.model.learning_rate} * eff_batch="
-            f"{eff_batch}({dcfg.batch_size}*{accum})/256 = {scaled_lr:.6g} "
-            f"(legacy: per_step_batch/256 = "
+            f"{eff_batch}({dcfg.batch_size}*{accum}*{devices})/256 = {scaled_lr:.6g} "
+            f"(per-rank only would have been "
+            f"{cfg.model.learning_rate * dcfg.batch_size * accum / 256.0:.6g}; "
+            f"legacy per-step_batch only = "
             f"{cfg.model.learning_rate * dcfg.batch_size / 256.0:.6g})"
         )
 
@@ -374,18 +403,28 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         OmegaConf.save(cfg, config_path)
         mlflow_logger.experiment.log_artifact(mlflow_logger.run_id, str(config_path))
 
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=output_dir / "checkpoints",
-            filename="epoch={epoch:02d}-val_mAP={val/mAP:.4f}",
-            monitor="val/mAP",
-            mode="max",
-            save_top_k=1,
-            save_last=True,
-        ),
+    # ``SPDNET_DISABLE_CHECKPOINTING=1`` skips both ModelCheckpoint
+    # callbacks. Useful for smoke runs that don't need to retain
+    # weights and to bisect ModelCheckpoint-related DDP deadlocks
+    # (the 2026-05-07 4x 5090 P1' smoke pinned one to this codepath
+    # despite val/mAP+val/cam_iou_* being logged with sync_dist=True).
+    skip_ckpt = bool(int(os.environ.get("SPDNET_DISABLE_CHECKPOINTING", "0")))
+    callbacks: list = []
+    if not skip_ckpt:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=output_dir / "checkpoints",
+                filename="epoch={epoch:02d}-val_mAP={val/mAP:.4f}",
+                monitor="val/mAP",
+                mode="max",
+                save_top_k=1,
+                save_last=True,
+            )
+        )
+    callbacks.extend([
         LearningRateMonitor(logging_interval="epoch"),
         RichProgressBar(),
-    ]
+    ])
 
     # Optional second checkpoint: track val/cam_iou_best (online macro
     # disease-IoU emitted by OnlineCAMIoU). Added as a sibling to the
@@ -397,7 +436,7 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
     # OnlineCAMIoU (which never log val/cam_iou_best) can opt out. If the
     # metric is never logged the callback silently keeps save_top_k=1
     # slot empty; that is preferable to crashing on missing metric.
-    if getattr(cfg.trainer, "save_best_cam_iou", True):
+    if not skip_ckpt and getattr(cfg.trainer, "save_best_cam_iou", True):
         callbacks.append(
             ModelCheckpoint(
                 dirpath=output_dir / "checkpoints",
@@ -442,6 +481,7 @@ def train_spdnet(cfg: SPDNetConfig) -> float:
         val_check_interval=cfg.trainer.val_check_interval,
         logger=mlflow_logger,
         callbacks=callbacks,
+        enable_checkpointing=not skip_ckpt,
         default_root_dir=str(output_dir),
     )
 

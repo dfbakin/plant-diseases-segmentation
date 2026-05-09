@@ -39,11 +39,21 @@ def load_spdnet_from_checkpoint(
     fpn_channels: int = 256,
     mse_reduction: int = 4,
     fusion_mode: str | None = None,
+    ref_pool_size: int | None = None,
 ) -> SPDNet:
     """Load SPDNet from a Lightning checkpoint.
 
     If *fusion_mode* is ``None``, it is auto-detected from saved
     hyperparameters (falls back to ``"token"`` for old checkpoints).
+
+    If *ref_pool_size* is ``None``, it is auto-detected from saved
+    hyperparameters (falls back to the SPDNet default of 14 for old
+    checkpoints that pre-date the rps logging in ``SPDNetModule.__init__``).
+    Auto-detection matters: ``ref_pool_size`` controls the spatial K side
+    of the SCA attention buffer ``(B, heads, Q, K^2)`` -- loading a rps=56
+    checkpoint into a rps=14 model will silently produce incorrect CAMs
+    because the AdaptiveAvgPool2d on the reference path collapses keys to
+    a different grid size.
     """
     ckpt = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if "state_dict" in ckpt:
@@ -51,9 +61,11 @@ def load_spdnet_from_checkpoint(
     else:
         sd = ckpt.get("model", ckpt)
 
+    hp = ckpt.get("hyper_parameters", {})
     if fusion_mode is None:
-        hp = ckpt.get("hyper_parameters", {})
         fusion_mode = hp.get("fusion_mode", "token")
+    if ref_pool_size is None:
+        ref_pool_size = int(hp.get("ref_pool_size", 14))
 
     model = SPDNet(
         num_classes=num_classes,
@@ -61,6 +73,7 @@ def load_spdnet_from_checkpoint(
         mse_reduction=mse_reduction,
         pretrained=False,
         fusion_mode=fusion_mode,
+        ref_pool_size=ref_pool_size,
     )
     model.load_state_dict(sd, strict=False)
     return model

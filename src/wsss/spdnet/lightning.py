@@ -112,11 +112,58 @@ class SPDNetModule(L.LightningModule):
         self.min_lr = min_lr
         self.image_size = image_size
 
-        mk = lambda: torchmetrics.classification.MultilabelAveragePrecision(
-            num_labels=num_classes
-        )
-        self.train_mAP = mk()
-        self.val_mAP = mk()
+        # mAP computation strategy on the 4x 5090 host (PCIe-only NCCL,
+        # SyncBN + find_unused_parameters=True + OnlineCAMIoU stack).
+        # We hit a brutal series of DDP deadlocks debugging this:
+        #
+        # 1. (smokes #1-#3) torchmetrics ``MultilabelAveragePrecision.
+        #    compute()`` triggers ``Metric.sync()`` -> ``gather_all_
+        #    tensors`` (torchmetrics util) -> a size-info ``ALLGATHER
+        #    NumelIn=2 NumelOut=2*world_size`` of the state tensor's
+        #    *shape*. On this host that size-info ALLGATHER desyncs:
+        #    rank 0 advances while ranks 1..3 stay stuck on it. The
+        #    NCCL watchdog shows the exact fingerprint ``WorkNCCL(
+        #    SeqNum=N, OpType=ALLGATHER, NumelIn=2, NumelOut=8)`` on
+        #    ranks 1..3.
+        #
+        # 2. (smoke #4) Refactoring val_mAP to manual ``self.all_gather``
+        #    + functional mAP fixed val_mAP. But the same deadlock
+        #    fingerprint reappeared because train_mAP still took the
+        #    torchmetrics path; ``train_mAP.compute()`` in
+        #    on_train_epoch_end leaked an asymmetric collective into
+        #    the validation epoch's CUDA stream (it eventually
+        #    completed on rank 0 but stayed stuck on ranks 1..3).
+        #
+        # 3. (smoke #5) Disabling ``ModelCheckpoint`` entirely did NOT
+        #    fix the deadlock -- ruling out the checkpoint save barrier
+        #    hypothesis. The deadlock was deeper.
+        #
+        # 4. (smoke #6) Refactoring train_mAP to ALSO use manual
+        #    ``self.all_gather`` + functional mAP STILL deadlocked, this
+        #    time with ranks 1..3 stuck on ``ALLGATHER NumelIn=974050
+        #    NumelOut=3896200`` (= our 8470x115 train preds gather)
+        #    while rank 0 had advanced to the OOM-coord ALLREDUCE.
+        #    val_mAP gather completed successfully (val/mAP=0.033 was
+        #    logged on rank 0). So the same primitive ``self.all_gather``
+        #    works for the smaller val preds tensor (1122x115=129030)
+        #    but hangs on the larger train preds tensor (8470x115=
+        #    974050). Plausibly: a CUDA-stream-scheduling or NCCL-on-
+        #    PCIe-only pathology specific to large all_gathers, or a
+        #    DDP-reducer-vs-explicit-collective race.
+        #
+        # Final strategy adopted here: compute val/mAP with manual gather
+        # (proven to work at the val-tensor size) and DROP the
+        # in-training train/mAP entirely. Training-side mAP is a
+        # nice-to-have monitoring metric, not a checkpoint criterion --
+        # ``ModelCheckpoint(monitor="val/mAP")`` is what matters.
+        # Train-side mAP can be recomputed offline from the saved
+        # checkpoint after fit if ever needed (eval scripts in
+        # ``scripts/`` already cover this). Removing the train-side
+        # gather eliminates the only collective that we know hangs at
+        # this scale on this host.
+        self.num_classes = int(num_classes)
+        self._val_preds_buf: list[torch.Tensor] = []
+        self._val_target_buf: list[torch.Tensor] = []
 
         # ------------------------ aux losses --------------------------
         self.losses_cfg = losses_cfg or SPDNetSpatialLossesConfig()
@@ -400,13 +447,15 @@ class SPDNetModule(L.LightningModule):
             total = total + self.losses_cfg.lambda_distill * L_dist
             comp["L_dist"] = L_dist.detach()
 
-        # ------------------ Logging + mAP ------------------
-        preds = torch.sigmoid(logits.detach())
-        self.train_mAP.update(preds, labels.int())
+        # ------------------ Logging ------------------
+        # Note: train/mAP is INTENTIONALLY not computed here any more.
+        # See class-init docstring for the full deadlock saga; short
+        # version: the all_gather of the train preds tensor (8470x115
+        # per rank) hangs on the 4x 5090 host even after eliminating
+        # torchmetrics' Metric.sync(). Compute train/mAP offline from
+        # the saved ckpt if needed.
         # ``sync_dist=True`` averages each scalar across DDP ranks before it
-        # reaches the MLflow logger. torchmetrics objects (``train_mAP``,
-        # ``val_mAP``) auto-sync via their internal ``.compute()`` and do
-        # NOT need this flag; setting it on them would double-count.
+        # reaches the MLflow logger.
         self.log(
             "train/loss", total,
             prog_bar=True, on_step=True, on_epoch=True, batch_size=B,
@@ -428,12 +477,17 @@ class SPDNetModule(L.LightningModule):
         if self.ema_teacher is not None:
             self.ema_teacher.update(self.model)
 
+    # NOTE: ``on_train_epoch_end`` intentionally has no body. We had
+    # train/mAP computed here for a long time, first via torchmetrics
+    # (caused the original deadlock) and then via a manual self.all_
+    # gather + functional mAP path. The manual gather ALSO deadlocked
+    # on the 4x 5090 host (smoke #6: ``ALLGATHER NumelIn=974050
+    # NumelOut=3896200`` hung on ranks 1..3 while rank 0 advanced).
+    # train/mAP is monitoring-only; compute it offline if needed.
+    # No-op hook is kept (rather than removed) so any subclass that
+    # legitimately wants to override it has a stable hook point.
     def on_train_epoch_end(self) -> None:
-        # torchmetrics' ``.compute()`` already gathers across DDP ranks;
-        # do NOT pass ``sync_dist=True`` here or the value would be
-        # averaged a second time.
-        self.log("train/mAP", self.train_mAP.compute(), prog_bar=True)
-        self.train_mAP.reset()
+        return
 
     # ------------------------------------------------------------------
     # Validation loop
@@ -443,7 +497,11 @@ class SPDNetModule(L.LightningModule):
         logits = self.model(batch["query_image"], batch["ref_images"], return_cam=False)
         loss = self.criterion(logits, batch["query_label"])
         preds = torch.sigmoid(logits.detach())
-        self.val_mAP.update(preds, batch["query_label"].int())
+        # Buffer locally; concatenate + cross-rank gather + functional
+        # mAP all happen in ``on_validation_epoch_end`` so that this hot
+        # path stays collective-free.
+        self._val_preds_buf.append(preds)
+        self._val_target_buf.append(batch["query_label"].detach())
         self.log(
             "val/loss", loss,
             prog_bar=True, on_epoch=True, batch_size=logits.size(0),
@@ -451,9 +509,74 @@ class SPDNetModule(L.LightningModule):
         )
 
     def on_validation_epoch_end(self) -> None:
-        # torchmetrics auto-syncs across ranks; no ``sync_dist`` here.
-        self.log("val/mAP", self.val_mAP.compute(), prog_bar=True)
-        self.val_mAP.reset()
+        # Manual rank-symmetric val/mAP computation. We accumulate
+        # ``(preds, target)`` per-rank in ``validation_step`` and
+        # cross-rank gather them HERE via ``self.all_gather`` (Lightning's
+        # symmetric tensor primitive that pads to the max size across
+        # ranks). The mAP itself is computed on every rank with the
+        # torchmetrics functional API -- a pure function with no internal
+        # collectives.
+        #
+        # Why not torchmetrics ``MultilabelAveragePrecision.compute()``:
+        # its ``Metric.sync()`` issues an ``all_gather`` of state-size
+        # info that desynced against our DDP+SyncBN+
+        # ``find_unused_parameters=True`` + OnlineCAMIoU stack on the 4x
+        # 5090 host. The 2026-05-07 P1' smoke watchdog showed rank 0
+        # advanced one collective past ranks 1..3 (rank 0 reached our
+        # OOM-coord ALLREDUCE NumelIn=1, ranks 1..3 still stuck on
+        # torchmetrics' ALLGATHER NumelIn=2 NumelOut=8 size-info
+        # gather), even with ``ModelCheckpoint`` fully disabled. Going
+        # through ``self.all_gather`` (which uses
+        # ``dist.all_gather_into_tensor`` directly) sidesteps the
+        # torchmetrics-internal sync entirely. The functional mAP is
+        # numerically identical to the Metric class output.
+        if self._val_preds_buf:
+            local_preds = torch.cat(self._val_preds_buf, dim=0)
+            local_target = torch.cat(self._val_target_buf, dim=0)
+        else:
+            local_preds = torch.zeros(0, self.num_classes, device=self.device)
+            local_target = torch.zeros(
+                0, self.num_classes, device=self.device, dtype=torch.long,
+            )
+        self._val_preds_buf.clear()
+        self._val_target_buf.clear()
+
+        # ``self.all_gather`` returns shape (world_size, N_per_rank, C)
+        # in DDP and the bare tensor in single-process. Flatten the rank
+        # axis to get (world_size * N_per_rank, C).
+        gathered_preds = self.all_gather(local_preds)
+        gathered_target = self.all_gather(local_target)
+        if gathered_preds.dim() == 3:
+            gathered_preds = gathered_preds.flatten(0, 1)
+            gathered_target = gathered_target.flatten(0, 1)
+
+        # Functional API: pure function, no collectives. Identical
+        # result to ``MultilabelAveragePrecision.compute()`` given the
+        # same gathered inputs.
+        from torchmetrics.functional.classification import (
+            multilabel_average_precision as _functional_mAP,
+        )
+        if gathered_preds.numel() > 0:
+            mAP_value = _functional_mAP(
+                gathered_preds.float(),
+                gathered_target.int(),
+                num_labels=self.num_classes,
+            )
+        else:
+            mAP_value = torch.tensor(0.0, device=self.device)
+
+        # ``sync_dist=False`` because the value is already identical on
+        # every rank (we computed it from the same gathered tensors).
+        # ``sync_dist=True`` would all-reduce N identical scalars which
+        # is a redundant collective; in particular it would re-introduce
+        # one more entry to the per-rank collective sequence and we want
+        # the validation epoch boundary to be as collective-light as
+        # possible. The metric still propagates to ``callback_metrics``
+        # symmetrically because every rank logs it.
+        self.log(
+            "val/mAP", mAP_value,
+            prog_bar=True, sync_dist=False,
+        )
 
         # ``OnlineCAMIoU.evaluate`` runs on EVERY rank (lockstep) so
         # that every metric logged through ``self.log`` is present on

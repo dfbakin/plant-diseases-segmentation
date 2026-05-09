@@ -147,12 +147,12 @@ NUM_WORKERS="${NUM_WORKERS:-6}"     # per rank -> 12 total on the 256-vCPU box
 # the 448 calibration). Override to (3, 5, 40) or (6, 3, 28) for the
 # alternative trade-offs.
 P1_BATCH="${P1_BATCH:-2}"
-P1_ACCUM="${P1_ACCUM:-8}"
+P1_ACCUM="${P1_ACCUM:-4}"
 P2_BATCH="${P2_BATCH:-2}"
-P2_ACCUM="${P2_ACCUM:-8}"
+P2_ACCUM="${P2_ACCUM:-4}"
 
-MAX_EPOCHS_P1="${MAX_EPOCHS_P1:-50}"
-MAX_EPOCHS_P2="${MAX_EPOCHS_P2:-25}"
+MAX_EPOCHS_P1="${MAX_EPOCHS_P1:-60}"
+MAX_EPOCHS_P2="${MAX_EPOCHS_P2:-30}"
 
 # Base LR -- the optimiser sees scaled_lr = LR_BASE * eff_batch / 256.
 # At eff_batch=32 and LR_BASE=5e-4 this is 6.25e-5, identical to the 448
@@ -194,11 +194,14 @@ MIN_LR_P2="${MIN_LR_P2:-1e-7}"
 WARMUP_P1="${WARMUP_P1:-5}"
 WARMUP_P2="${WARMUP_P2:-2}"
 
-# DDP. Must stay 2 / "ddp" -- the resolver in train_spdnet.py picks
-# DDPStrategy(find_unused_parameters=True, gradient_as_bucket_view=True)
-# when devices > 1 + strategy in {"auto", "ddp"}. Override DEVICES=1
-# for an emergency fallback to single-card.
-DEVICES="${DEVICES:-2}"
+# DDP. Default 4 GPUs on the 5090 host (4x RTX 5090 / SYS-PCIe). The
+# resolver in train_spdnet.py picks DDPStrategy(find_unused_parameters=
+# True, gradient_as_bucket_view=True) when devices > 1 + strategy in
+# {"auto", "ddp"}. With DEVICES=4 + accum=4 we keep eff_batch=32
+# (matches the single-card 448 baseline). Override DEVICES=2 + accum=8
+# for the older 2-GPU host or DEVICES=1 + accum=16 as an emergency
+# single-card fallback.
+DEVICES="${DEVICES:-4}"
 STRATEGY="${STRATEGY:-ddp}"
 
 # DDP env hygiene.
@@ -295,6 +298,36 @@ src_t = inspect.getsource(_ts.train_spdnet)
 assert "sync_batchnorm=" in src_t, \
     "train_spdnet does not pass sync_batchnorm to L.Trainer"
 
+# LR scaling MUST multiply by devices, not just batch * accum.
+# Regression: the 2026-05-07 P1' run on 4x 5090 used the per-rank-only
+# formula (batch*accum/256 = 8/256 instead of 32/256 for our setup),
+# giving peak LR=1.56e-5 vs the correct 6.25e-5. After 36 epochs the
+# val/mAP was 0.51 vs 0.79 in the equivalent single-card baseline at
+# the same epoch. The formula must be ``base_lr * eff_batch_global /
+# 256`` with ``eff_batch_global = batch * accum * devices``. We strip
+# python ``#`` comments first because the docstring above the
+# assignment also contains the literal string "eff_batch = batch *
+# accum" (describing the OLD formula) -- without stripping comments
+# the regex would false-positive on the docstring.
+import re as _re
+_src_t_code = "\n".join(
+    _re.sub(r"(?<!['\"])#.*$", "", ln) for ln in src_t.splitlines()
+)
+# Match the RHS only on lines that look like an actual assignment
+# (indented, starts with `eff_batch`).
+_eff_match = _re.search(
+    r"^\s+eff_batch\s*=\s*([^\n]+)", _src_t_code, _re.M,
+)
+assert _eff_match, \
+    "Could not find eff_batch assignment in train_spdnet (LR-scaling block)."
+_eff_rhs = _eff_match.group(1).strip()
+assert _re.search(r"\b(devices|world_size|num_devices)\b", _eff_rhs), \
+    (f"eff_batch RHS does not include devices/world_size: {_eff_rhs!r}. "
+     "The 2026-05-07 P1' run was crippled by the per-rank-only formula "
+     "``batch * accum``. The corrected formula is ``batch * accum * "
+     "devices`` (linear scaling on the GLOBAL effective batch). See "
+     "RESEARCH_CONTEXT.md and src/train_spdnet.py docstring.")
+
 # Resolver returns DDPStrategy with find_unused_parameters=True for 2-device auto.
 out = _resolve_trainer_strategy(strategy="auto", devices=2,
                                 find_unused_parameters=True)
@@ -305,10 +338,37 @@ assert fp is True, f"find_unused_parameters not propagated; got {fp!r}"
 gb = out._ddp_kwargs.get("gradient_as_bucket_view")
 assert gb is True, f"gradient_as_bucket_view not propagated; got {gb!r}"
 
-# training_step uses sync_dist=True on its scalar logs.
+# training_step uses sync_dist=True on its scalar logs (train/loss,
+# train/L_*, train/attn_*) and DOES NOT compute train/mAP any more.
+# After the 2026-05-07 P1' smoke series we dropped train/mAP entirely:
+# the train preds tensor (8470x115 per rank) all_gather hangs on this
+# 4x 5090 host (smoke #6 watchdog: ranks 1..3 stuck on ALLGATHER
+# NumelIn=974050 NumelOut=3896200 while rank 0 had advanced past).
+# The same primitive works for val (1122x115 = 129030 elements) so
+# val/mAP is still computed in-fit via the manual gather; train/mAP
+# becomes a post-hoc offline computation if ever needed.
 src = inspect.getsource(SPDNetModule.training_step)
 assert src.count("sync_dist=True") >= 2, \
     f"sync_dist=True missing in training_step (count={src.count('sync_dist=True')})"
+assert "self.train_mAP" not in src, \
+    "training_step still references self.train_mAP. After smoke #6 " \
+    "we removed in-fit train/mAP entirely -- the train preds " \
+    "all_gather deadlocks on this host. Compute it offline if needed."
+assert "_train_preds_buf" not in src, \
+    "training_step still buffers train preds. The train all_gather " \
+    "deadlocks; there's no point buffering. Drop the buffer code."
+
+# on_train_epoch_end is now a no-op (kept as a stable hook point for
+# subclass overrides). It must not perform any cross-rank collective.
+src_t_end = inspect.getsource(SPDNetModule.on_train_epoch_end)
+assert "self.train_mAP" not in src_t_end, \
+    "on_train_epoch_end still references self.train_mAP. We dropped it."
+assert "self.all_gather" not in src_t_end, \
+    "on_train_epoch_end calls self.all_gather. The train preds gather " \
+    "deadlocks at the 8470x115 size on this 4x 5090 host (smoke #6). " \
+    "Make on_train_epoch_end a no-op; do not compute train/mAP in-fit."
+assert "multilabel_average_precision" not in src_t_end, \
+    "on_train_epoch_end still computes mAP. Don't -- the gather hangs."
 
 # log_attn_stats branch is present in training_step.
 assert "log_attn_stats" in src, "training_step does not consult log_attn_stats"
@@ -417,6 +477,76 @@ assert "ReduceOp.MIN" in src_v_code, \
 assert "except torch.cuda.OutOfMemoryError" in src_v_code, \
     "Lost the try/except torch.cuda.OutOfMemoryError around " \
     "OnlineCAMIoU.evaluate -- the OOM defense-in-depth is gone."
+
+# val/mAP MUST be computed via the manual-gather + functional-mAP path
+# rather than torchmetrics ``MultilabelAveragePrecision.compute()``. The
+# class-based compute() runs ``Metric.sync()`` internally which issues
+# an ALLGATHER of state-size info. On the 4x 5090 host (PCIe-only NCCL
+# topology) that tiny size-info gather desynced against our DDP +
+# SyncBN + find_unused_parameters=True + OnlineCAMIoU stack and
+# deadlocked the entire fit. The 2026-05-07 P1' smoke #3 watchdog
+# stack-trace pinned this exactly: rank 0 reached our OOM-coord
+# ALLREDUCE NumelIn=1 while ranks 1..3 were stuck one collective
+# behind on ALLGATHER NumelIn=2 NumelOut=8 -- the torchmetrics
+# size-info gather. Fix: bypass torchmetrics' Metric.sync() by
+# accumulating preds/target into per-rank buffers, gathering them via
+# ``self.all_gather`` (Lightning's well-tested symmetric tensor
+# primitive that pads to the max size across ranks), and computing
+# the mAP locally on every rank with the FUNCTIONAL torchmetrics API
+# (``multilabel_average_precision``), which is a pure function with
+# no internal collectives.
+assert "self.val_mAP.compute" not in src_v_code, \
+    "on_validation_epoch_end calls self.val_mAP.compute(). That " \
+    "triggers torchmetrics' Metric.sync() ALLGATHER which deadlocked " \
+    "on the 2026-05-07 4x 5090 smoke. Use the manual-gather + " \
+    "functional mAP path instead. See the comment block above."
+assert "self.all_gather" in src_v_code, \
+    "on_validation_epoch_end MUST call self.all_gather to cross-rank " \
+    "gather buffered preds/target. Without it val/mAP is computed on " \
+    "partial val data per rank and diverges across ranks (which then " \
+    "breaks ModelCheckpoint(monitor=val/mAP) symmetry)."
+assert "multilabel_average_precision" in src_v_code, \
+    "on_validation_epoch_end MUST use the FUNCTIONAL torchmetrics " \
+    "multilabel_average_precision. The class-based " \
+    "MultilabelAveragePrecision is what triggers the internal-sync " \
+    "deadlock."
+
+# With the manual-gather flow the value of ``val/mAP`` is identical on
+# every rank by construction, so the ``self.log`` call MUST set
+# ``sync_dist=False`` -- ``sync_dist=True`` would all-reduce N copies
+# of the same scalar and add a redundant collective at exactly the
+# epoch boundary we are trying to keep collective-light. (rank_zero_
+# only=True is also wrong for the unrelated reason that it would skip
+# callback_metrics population on non-zero ranks and break
+# ModelCheckpoint symmetry.)
+_v_mAP_idx = src_v_code.find('"val/mAP"')
+assert _v_mAP_idx > 0, \
+    "Couldn't locate val/mAP log call in on_validation_epoch_end."
+_v_mAP_log_open = src_v_code.rfind("self.log", 0, _v_mAP_idx)
+_v_mAP_depth = 0
+_v_mAP_end = -1
+for _i, _ch in enumerate(src_v_code[_v_mAP_log_open + len("self.log"):]):
+    if _ch == "(":
+        _v_mAP_depth += 1
+    elif _ch == ")":
+        _v_mAP_depth -= 1
+        if _v_mAP_depth == 0:
+            _v_mAP_end = _v_mAP_log_open + len("self.log") + _i + 1
+            break
+_v_mAP_call = src_v_code[_v_mAP_log_open:_v_mAP_end] if _v_mAP_end > 0 else ""
+assert _v_mAP_call, "Couldn't extract val/mAP log call body."
+assert "sync_dist=False" in _v_mAP_call or "sync_dist = False" in _v_mAP_call, \
+    "val/mAP log MUST set sync_dist=False because the value is " \
+    "already identical on every rank (we gathered the inputs " \
+    "ourselves via self.all_gather). sync_dist=True would all-reduce " \
+    "identical scalars and add a redundant collective at the val-" \
+    "epoch boundary -- the boundary that deadlocked on 2026-05-07."
+assert "rank_zero_only=True" not in _v_mAP_call and \
+    "rank_zero_only = True" not in _v_mAP_call, \
+    "rank_zero_only=True is set on val/mAP -- that puts the metric on " \
+    "rank 0 only and reintroduces the asymmetric callback_metrics " \
+    "deadlock with ModelCheckpoint."
+
 # Tightened DDP timeout still wired through.
 assert hasattr(SPDNetTrainerConfig, "ddp_timeout_seconds"), \
     "Missing SPDNetTrainerConfig.ddp_timeout_seconds (defense in " \

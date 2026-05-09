@@ -681,28 +681,124 @@ class TestRefPoolSizeConfigurable:
 
 
 class TestEffectiveBatchLR:
-    """Trap-1 fix: scaled_lr is now ``base_lr * (batch * accum) / 256``
-    rather than ``base_lr * batch / 256``. Encoded as a unit test against
-    the train_spdnet helper (we don't import the full hydra entry point
-    because it pulls a heavy dataset; just compute the formula).
+    """Trap-1 fix (extended): ``scaled_lr = base_lr * eff_batch_global /
+    256`` where ``eff_batch_global = batch * accum * devices``. The
+    multiplication by ``devices`` is the 2026-05-07 fix -- without it
+    the 4-GPU production run got peak LR 1.56e-5 instead of 6.25e-5
+    (4x too low) and reached val/mAP=0.51 at epoch 36 vs 0.79 in the
+    equivalent single-card baseline. See ``train_spdnet.py`` for the
+    full regression history.
+
+    Encoded as a unit test that mirrors the formula from
+    ``train_spdnet.py`` directly (we don't import the hydra entry point
+    because it pulls a heavy dataset). A separate static-source check
+    (``test_devices_factor_present_in_source``) guards the source code
+    itself against silently regressing back to the per-rank-only form.
     """
 
     @pytest.mark.parametrize(
-        "base_lr, batch, accum, expected",
+        "base_lr, batch, accum, devices, expected",
         [
-            (5e-4, 16, 2, 5e-4 * 32 / 256),  # 448 spec -> 6.25e-5 (was 3.125e-5)
-            (5e-4, 8, 4, 5e-4 * 32 / 256),   # equivalent eff_batch -> same LR
-            (5e-4, 6, 5, 5e-4 * 30 / 256),   # 896 typical -> 5.86e-5
-            (5e-4, 4, 8, 5e-4 * 32 / 256),   # 896 aux-loss recipe -> 6.25e-5
-            (5e-4, 2, 15, 5e-4 * 30 / 256),  # 896 small-batch aux -> 5.86e-5
+            # 448 spec on 1 GPU.
+            (5e-4, 16, 2,  1, 5e-4 *  32 / 256),  # eff=32 -> 6.25e-5
+            # Equivalent eff_batch (32) reached different ways must give
+            # the same LR -- this is the whole point of the rule.
+            (5e-4,  8, 4,  1, 5e-4 *  32 / 256),
+            (5e-4,  4, 8,  1, 5e-4 *  32 / 256),
+            (5e-4,  2, 16, 1, 5e-4 *  32 / 256),
+            # 896 single-card baseline (eff_batch=30, peak LR 5.86e-5;
+            # this run reached val/mAP=0.823 in 60 epochs -- our
+            # reference for "correct LR").
+            (5e-4,  6, 5,  1, 5e-4 *  30 / 256),
+            (5e-4,  2, 15, 1, 5e-4 *  30 / 256),
+            # 2-GPU DDP at eff_batch=32 (batch=2, accum=8, devices=2):
+            # MUST give the same LR as eff_batch=32 on 1 GPU.
+            (5e-4,  2, 8,  2, 5e-4 *  32 / 256),  # 6.25e-5
+            # 4-GPU DDP at eff_batch=32 (batch=2, accum=4, devices=4):
+            # this is the production setup. MUST give 6.25e-5; pre-fix
+            # it gave 1.56e-5 (4x too low) because devices was ignored.
+            (5e-4,  2, 4,  4, 5e-4 *  32 / 256),  # 6.25e-5
+            # Smoke against the regression: 4-GPU should get exactly 4x
+            # the LR a 1-GPU run with the same per-rank batch/accum
+            # would. The 2026-05-07 bug made these match instead.
+            (5e-4,  2, 4,  1, 5e-4 *   8 / 256),  # = 1.5625e-5 (1-GPU
+                                                    # at eff=8 IS this)
+            (5e-4,  2, 4,  4, 5e-4 *  32 / 256),  # = 6.25e-5 (4-GPU
+                                                    # at eff=32 MUST be this)
         ],
     )
-    def test_effective_batch_scaling(self, base_lr, batch, accum, expected):
-        # Inline the exact formula used in train_spdnet.py so the test
-        # is independent of hydra+dataset wiring.
-        eff_batch = batch * accum
+    def test_effective_batch_scaling(
+        self, base_lr, batch, accum, devices, expected,
+    ):
+        eff_batch = batch * accum * devices
         scaled = base_lr * (eff_batch / 256.0)
         assert scaled == pytest.approx(expected, rel=1e-9)
+
+    def test_4gpu_run_must_be_4x_higher_than_per_rank_only_formula(self):
+        """Regression marker for the 2026-05-07 P1' bug: the bugged
+        formula ``base_lr * (batch * accum) / 256`` (per-rank only)
+        and the correct formula ``base_lr * (batch * accum * devices)
+        / 256`` (global) MUST differ by a factor of ``devices`` for any
+        DDP run. If this test fails it means the formula has silently
+        regressed.
+        """
+        base_lr = 5e-4
+        batch, accum, devices = 2, 4, 4
+        per_rank_only = base_lr * (batch * accum) / 256.0
+        global_correct = base_lr * (batch * accum * devices) / 256.0
+        assert global_correct == pytest.approx(
+            per_rank_only * devices, rel=1e-9,
+        ), (
+            "Global eff_batch formula must equal per-rank-only formula "
+            "times devices. If you changed the formula, update this "
+            "test alongside the source."
+        )
+        # Concrete pinned values that match the run logs:
+        # MLflow params from phase5_5090_P1_cls_only_rps56_20260507_2045
+        # showed learning_rate=1.5625e-05; correct value was 6.25e-05.
+        assert per_rank_only == pytest.approx(1.5625e-5, rel=1e-9)
+        assert global_correct == pytest.approx(6.25e-5, rel=1e-9)
+
+    def test_devices_factor_present_in_source(self):
+        """Static source check: the LR scaling formula in
+        ``train_spdnet.py`` MUST multiply by ``devices`` (or an
+        equivalent variable that resolves to ``cfg.trainer.devices``).
+        This is the regression that bit the 2026-05-07 P1' run -- the
+        fix lived in code only, with no source-level guard, and any
+        future refactor that touches that block could silently revert
+        it.
+        """
+        import inspect
+        import re
+        from pathlib import Path
+
+        src_path = Path(__file__).resolve().parent.parent / "src" / "train_spdnet.py"
+        src = src_path.read_text(encoding="utf-8")
+
+        # Strip comments so we don't false-positive on prose.
+        code = "\n".join(
+            re.sub(r"(?<!['\"])#.*$", "", ln) for ln in src.splitlines()
+        )
+
+        # The eff_batch assignment must include `* devices` (or
+        # `* devices_count` etc.) -- i.e. SOMETHING that is not just
+        # ``batch_size * accum``.
+        m = re.search(
+            r"eff_batch\s*=\s*([^\n]+)", code,
+        )
+        assert m, "eff_batch assignment not found in train_spdnet.py"
+        rhs = m.group(1).strip().rstrip(";")
+        # Must contain at least one factor that looks like the devices
+        # count. Accept ``devices`` or ``world_size`` or ``num_devices``
+        # to leave room for refactors, but NOT bare ``batch * accum``.
+        assert re.search(
+            r"\b(devices|world_size|num_devices|n_devices)\b", rhs,
+        ), (
+            f"eff_batch RHS does not multiply by devices/world_size: "
+            f"{rhs!r}. The 2026-05-07 P1' run had eff_batch = batch * "
+            f"accum (per-rank), giving LR=1.56e-5 instead of 6.25e-5 "
+            f"on 4 GPUs. The formula MUST include the device count."
+        )
 
 
 class TestLogAttnStats:
@@ -1162,6 +1258,220 @@ class TestOnlineCAMIoUOOMDefense:
             "call. Lightning explicitly warns about this in the "
             "logger_connector at distributed training, and not "
             "having it makes the metric value rank-local."
+        )
+
+    def test_val_mAP_uses_manual_gather_not_torchmetrics_sync(self):
+        """``on_validation_epoch_end`` must compute ``val/mAP`` via a
+        manual ``self.all_gather`` of buffered preds/targets followed
+        by the torchmetrics FUNCTIONAL ``multilabel_average_precision``
+        (which is a pure function with no internal collectives), NOT
+        via ``self.val_mAP.compute()`` on a torchmetrics
+        ``MultilabelAveragePrecision`` accumulator.
+
+        Regression context: the 2026-05-07 P1' smoke on the 4x 5090
+        host repeatedly deadlocked at the validation epoch boundary
+        even after we (a) made OnlineCAMIoU evaluation rank-symmetric,
+        (b) added ``sync_dist=True`` to all val/* log calls, and (c)
+        disabled ``ModelCheckpoint`` entirely. The watchdog stack-trace
+        showed rank 0 reaching our OOM-coordination ``ALLREDUCE
+        NumelIn=1`` while ranks 1..3 were stuck one collective behind
+        on an ``ALLGATHER NumelIn=2 NumelOut=8`` -- the size-info
+        gather that torchmetrics' ``Metric.sync()`` runs as the first
+        step of ``compute()``. That tiny 2-element gather desyncs
+        against our DDP+SyncBN+``find_unused_parameters=True`` +
+        OnlineCAMIoU stack on the 5090 host (root cause unknown;
+        possibly a NCCL-on-PCIe-only bug, possibly a torchmetrics
+        sync-state-list interaction with our forward-pass DDP hooks).
+
+        The fix is to BYPASS torchmetrics' internal sync entirely:
+        accumulate preds/target into per-rank Python lists during
+        ``validation_step``, gather them via ``self.all_gather`` in
+        ``on_validation_epoch_end`` (Lightning's well-tested symmetric
+        primitive that pads to the max size across ranks), then
+        compute mAP locally on every rank using the FUNCTIONAL API
+        ``torchmetrics.functional.classification.
+        multilabel_average_precision`` -- which is a pure function. The
+        result is bit-for-bit identical to the Metric class output
+        because the inputs are identical.
+
+        ``sync_dist=False`` on the ``val/mAP`` log call is correct
+        here: the value is already identical on every rank (by
+        construction of the manual gather), so an additional
+        ``ALLREDUCE`` of N copies of the same scalar is redundant
+        AND adds another collective at exactly the boundary we are
+        trying to make collective-light.
+        """
+        import inspect
+
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        src = inspect.getsource(SPDNetModule.on_validation_epoch_end)
+
+        assert "self.val_mAP.compute" not in src, (
+            "on_validation_epoch_end calls self.val_mAP.compute(). That "
+            "triggers torchmetrics' internal Metric.sync() ALLGATHER "
+            "(size info: NumelIn=2 NumelOut=2*world_size). On the 4x "
+            "5090 host this gather desynced against our DDP stack and "
+            "deadlocked the entire fit. Use the manual gather + "
+            "functional mAP path instead. See the docstring for "
+            "context."
+        )
+        assert "self.all_gather" in src, (
+            "on_validation_epoch_end must call self.all_gather to "
+            "cross-rank gather buffered preds/target. Without it the "
+            "metric is computed per-rank on partial val data and the "
+            "value diverges across ranks (which then breaks "
+            "ModelCheckpoint(monitor=val/mAP) symmetry)."
+        )
+        assert "multilabel_average_precision" in src, (
+            "on_validation_epoch_end must use the torchmetrics "
+            "FUNCTIONAL multilabel_average_precision. The class-based "
+            "MultilabelAveragePrecision is what triggers the "
+            "internal-sync deadlock; the functional version is a "
+            "pure function with no collectives."
+        )
+
+        # The val/mAP log call exists, computes a tensor we already
+        # gathered ourselves, and so MUST NOT use sync_dist=True (which
+        # would re-add an ALLREDUCE of identical scalars at exactly the
+        # boundary we are trying to keep collective-light).
+        log_open = -1
+        log_call = ""
+        search_from = 0
+        anchor_str = '"val/mAP"'
+        while True:
+            anchor = src.find(anchor_str, search_from)
+            if anchor < 0:
+                break
+            candidate_open = src.rfind("self.log", 0, anchor)
+            if candidate_open < 0:
+                search_from = anchor + len(anchor_str)
+                continue
+            cand_depth = 0
+            cand_end = -1
+            for _i, _ch in enumerate(
+                src[candidate_open + len("self.log") :]
+            ):
+                if _ch == "(":
+                    cand_depth += 1
+                elif _ch == ")":
+                    cand_depth -= 1
+                    if cand_depth == 0:
+                        cand_end = (
+                            candidate_open + len("self.log") + _i + 1
+                        )
+                        break
+            if cand_end > anchor:
+                log_open = candidate_open
+                log_call = src[candidate_open:cand_end]
+                break
+            search_from = anchor + len(anchor_str)
+        assert log_open >= 0 and log_call, (
+            f"Couldn't trace back to self.log( ... val/mAP ... ) in "
+            f"on_validation_epoch_end. Inspected source:\n{src}"
+        )
+        assert "sync_dist=False" in log_call, (
+            f"val/mAP log MUST set sync_dist=False because the value "
+            f"is already identical on every rank (we gathered the "
+            f"inputs ourselves via self.all_gather). sync_dist=True "
+            f"would all-reduce identical scalars and add a redundant "
+            f"collective at the val-epoch boundary -- which is exactly "
+            f"the boundary that deadlocked on the 2026-05-07 4x 5090 "
+            f"smoke. Code:\n{log_call}"
+        )
+        assert "rank_zero_only=True" not in log_call, (
+            f"val/mAP log sets rank_zero_only=True. That puts the "
+            f"metric on rank 0 only and breaks symmetric "
+            f"callback_metrics population (ModelCheckpoint deadlock). "
+            f"With the manual-gather flow, every rank already has the "
+            f"same value -- just log on every rank with sync_dist=False."
+        )
+
+    def test_train_mAP_is_not_computed_in_fit(self):
+        """``on_train_epoch_end`` MUST NOT compute train/mAP under any
+        path -- not via torchmetrics' class-based ``compute()`` (which
+        triggers the size-info ALLGATHER deadlock), and ALSO not via a
+        manual ``self.all_gather`` + functional mAP path (which itself
+        hangs on the 4x 5090 host at the larger train preds tensor
+        size).
+
+        Regression context: the 2026-05-07 P1' smoke series
+        progressively narrowed down the deadlock and finally pinned it
+        to the train-side preds gather:
+          - Smokes #1-3: torchmetrics ``Metric.sync()`` size-info
+            ALLGATHER deadlocked.
+          - Smoke #4: refactoring val_mAP to manual ``self.all_gather``
+            unblocked val/mAP, but train_mAP (still torchmetrics class)
+            then leaked the same size-info ALLGATHER asymmetry into
+            the validation epoch's CUDA stream.
+          - Smoke #5: disabling ModelCheckpoint did NOT fix the
+            deadlock, ruling out the checkpoint barrier hypothesis.
+          - Smoke #6: refactoring train_mAP to manual ``self.all_
+            gather`` + functional mAP STILL deadlocked, this time
+            with ranks 1..3 stuck on ``ALLGATHER NumelIn=974050
+            NumelOut=3896200`` (= our 8470 x 115 train preds tensor)
+            while rank 0 had advanced all the way to the OOM-coord
+            ALLREDUCE. The val gather (NumelIn=129030) had completed
+            successfully on all ranks; only the train gather hung.
+
+        That last smoke ruled out every "smart" fix: the same
+        primitive ``self.all_gather`` works fine for the val tensor
+        but hangs on the 7.5x larger train tensor. The most likely
+        cause is a CUDA-stream-vs-NCCL race or a PCIe-path NCCL
+        pathology that triggers above some size threshold on this
+        host (4x 5090, no NVLink).
+
+        Final decision: don't compute train/mAP during fit at all.
+        Training-side mAP is monitoring-only -- not a checkpoint
+        criterion (val/mAP is). It can be reconstructed offline from
+        the saved checkpoint after fit if ever needed.
+        """
+        import inspect
+
+        from src.wsss.spdnet.lightning import SPDNetModule
+
+        src_init = inspect.getsource(SPDNetModule.__init__)
+        assert "self.val_mAP" not in src_init, (
+            "SPDNetModule still constructs self.val_mAP. We removed it "
+            "in the 2026-05-07 fix; see class init docstring."
+        )
+        assert "self.train_mAP" not in src_init, (
+            "SPDNetModule still constructs self.train_mAP. After smoke "
+            "#6 we removed it entirely (training-side mAP is "
+            "monitoring-only and the all_gather hangs on this host). "
+            "See class init docstring for the full saga."
+        )
+
+        src_step = inspect.getsource(SPDNetModule.training_step)
+        assert "self.train_mAP" not in src_step, (
+            "training_step still references self.train_mAP. We removed "
+            "the in-fit train/mAP after smoke #6 -- the train preds "
+            "all_gather deadlocks on this host."
+        )
+        assert "_train_preds_buf" not in src_step, (
+            "training_step still buffers train preds. The train-side "
+            "gather doesn't work on this host so there is no point "
+            "buffering. Remove the buffer code entirely."
+        )
+
+        src_end = inspect.getsource(SPDNetModule.on_train_epoch_end)
+        assert "self.train_mAP" not in src_end, (
+            "on_train_epoch_end still references self.train_mAP."
+        )
+        assert "self.all_gather" not in src_end, (
+            "on_train_epoch_end still calls self.all_gather. The train "
+            "preds gather deadlocks on this host (smoke #6: ranks 1..3 "
+            "stuck on ALLGATHER NumelIn=974050 NumelOut=3896200). "
+            "Remove the gather; do not compute train/mAP in-fit."
+        )
+        assert "multilabel_average_precision" not in src_end, (
+            "on_train_epoch_end still computes mAP. Don't -- it "
+            "requires a gather that doesn't work at the train tensor "
+            "size on this host."
+        )
+        assert '"train/mAP"' not in src_end, (
+            "on_train_epoch_end still logs train/mAP. We dropped this "
+            "metric from the in-fit pipeline after smoke #6."
         )
 
     def test_oom_coordinated_across_ranks(self):
