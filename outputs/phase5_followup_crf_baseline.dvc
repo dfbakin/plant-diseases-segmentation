@@ -1,0 +1,6 @@
+outs:
+- md5: b15b33d76b82b75bfa5190320adadb7f.dir
+  size: 346500
+  nfiles: 3
+  hash: md5
+  path: phase5_followup_crf_baseline

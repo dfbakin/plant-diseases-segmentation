@@ -1,0 +1,130 @@
+repo_commit: 657aea5993d3d515a00f1bc7852ffa1f37850e52
+val_set: PlantSeg val (full 1247 images)
+gt_dir: outputs/plantseg_binary_mc115/gt_binary_val
+convention: "dataset-level (pixel-pooled) IoU per src/wsss/mctformer/evaluation.py:evaluate_cam_miou; image_mean_* fields use macro-image IoU averaging"
+P1_prime:
+  ckpt: outputs/phase5_5090_chain/phase5_5090_P1_cls_only_rps56_20260508_0711/checkpoints/best_mAP_epoch33.ckpt
+  rps: 56
+  seed_source: cam_classifier
+  scales: [1.0]
+  crf:
+    srgb: 13
+    bg_thr: 0.1
+    sf: 1.0
+  full_val:
+    disease_iou: 30.13
+    bg_iou: 72.26
+    miou: 51.2
+    best_thr: 0.14
+    _n_images: 1247
+P2_prime:
+  ckpt: outputs/phase5_5090_chain/phase5_5090_P2_warm_mask_rps56_20260508_1721/checkpoints/best_cam_iou.ckpt
+  rps: 56
+  seed_source: cam_classifier
+  scales: [1.0]
+  crf:
+    srgb: 13
+    bg_thr: 0.2
+    sf: 1.0
+  full_val:
+    disease_iou: 29.43
+    bg_iou: 76.52
+    miou: 52.98
+    best_thr: 0.42
+    _n_images: 1247
+P1_prime_multiscale:
+  scales: [0.75, 1.0, 1.25]
+  hflip: true
+  per_scale:
+    0.75:
+      disease_iou: 28.85
+      bg_iou: 69.61
+      miou: 49.23
+      best_thr: 0.15
+    1.00:
+      disease_iou: 30.13
+      bg_iou: 72.26
+      miou: 51.2
+      best_thr: 0.14
+    1.25:
+      disease_iou: 30.13
+      bg_iou: 72.94
+      miou: 51.54
+      best_thr: 0.13
+  multi_scale_avg:
+    crf:
+      srgb: 13
+      bg_thr: 0.1
+      sf: 1.0
+    disease_iou: 30.42
+    bg_iou: 70.18
+    miou: 50.3
+    best_thr_raw_cam: 0.14
+P2_prime_multiscale:
+  scales: [0.75, 1.0, 1.25]
+  hflip: true
+  per_scale:
+    0.75:
+      disease_iou: 29.08
+      bg_iou: 75.97
+      miou: 52.52
+      best_thr: 0.42
+    1.00:
+      disease_iou: 29.43
+      bg_iou: 76.52
+      miou: 52.98
+      best_thr: 0.43
+    1.25:
+      disease_iou: 30.02
+      bg_iou: 76.79
+      miou: 53.41
+      best_thr: 0.43
+  multi_scale_avg:
+    crf:
+      srgb: 13
+      bg_thr: 0.2
+      sf: 1.0
+    disease_iou: 33.94
+    bg_iou: 72.99
+    miou: 53.47
+    best_thr_raw_cam: 0.42
+per_image_stats:
+  p1:
+    mean_pred_fg_fraction: 0.3998
+    mean_gt_fg_fraction: 0.2033
+    oversegmentation_ratio: 0.5996
+    undersegmentation_ratio: 0.2705
+    image_mean_disease_iou: 31.25
+    image_mean_miou: 46.67
+    _n_images: 1247
+    _n_with_gt_fg: 1247
+    _n_with_pred_fg: 1234
+  p2:
+    mean_pred_fg_fraction: 0.3621
+    mean_gt_fg_fraction: 0.2033
+    oversegmentation_ratio: 0.606
+    undersegmentation_ratio: 0.2473
+    image_mean_disease_iou: 30.67
+    image_mean_miou: 48.86
+    _n_images: 1247
+    _n_with_gt_fg: 1247
+    _n_with_pred_fg: 1135
+paired_delta:
+  threshold_pp: 1.0
+  n_pair: 1247
+  n_improved: 570
+  n_unchanged: 159
+  n_degraded: 518
+  median_delta_pp: 0.23422496368292567
+  best_5_image_names: [bean_rust_google_0097, bean_rust_59, citrus_greening_disease_google_0091, blueberry_rust_google_0038, squash_powdery_mildew_google_0061]
+  worst_5_image_names: [wheat_powdery_mildew_Baidu_0188, wheat_bacterial_leaf_streak_(black_chaff)_Bing_0002, banana_black_leaf_streak_banana black sigatoka (7), zucchini_downy_mildew_Bing_0001, cabbage_downy_mildew_Bing_0000]
+sanity_check_mctformer:
+  ha_crf_disease_iou: null
+  weakclip_final_disease_iou: null
+  _ha_crf_n_images: null
+  _weakclip_n_images: null
+elapsed_sec:
+  stage_a_camgen: 1552.9298389930045
+  stage_b_eval: 633.5471647139639
+  stage_c_perimage: 10.4337095739902
+  stage_d_mctformer: 0.00013379898155108094

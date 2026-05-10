@@ -1149,7 +1149,7 @@ dvc pull outputs/spdnet_plantseg.dvc outputs/visualizations.dvc mlruns.dvc
 
 33. **Equivariance loss (`L_eq`) has the same trivial-fixed-point pathology as `L_ac` — DON'T USE WITHOUT ANTI-FLATTENING REGULARISER (NEW NULL RESULT, §5.14.9.d)**: P3' (`phase5_5090_P3_warm_mask_eq_rps56`, warm-start from P2' best-cam, +`λ_eq=0.1`, transforms=[1,2,3,4]) showed clean convergence of `train/L_eq` (-85% in 9 epochs) **achieved through attention flattening, not through learning equivariant attention**: `train/attn_std` collapsed -71% (0.107 → 0.031), `train/attn_p99` collapsed -30% (0.356 → 0.248), and `val/mAP` regressed -5 pp (0.847 → 0.799) while `val/cam_iou_best` stayed flat at the P2' plateau (~0.27). The L_eq objective `MSE(T(attn(q)), attn(T(q)))` has a trivial minimum at any spatially-uniform attention map (std=0 globally satisfies any geometric transform), exactly analogous to L_ac's trivial minimum at attn_mean=1 (§5.13.6). The rps=56 enlargement does not change this — the trivial-fixed-point exists regardless of key-set size. **Implication**: any future L_eq experiment needs an anti-flattening regulariser to prevent the degenerate solution: an attention entropy *floor* (e.g. `max(0, H_target - H(attn))`), an explicit `attn_std` lower bound, or a localisation-anchored loss term that requires non-uniform attention to satisfy. Without that, L_eq optimisation is unsafe by construction.
 
-34. **Mask supervision is a robustness tool, not a peak-IoU tool — CRF baseline reveals trade-off (NEW FINDING, §5.14.9.c)**: 200-image CRF parameter sweep on P1' (cls-only, rps=56) vs P2' (cls+mask, rps=56) shows P1' wins on **peak** disease_iou (37.73% at bg_thr=0.10 vs P2's 35.29% at bg_thr=0.20, **-2.4 pp delta**) but P2' wins on **robustness** across CRF parameter space (P1's disease_iou cliff -22 pp from peak to bg_thr=0.30 vs P2's cliff of only -1 pp). The user's intuition that "AUC-up → better CRF refinement" is **partially confirmed (robustness sense)** but **contradicted at the optimum config (peak sense)**. The mechanism: cls-only CAMs are peakier with steeper boundary gradients that align with the CRF's pairwise-color-discontinuity term — in a narrow CRF sweet spot CRF propagates beautifully from these high-confidence seeds. Mask-supervised CAMs are *spread out*: they cover the whole lesion at moderate amplitude, so CRF works adequately over a wide range of bg_thr but never gets the steep-boundary signal needed for the optimum. **Practical recommendation**: in the production WSSS pipeline (fixed CRF params across ckpts), use mask-supervised ckpts for robustness; in any per-distribution-tuned setting, use cls-only ckpts for peak. **Add a 200-image CRF sweep to the post-training acceptance gate of every future SPDNet run** — `val/cam_iou_best` alone is misleading for ckpt selection when a CRF stage follows.
+34. **Mask supervision is a robustness tool at single-scale and a peak tool at multi-scale (REFINED FINDING, §5.14.9.c → §5.14.9.f)**: 200-image CRF parameter sweep on P1' (cls-only, rps=56) vs P2' (cls+mask, rps=56) at single-scale shows P1' wins on peak disease_iou (37.73% at bg_thr=0.10 vs P2's 35.29% at bg_thr=0.20, **−2.4 pp**) but P2' wins on robustness across CRF parameter space (P1's disease_iou cliff −22 pp from peak to bg_thr=0.30 vs P2's cliff of only −1 pp). **However**, the full-val (1247) re-evaluation with multi-scale {0.75, 1.0, 1.25} + h-flip ensembling **flips the peak ordering**: P2' MS+CRF=33.94% disease_iou vs P1' MS+CRF=30.42% (**+3.52 pp for P2'**). P2's MS gain (+4.5 pp over its single-scale 29.4) is 15× larger than P1's (+0.3 pp over its single-scale 30.1) because mask-supervised CAMs are smoother and average constructively across scales, while cls-only CAMs have scale-dependent peak locations that smear when averaged. **Refined practical recommendation**: at single-scale inference (fast, cheap), the cls-only ckpt wins peak by 0.7 pp; at multi-scale + flip inference (3× cost), the mask-supervised ckpt wins peak by 3.5 pp. Mask supervision is thus a robustness tool *and* a peak tool, conditional on the inference budget. **Add a multi-scale+flip CRF sweep to the post-training acceptance gate of every future SPDNet run** — single-scale evaluation systematically underestimates mask-supervised ckpts.
 
 35. **Run seg-probe pipeline on P1'/P2' ckpts (NEW HIGHEST PRIORITY for localisation, supersedes #28)**: the seg-probe pipeline (§5.12) lifted SPDNet localisation from 32 % to 62 % disease IoU at 448 — a ~25× larger gain than the entire phase-5 highres + LR-fix + warm-start campaign achieved (~5-pp lift on cam_iou_best, ~2-pp lift on CRF disease_iou). With P1' (val/mAP=0.851 cls-only) and P2' (cam_iou_best=0.271 mask-supervised) as starting ckpts at 896² rps=56, the probe could potentially push localisation to ≥65 % disease IoU. Total compute: ~6 h Ph1 + Ph2 per ckpt. **Two-ckpt comparison**: (a) does mask supervision *help* or *hurt* the probe ceiling? — i.e., is P2's broader-CAM regime a better feature substrate for downstream segmentation than P1's peakier regime? (b) does rps=56 lift the probe ceiling vs the §5.12 result at rps=14? Both are answerable in one weekend.
 
@@ -2104,7 +2104,7 @@ MLflow experiment `phase5_5090_chain` (ID `821047238167612067`):
 |-----|----------|-------:|-------:|-----------|---------------:|------------------------:|-----------------------:|-----------:|
 | **P1'** | `phase5_5090_P1_cls_only_rps56_20260508_0711` | stopped at ep 35 (early) | 35 | none (cls-only) | **0.851** (ep 33) | 0.242 (ep 14) | 0.166 (ep 17) | ~9.9 h |
 | **P2'** | `phase5_5090_P2_warm_mask_rps56_20260508_1721` (warm-start P1' ep33) | FINISHED | 30 | `λ_mask=0.05` (constant, union combiner) | 0.847 (ep 12), final 0.838 | **0.271** (ep 20) | **0.225** (ep 24) | 8.6 h |
-| **P3'** | `phase5_5090_P3_warm_mask_eq_rps56_20260508_1721` (warm-start P2' best-cam) | RUNNING (ep 9 / 25) | 9 | `λ_mask=0.05` + `λ_eq=0.1`, transforms=[1,2,3,4] | 0.823 (ep 2), latest 0.799 | 0.273 (ep 4) — flat | 0.225 (ep 4) — flat | ~5 h so far |
+| **P3'** | `phase5_5090_P3_warm_mask_eq_rps56_20260508_1721` (warm-start P2' best-cam) | STOPPED at ep 9 (manual, attention collapse confirmed) | 9 | `λ_mask=0.05` + `λ_eq=0.1`, transforms=[1,2,3,4] | 0.823 (ep 2), final 0.799 | 0.273 (ep 4) — flat | 0.225 (ep 4) — flat | ~5 h |
 
 There was also a precursor P1 run (`phase5_5090_P1_cls_only_rps56_20260507_2045`, run `1f17289…`) that hit a learning-rate scaling bug — `eff_batch` formula in `train_spdnet.py` was missing the `devices` factor, so the 4-GPU run was effectively training at LR=1.5625e-5 instead of the intended 6.25e-5 (4× too low). Diagnosed at ep 36 when val/mAP was still climbing slowly toward 0.65; killed and restarted as P1' after the fix. The fix landed in `src/train_spdnet.py` with a regression test (`tests/test_spdnet.py:TestEffBatchLRScaling`) and a pre-flight assertion in `scripts/run_phase5_5090_chain.sh`.
 
@@ -2196,7 +2196,7 @@ P2 end 0.838     0.267         0.222         (n/a)        0.107           0.356
 
 The pattern matches the §5.14.5 prediction "Don't run aux-loss highres until fix 1 + fix 2 are in" — except those fixes *are* in. The new lesson is that **L_eq itself has a trivial-fixed-point pathology analogous to L_ac**, and the rps=56 enlargement does not protect against it. With 3136 keys and a uniform attention map, the L_eq gradient is zero and L_mask's spatially-localising gradient is the only thing keeping the model honest. But L_mask alone (P2') was already at the cam_iou_best plateau, so the combined run has nothing to gain and a real cost in classifier integrity.
 
-**Decision pending** (user's call): stop P3' now to save ~12 h of compute on a degenerating run, or let it complete to ep 25 to catalogue the steady-state for the §5.13 / §5.14 follow-up table. Recommendation: **stop and reallocate**. The signal is unambiguous after 9 epochs and matches the §5.13.6 "trivial fixed point" pathology of L_ac.
+**Decision (May 9)**: P3' was manually stopped at ep 9 once the attention-collapse trajectory was confirmed. The `best_cam_iou.ckpt` (ep 4, val/cam_iou_best=0.273) and the ep-1 / ep-9 last.ckpt are kept as a diagnostic cautionary record (DVC-tracked under `outputs/phase5_5090_chain.dvc`). The signal is unambiguous after 9 epochs and matches the §5.13.6 "trivial fixed point" pathology of L_ac.
 
 ##### 5.14.9.e What this changes about our localisation roadmap
 
@@ -2207,6 +2207,64 @@ The combined P1'/P2'/P3' + CRF result re-frames the priorities (and obsoletes pa
 3. **The next leverage is *not* combining cls+mask+eq at scale.** The P3' run is empirical proof that the obvious extension fails. The right next step is either (a) the segmentation-probe pipeline run on the P1' / P2' ckpts (cf. Open-Problems #28), which previously lifted spatial cls-only ckpts from 32% → 62% disease IoU at 448 — a ~25× larger gain than anything mask supervision or equivariance has produced; or (b) pseudo-mask distillation from a frozen probe-head teacher (Open-Problems #24), which avoids the trivial-fixed-point issue by giving the model a real localisation target instead of a self-consistency target.
 4. **CRF is a sharper instrument than `val/cam_iou_best` for choosing between checkpoints.** The cam_iou metrics ranked P2' > P1', but CRF disease_iou at the per-distribution sweet spot ranks P1' > P2'. For ckpt selection in any future run with a downstream CRF stage, the *only* trustworthy metric is the actual CRF sweep. Add a 200-image CRF sweep to the post-training acceptance gate of every future SPDNet run.
 5. **Sweep-once-per-distribution discipline matters more than we thought.** P2's optimal bg_thr=0.20 vs P1's optimal bg_thr=0.10 is a 2× shift in CRF param space — the same legacy CRF settings (used since §5.10 with bg_thr=0.10) are *unfair* to mask-supervised ckpts. The §5.8 finding that "feature seeds need their own CRF tuning" generalises to "every checkpoint with a meaningfully different CAM distribution needs its own CRF tuning". **Action**: re-tune CRF on every ckpt comparison going forward.
+
+##### 5.14.9.f Full-val multi-scale + CRF write-up metrics — mask supervision wins on multi-scale (May 9, 2026)
+
+The 200-image CRF sweep in §5.14.9.c was deliberately small (8 CPU workers, single resolution) to find the per-ckpt optimum CRF config quickly. To finalise the §5.14.9 write-up we re-evaluated both headline ckpts on the **full 1247-image val set** with multi-scale + horizontal-flip averaging at the per-ckpt optimum CRF config. The pipeline is `scripts/eval_phase5_writeup_metrics.py` (4-GPU sharded CAM gen + 32-worker CPU CRF + parallel per-image stats); ~37 min wall clock end-to-end. Output: `outputs/phase5_writeup_eval/report.yaml` (DVC-tracked under `outputs/phase5_writeup_eval.dvc`).
+
+**Headline (full val, 1247 images, pixel-pooled disease IoU):**
+
+| Config | P1' (cls-only, srgb=13/bg=0.10) | P2' (warm+mask, srgb=13/bg=0.20) | Δ (P2' − P1') |
+|---|---:|---:|---:|
+| Single-scale 1.00 + CRF | 30.13 | 29.43 | **−0.70 pp** |
+| Per-scale 0.75 + CRF | 28.85 | 29.08 | +0.23 pp |
+| Per-scale 1.25 + CRF | 30.13 | **30.02** | −0.11 pp |
+| **Multi-scale {0.75, 1.0, 1.25} + h-flip + CRF** | 30.42 | **33.94** | **+3.52 pp** |
+| MS+CRF mIoU | 50.30 | **53.47** | +3.17 pp |
+| MS+CRF bg_iou | 70.18 | 72.99 | +2.81 pp |
+
+**Two findings, both important for the write-up:**
+
+1. **Single-scale verifies the §5.14.9.c ordering on the full val set.** The 200-img CRF sweep showed P1' winning at peak (37.73% vs 35.29%, −2.4 pp), and the full-val single-scale eval reproduces the same direction at smaller magnitude (30.13 vs 29.43, −0.7 pp). The absolute disease_iou drops from the 200-img subset to full val by ~5-7 pp on both ckpts — the 200-img subset was easier than the full val (consistent with our standing observation that PlantSeg has long-tail hard images). The *relative* ordering is preserved: at single-scale, cls-only still beats mask-supervised on peak disease_iou.
+
+2. **Multi-scale + flip flips the verdict on full val.** P2's MS gain (+4.51 pp from its single-scale 29.43) is **15× larger** than P1's MS gain (+0.29 pp from its single-scale 30.13). The headline result for the campaign is **P2' multi-scale + h-flip + CRF (srgb=13, bg=0.20) = 33.94 disease_iou on full val** — the strongest disease_iou we've measured on PlantSeg with a SPDNet-family backbone, ~+8.5 pp over the 5.14.6 P2 baseline (rps=20, single-scale CRF: 25.4%) and ~+3.5 pp over P1' MS at the same CRF protocol.
+
+**Mechanism — why MS works asymmetrically.** The CAM-averaging step in stage A averages per-class CAM tensors across {0.75, 1.00, 1.25} × {original, h-flipped} (after resizing to the canonical scale-1.0 grid) *before* binary aggregation and min-max normalisation. This denoises the CAM topology before CRF gets to see it. P2's CAMs are *cleaner already* (the cam_iou_auc lift in §5.14.9.b) so they average constructively across scales — independent noise patterns at each scale get smoothed out, leaving a consensus signal that CRF can refine. P1's CAMs are *peakier* but each scale has its own peak location (driven by the receptive-field interaction with the disease patch size at that scale), so averaging doesn't constructively combine them — it just smears, costing about as much as it gains.
+
+**Per-image diagnostics (multi-scale + best CRF, both ckpts on full val, macro means)**:
+
+| Metric | P1' | P2' | Δ |
+|---|---:|---:|---:|
+| `mean_pred_fg_fraction` | 0.400 | 0.362 | −0.038 (P2' more conservative) |
+| `mean_gt_fg_fraction` | 0.203 | 0.203 | 0 (identical GT) |
+| `oversegmentation_ratio` | 0.600 | 0.606 | +0.006 (tied) |
+| `undersegmentation_ratio` | 0.271 | 0.247 | **−0.024 (P2' captures more disease)** |
+| `image_mean_disease_iou` (macro) | 31.25 | 30.67 | −0.58 (≈ tied per-image) |
+| `image_mean_miou` (macro) | 46.67 | **48.86** | +2.19 |
+| `n_with_pred_fg` / 1247 | 1234 | 1135 | −99 (P2' confidently silent on 99 more bg images) |
+
+Both models still grossly oversegment (predicted FG fraction is ~2× GT FG fraction). P2' is a touch more conservative in two ways: it predicts FG on 99 fewer images, and where it does predict FG, the FG fraction is 4 pp smaller. P2's lower undersegmentation_ratio (24.7% vs 27.1%) is the per-image evidence for the cam_iou_auc lift in §5.14.9.b: mask supervision spreads the CAM more evenly across the lesion, missing fewer disease pixels at any given threshold.
+
+**Paired delta (P2' − P1' per image, threshold 1 pp):**
+
+| | count |
+|---|---:|
+| n_improved (Δ > +1 pp) | 570 |
+| n_unchanged | 159 |
+| n_degraded (Δ < −1 pp) | 518 |
+| **median Δ** | **+0.23 pp** |
+| best 5 P2' wins | bean_rust_google_0097, bean_rust_59, citrus_greening_disease_google_0091, blueberry_rust_google_0038, squash_powdery_mildew_google_0061 |
+| worst 5 P2' regressions | wheat_powdery_mildew_Baidu_0188, wheat_bacterial_leaf_streak_(black_chaff)_Bing_0002, banana black sigatoka (7), zucchini_downy_mildew_Bing_0001, cabbage_downy_mildew_Bing_0000 |
+
+P2' wins on 570 / 1247 images vs 518 losses — the per-image distribution is almost symmetric (median Δ = +0.23 pp). The pixel-pooled +3.52 pp MS gain is therefore concentrated in big-leaf / dense-disease images where P2' wins by larger margins. P2's regressions cluster on cereal-crop dense-streak images (wheat, banana, zucchini, cabbage) where P1's overprediction overlaps GT by accident; the wins cluster on rust / powdery-mildew images with discrete lesion patches where P2's better lesion coverage matters most.
+
+**Updated take on §5.14.9.e claim 1 ("mask supervision is a robustness tool, not a peak tool")**: this was *correct at single-scale* but **needs amending for multi-scale**. The trade-off is:
+- At single-scale: P1' wins peak by 0.7 pp (cls-only CAMs are peaky, single-scale, well-aligned with CRF).
+- At multi-scale: P2' wins peak by 3.5 pp (mask-supervised CAMs are smoother, multi-scale-averaging-friendly).
+
+So the production rule should be: **if the inference budget allows multi-scale + flip ensembling (+3 forward passes, ~3× cost), use the mask-supervised ckpt; if compute-constrained to single-scale, use the cls-only ckpt.** Both are deployable depending on the deployment budget.
+
+The campaign artefact (`outputs/phase5_writeup_eval/report.yaml`, 27 MiB total with 1247 multi-scale CRF prediction PNGs and per-image CSVs) is the canonical write-up dataset for §5.14.9. The 23 GiB of intermediate per-scale CAMs was deleted after the report was generated — they're reproducible from the ckpts in ~26 min via the eval script.
 
 ---
 
@@ -2371,15 +2429,37 @@ disown
 LAMBDA_EQ_P3=0.05 bash scripts/run_phase5_5090_followup.sh --skip-crf
 
 # Manually compare two existing CRF sweep JSONs at matched configs
+# (note: CRF baseline JSONs are now archived at outputs/phase5_followup_crf_baseline/)
 python -c "
 import json
-p1 = json.load(open('outputs/_phase5_followup/crf_eval_<TAG>/sweep_p1_best_map.json'))['all_results']
-p2 = json.load(open('outputs/_phase5_followup/crf_eval_<TAG>/sweep_p2_best_cam.json'))['all_results']
+p1 = json.load(open('outputs/phase5_followup_crf_baseline/sweep_p1_best_map.json'))['all_results']
+p2 = json.load(open('outputs/phase5_followup_crf_baseline/sweep_p2_best_cam.json'))['all_results']
 g = lambda rs: {(r['srgb'], r['bg_threshold'], r['scale_factor']): r['disease_iou'] for r in rs}
 g1, g2 = g(p1), g(p2)
 for k in sorted(set(g1) & set(g2)):
     print(f'srgb={k[0]:>2} bg_thr={k[1]:>4.2f} sf={k[2]:>4.1f}  P1={g1[k]:6.2f}  P2={g2[k]:6.2f}  delta={g2[k]-g1[k]:+.2f}')
 "
+```
+
+### Phase-5 write-up metrics (full-val multi-scale + CRF eval, both ckpts)
+```bash
+# Re-emits the §5.14.9.f headline numbers (33.94 P2' MS+CRF disease_iou on full val).
+# 4-GPU sharded CAM gen + 32-worker CRF; ~37 min wall clock end-to-end.
+# Output: outputs/phase5_writeup_eval/{report.yaml, per_image_p?.csv, preds/}
+export PATH="/venv/main/bin:$PATH"
+python scripts/eval_phase5_writeup_metrics.py \
+    --output-dir outputs/phase5_writeup_eval \
+    --num-crf-workers 32
+
+# Smoke (32 images, 4 GPUs, ~3 min wall clock; for verifying changes to the script)
+python scripts/eval_phase5_writeup_metrics.py \
+    --output-dir outputs/_phase5_writeup_smoke \
+    --max-images 32 --num-crf-workers 16 --skip-mctformer
+
+# Re-emit YAML from cached stage outputs (no compute)
+python scripts/eval_phase5_writeup_metrics.py \
+    --output-dir outputs/phase5_writeup_eval \
+    --skip-camgen --skip-eval --skip-perimage --skip-mctformer
 ```
 
 ### Generate reports
@@ -2874,4 +2954,56 @@ CUDA_VISIBLE_DEVICES=1 python -m src.train_spdnet \
     losses.online_loc_eval_enabled=true &
 
 wait
+```
+
+### 14.9 Post-§5.14.9 4× RTX 5090 chain artefacts (NEW, May 9 2026)
+
+Three new DVC pointers were added to capture the §5.14.9 campaign, and `mlruns.dvc` was refreshed to include the four new run trees (`phase5_5090_chain` MLflow experiment).
+
+| `.dvc` pointer | Path | Size | Contents |
+|---|---|---:|---|
+| `outputs/phase5_5090_chain.dvc` | `outputs/phase5_5090_chain/` | **4.0 GiB** | Four 4×5090 run trees: P1' headline (0508_0711, val/mAP=0.851 @ ep33, `best_mAP_epoch33.ckpt` is the §5.14.9.f canonical warm-start source for any future cls-only ckpt comparison), P2' headline (0508_1721, val/cam_iou_best=0.271 @ ep20, `best_cam_iou.ckpt` is the canonical mask-supervised ckpt), P3' (0508_1721, stopped at ep 9 with attention collapse — kept as cautionary diagnostic), and the pre-LR-fix P1' (0507_2045, undertrained, kept as before/after evidence for the LR scaling bug). Each run dir carries `config.yaml` + `checkpoints/{best_*.ckpt, last.ckpt}`; the empty Lightning placeholder `epoch=epoch=NN-val_mAP=val/` dirs were pruned before adding. |
+| `outputs/phase5_writeup_eval.dvc` | `outputs/phase5_writeup_eval/` | **27 MiB** | Full-val multi-scale + CRF write-up artefacts (§5.14.9.f): `report.yaml` (the headline 33.94 disease_iou number lives here), `stage_a/b/c/d.json` (per-stage caches for re-emit-without-recompute), `per_image_p1.csv` + `per_image_p2.csv` (per-image diagnostics for both ckpts), `preds/p?_ms_crf/*.png` (1247 + 1247 = 2494 multi-scale CRF prediction PNGs for qualitative analysis). The 23 GiB of intermediate per-scale CAMs was deliberately deleted — reproducible from ckpts via `scripts/eval_phase5_writeup_metrics.py` in ~26 min. |
+| `outputs/phase5_followup_crf_baseline.dvc` | `outputs/phase5_followup_crf_baseline/` | **340 KiB** | The §5.14.9.c 200-image CRF parameter sweep results: `sweep_p1_best_map.json` + `sweep_p2_best_cam.json` (full grid: srgb × bg_thr × sf for both ckpts) + `plantseg_wsss_val_subset.npy` (the 200-image subset mapping for reproducibility). The 2.3 GiB of single-scale 200-image CAMs that backed the sweep was deleted — regenerable from `outputs/phase5_5090_chain.dvc` ckpts in ~10 min. |
+| `mlruns.dvc` (refreshed) | `mlruns/` | **7.9 GiB** (was ~7.4) | Now includes the four `phase5_5090_chain` runs (3 new MLflow run UUIDs in experiment 821047238167612067) with full attention-stat trajectories. Critical for §5.14.9.b's `train/attn_std`+`attn_p99` plots and §5.14.9.d's collapse diagnosis curve. |
+
+**Cleanup performed before adding** (saves ~26 GiB on disk):
+- `outputs/phase5_writeup_eval/cams/` (23 GiB intermediate CAMs) — deleted, reproducible.
+- `outputs/_phase5_followup/crf_eval_*/cams_p?_best_*` (2.3 GiB) — deleted, reproducible.
+- `outputs/_phase5_writeup_smoke/` (642 MiB smoke test).
+- `outputs/_phase5_5090_smoke_ddp/`, `outputs/_phase5_5090_chain/` (smoke stubs).
+- `outputs/_cache/`, `outputs/2026-05-0[789]/` (Hydra log dirs covered by run dirs).
+- Empty `epoch=epoch=NN-val_mAP=val/` dirs inside each run's `checkpoints/` (Lightning ModelCheckpoint quirk; cosmetic only).
+
+**Reproduction commands** for any single artefact:
+
+```bash
+# Full chain (P1' fresh) -- 4× RTX 5090, ~10 h
+bash scripts/run_phase5_5090_chain.sh
+
+# CRF baseline (after both P1' + P2' exist) -- ~50 min
+bash scripts/run_phase5_5090_followup.sh --skip-p3
+
+# Full-val MS+CRF write-up metrics (after P1' + P2' exist) -- ~37 min
+python scripts/eval_phase5_writeup_metrics.py \
+    --output-dir outputs/phase5_writeup_eval \
+    --num-crf-workers 32
+```
+
+**Pull on a fresh host** (any subset, in priority order):
+
+```bash
+export PATH="/venv/main/bin:$PATH"
+
+# 1) Critical for any further SPDNet experiment — the headline P1'/P2' ckpts
+dvc pull outputs/phase5_5090_chain.dvc
+
+# 2) The §5.14.9.f write-up artefacts — for re-reading the report or re-emitting figures
+dvc pull outputs/phase5_writeup_eval.dvc
+
+# 3) The 200-image CRF sweep results — for cross-ckpt CRF parameter analysis
+dvc pull outputs/phase5_followup_crf_baseline.dvc
+
+# 4) MLflow with phase5_5090_chain trajectories (heavy; only if you need attention-stat plots)
+dvc pull mlruns.dvc
 ```

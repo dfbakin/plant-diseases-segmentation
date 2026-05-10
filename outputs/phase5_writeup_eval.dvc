@@ -1,0 +1,6 @@
+outs:
+- md5: 88a03aca4a7bcde8f1475272d4237dbd.dir
+  size: 22178151
+  nfiles: 2501
+  hash: md5
+  path: phase5_writeup_eval

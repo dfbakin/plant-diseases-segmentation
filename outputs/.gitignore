@@ -13,3 +13,6 @@
 /phase5_lr_fix
 /phase5_highres
 /spdnet_aux_losses
+/phase5_5090_chain
+/phase5_writeup_eval
+/phase5_followup_crf_baseline

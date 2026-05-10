@@ -1,0 +1,6 @@
+outs:
+- md5: 5838709b50829b0a9c33bcbad936d290.dir
+  size: 4249060040
+  nfiles: 17
+  hash: md5
+  path: phase5_5090_chain
