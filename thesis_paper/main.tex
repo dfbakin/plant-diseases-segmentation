@@ -1,0 +1,1067 @@
+\documentclass[11pt,a4paper]{article}
+
+% =========================================================
+%  Style (arXiv template provided with the project)
+% =========================================================
+\usepackage{arxiv}
+
+% =========================================================
+%  Language, fonts, input encoding
+% =========================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T2A,T1]{fontenc}
+\usepackage[english,russian,main=english]{babel}
+
+% =========================================================
+%  Core typography / math / graphics
+% =========================================================
+\usepackage{amsmath,amsfonts,amssymb}
+\usepackage{mathtools}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{makecell}
+\usepackage{xcolor}
+\usepackage{setspace}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{natbib}
+\usepackage{hyperref}
+\usepackage{doi}
+\usepackage{cleveref}
+\usepackage{url}
+
+% =========================================================
+%  Geometry override to A4 (arxiv.sty loaded geometry as letterpaper)
+% =========================================================
+\AtBeginDocument{\newgeometry{a4paper,margin=2.4cm,headheight=14pt,headsep=20pt,footskip=24pt}}
+
+% =========================================================
+%  Hyperref / PDF metadata
+% =========================================================
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue,
+  pdftitle={Weakly Supervised Semantic Segmentation for Plant Disease Localization},
+  pdfauthor={Denis Bakin},
+  pdfkeywords={weakly supervised semantic segmentation, plant disease, class activation maps, Siamese network, localization probe}
+}
+
+% =========================================================
+%  Title
+% =========================================================
+\title{Weakly Supervised Semantic Segmentation for Plant Disease Localization}
+\author{Denis Bakin}
+\date{April 2026}
+\renewcommand{\shorttitle}{WSSS for Plant Disease Localization}
+
+% =========================================================
+%  Shortcuts
+% =========================================================
+\newcommand{\Leq}{\mathcal{L}_{\mathrm{eq}}}
+\newcommand{\Lcon}{\mathcal{L}_{\mathrm{con}}}
+\newcommand{\Ldist}{\mathcal{L}_{\mathrm{distill}}}
+\newcommand{\Lcls}{\mathcal{L}_{\mathrm{cls}}}
+\newcommand{\Ltotal}{\mathcal{L}_{\mathrm{total}}}
+\newcommand{\IoU}{\mathrm{IoU}}
+\newcommand{\mIoU}{\mathrm{mIoU}}
+
+\begin{document}
+
+% =========================================================
+%  Title page (cover)
+% =========================================================
+% \input{title.tex}
+
+% =========================================================
+%  Abstract (English)
+% =========================================================
+\begin{abstract}
+\noindent
+We study weakly-supervised semantic segmentation (WSSS) for plant disease
+localization on the in-the-wild \textsc{PlantSeg} dataset, where only
+image-level labels are available at training time. We reproduce three
+strong PASCAL VOC baselines (MCTformer, PSA/Random-Walk, WeakCLIP) and
+show that they transfer poorly to plant lesions: the best full-pipeline
+disease IoU is $33.3\%$ against a fully-supervised upper bound of
+$70.1\%$. As the main methodological contribution we introduce a
+\emph{shallow-probe localization-capacity} analysis that upper-bounds the
+pixel information latent in any intermediate layer, and use it to (i)~uncover
+$42$--$62\%$ disease IoU hidden inside classifier-only SPDNet features and
+(ii)~document a clean null result for equivariance and patch-contrastive
+auxiliary losses.
+\end{abstract}
+
+\vspace{0.5em}
+\keywords{weakly-supervised semantic segmentation \and plant disease \and
+class activation maps \and Siamese networks \and localization probes \and
+auxiliary losses}
+
+% =========================================================
+%  Abstract (Russian)  —  Аннотация
+% =========================================================
+\begin{otherlanguage}{russian}
+\begin{abstract}
+\noindent
+В работе изучается задача слабо-управляемой семантической сегментации
+(WSSS) для локализации болезней растений на полевом наборе
+\textsc{PlantSeg}, где на этапе обучения доступны только метки уровня
+изображения. Воспроизведены три базовых метода (MCTformer,
+PSA/Random\,Walk, WeakCLIP); показано, что их прямой перенос из домена
+PASCAL VOC даёт лишь $33{,}3\%$ IoU на классе disease при
+полностью-управляемом верхнем пределе $70{,}1\%$. Основным
+методологическим вкладом является \emph{анализ локализационной ёмкости
+с помощью мелкого декодера-зонда}, позволяющий оценить локализационную
+информацию, содержащуюся в произвольном слое сети. С его помощью
+(i)~обнаружено $42$--$62\%$ IoU, скрытых в признаках классификатора
+SPDNet, и (ii)~документирован отрицательный результат для
+вспомогательных функций потерь $\Leq$ и $\Lcon$.
+\end{abstract}
+\end{otherlanguage}
+
+% =========================================================
+%  Table of contents
+% =========================================================
+\newpage
+\pagenumbering{roman}
+{\small\setstretch{1.05}\tableofcontents}
+\newpage
+\pagenumbering{arabic}
+\setcounter{page}{1}
+
+% =========================================================
+%  1 — Introduction
+% =========================================================
+\section{Introduction}
+\label{sec:intro}
+
+Plant diseases cause recurring yield losses on the order of
+$20$--$40\%$ of global crop production and directly affect food security,
+supply chains and the economy~\citep{plantseg,qin_severity,garden}. Early,
+accurate identification and spatial delineation of disease regions on the
+plant is therefore a scientifically and economically valuable task.
+Modern computer-vision pipelines can in principle provide such delineation
+through \emph{semantic segmentation}, but pixel-accurate disease masks are
+prohibitively expensive to produce: they require domain-expert annotators,
+careful boundary labelling, and considerable time per image. The most
+recently released PlantSeg dataset~\citep{plantseg}, with roughly
+$7{,}700$ expertly annotated field images, is currently the largest public
+pixel-labelled resource and illustrates how severely supply-constrained
+the plant-disease segmentation domain is.
+
+\paragraph{Research question.}
+Given this scarcity of dense annotations, a natural research direction is
+\emph{weakly-supervised semantic segmentation} (WSSS): learn a segmentation
+model from image-level labels only (``the image contains disease $c$''),
+leveraging the much cheaper annotations available in plant-phenotyping
+collections such as PlantVillage~\citep{plantvillage}. WSSS has been
+extensively studied on general-purpose benchmarks — notably PASCAL
+VOC\,2012 — where state-of-the-art methods achieve mean IoU values on the
+order of $60$--$75\%$ and are within a few percentage points of the
+fully-supervised upper bound \citep{sec,affinitynet,weaktr,weakclip}. These
+methods typically follow a common pattern: (i)~train an image-level
+classifier, (ii)~extract \emph{class activation maps}
+(CAMs)~\citep{cam,gradcam}, (iii)~refine the CAMs with dense
+CRF~\citep{densecrf} and pixel-affinity~\citep{affinitynet} modules to
+produce pseudo-masks, and (iv)~train a segmentation network on these
+pseudo-masks.
+
+The main claim of this thesis is that \emph{this recipe transfers poorly
+to the plant-disease domain as it currently stands}, and that the gap
+between PASCAL VOC WSSS ($\mIoU\approx65\%$) and plant-disease WSSS
+(our best end-to-end result: $46\%$ $\mIoU$, $33\%$ disease IoU) is not
+an artefact of hyperparameter tuning but a structural property of the
+problem: plant lesions are small, sparse, low-contrast, and visually
+similar across the background; moreover, a standard classifier trained
+for disease \emph{class} prediction is not required to produce
+spatially discriminative attention to solve its training objective.
+
+\paragraph{Contributions.}
+The thesis makes four main contributions, all building on the PlantSeg
+and PlantVillage datasets:
+
+\begin{enumerate}[label=(\roman*),leftmargin=*,itemsep=2pt]
+\item A reproducible baseline evaluation of three well-known WSSS methods
+(MCTformer~\citep{mctformer}, PSA\,+\,Random\,Walk~\citep{affinitynet},
+WeakCLIP~\citep{weakclip}) on PlantSeg, plus an ablation that isolates the
+impact of binary vs.\ 115-class classification framing. The best pipeline
+disease IoU is $33.31\%$, far below the supervised upper bound of
+$70.1\%$ (SegNeXt, \citep{segnext}).
+\item A reproduction and careful debugging of the recent SPDNet
+Siamese plant-disease network~\citep{spdnet} in two fusion regimes
+(ADPL-CAM token fusion and a new spatial cross-attention variant), showing
+that neither improves pseudo-mask quality over MCTformer under a
+classification-only objective.
+\item A \emph{shallow-probe localization-capacity methodology} for
+measuring how much localization signal a given intermediate layer
+\emph{contains}. This is, to our knowledge, the first explicit
+upper-bound analysis of this form for plant-disease WSSS features.
+Applied to SPDNet, the probe lifts the measurable localization ceiling
+from $32\%$ (production cam\_classifier+CRF) to ${\approx}62\%$ disease
+IoU, $88\%$ of the fully-supervised SegNeXt baseline.
+\item A formal specification and empirical evaluation of three auxiliary
+spatial losses (equivariance, patch contrastive, and EMA-teacher
+self-distillation) designed to force the Siamese attention map to become
+spatially discriminative. We report a clean \emph{null result} with a
+root-cause analysis: neither loss injects an independent localization
+signal, and we explain why this is a structural property of the chosen
+formulations.
+\end{enumerate}
+
+\paragraph{Structure of the thesis.}
+\Cref{sec:related} reviews the relevant WSSS, foundation-model and
+plant-pathology literature. \Cref{sec:setup} describes the data, metrics
+and supervised upper bound. \Cref{sec:wsss-baselines} reproduces the
+standard WSSS pipeline on PlantSeg. \Cref{sec:spdnet} covers the SPDNet
+Siamese approach. \Cref{sec:probe} introduces the shallow-probe
+methodology and reports the capacity-analysis results. \Cref{sec:aux}
+formalizes the three auxiliary spatial losses and analyses the observed
+null result. \Cref{sec:discussion,sec:conclusion} summarize findings and
+discuss priorities for remaining work.
+
+% =========================================================
+%  2 — Related Work
+% =========================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Classical WSSS.}
+Classical WSSS methods are founded on class activation
+maps~\citep{cam,gradcam}, which identify the spatial locations an
+image classifier uses to make its decision. Because CAMs tend to be
+sparse and focus on the most discriminative parts of an object, a
+substantial sub-literature is devoted to \emph{expanding} and
+\emph{denoising} these seeds: SEC's seed/expand/constrain framework
+\citep{sec}, PSA/AffinityNet pixel-affinity propagation
+\citep{affinitynet}, and their Random Walk post-processing. TransCAM
+\citep{transcam} and WeakTr~\citep{weaktr} use transformer attention
+to refine the raw CAM maps; MCTformer~\citep{mctformer} introduces
+class tokens explicitly interacting with patch tokens to produce
+class-specific attention maps that are directly usable as CAM surrogates.
+
+\paragraph{Foundation-model-assisted WSSS.}
+Large pretrained models such as CLIP~\citep{clip} and SAM~\citep{sam}
+provide strong semantic and geometric priors. WeakCLIP~\citep{weakclip}
+adapts CLIP to WSSS through a text-to-pixel matching mechanism and
+reports PASCAL VOC mIoU in the mid-$60$s. SAM-based WSSS
+\citep{sam_pseudo,s2c,fm_wsss} uses SAM as a boundary-precise mask
+refiner over CAM-derived prompts. All of these methods make an implicit
+\emph{domain assumption}: that the pretrained model's general-purpose
+knowledge transfers to the target task. The present work finds that this
+assumption is weak for plant diseases, which are niche concepts rarely
+represented in web-scale contrastive pretraining.
+
+\paragraph{Plant-disease WSSS and Siamese localization.}
+Plant-specific WSSS has been studied in~\citep{plant_wsss} using
+CAM\,+\,weak-annotation refinement, and in~\citep{garden,sparsemoesam}
+using dedicated plant-lesion architectures with stronger geometric
+priors. Most closely related to our Siamese investigation is
+SPDNet~\citep{spdnet}, which introduces the ADPL-CAM algorithm. The
+SPDNet paper evaluates on only $42$ images with bounding-box IoU and
+reports visually compelling but statistically thin results; part of
+this thesis is devoted to a careful re-evaluation under pixel-level
+IoU on a two-order-of-magnitude larger validation set.
+
+\paragraph{Positioning.}
+Our work does not propose a fundamentally new WSSS algorithm. Rather,
+we provide a carefully calibrated study of how four families of
+approaches — classical CAM pipelines, foundation-model assistance,
+Siamese reference-guided CAMs and shallow-probe-based analysis — behave
+on a realistic plant-disease benchmark, and introduce a probing tool
+that we believe to be a useful unit of analysis for future WSSS work on
+specialized domains.
+
+% =========================================================
+%  3 — Problem Setting
+% =========================================================
+\section{Problem Setting, Data and Supervised Upper Bound}
+\label{sec:setup}
+
+\subsection{Formal problem statement}
+
+Let $\mathcal{X}\subseteq\mathbb{R}^{H\times W\times 3}$ denote the
+image space and let $\mathcal{Y}=\{0,1,\dots,C\}$ denote a label set
+consisting of $C$ disease classes and a single background class.
+\emph{Fully-supervised} semantic segmentation assumes a training set
+$\mathcal{D}_{\mathrm{full}}=\{(x_i,m_i)\}_{i=1}^{N_{\mathrm{f}}}$
+where $m_i\in\mathcal{Y}^{H\times W}$ is a pixel-level mask. The WSSS
+setting we target assumes only image-level labels:
+\[
+  \mathcal{D}_{\mathrm{weak}}=\{(x_i,y_i)\}_{i=1}^{N_{\mathrm{w}}},
+  \qquad
+  y_i\in\{0,1\}^{C},
+  \qquad N_{\mathrm{w}}\gg N_{\mathrm{f}},
+\]
+where $y_{i,c}=1$ indicates the presence of class $c$ anywhere in $x_i$.
+The goal is to learn a segmentation function
+$f_\theta:\mathcal{X}\to\mathcal{Y}^{H\times W}$ using only
+$\mathcal{D}_{\mathrm{weak}}$, evaluated on a held-out set for which
+pixel-level masks exist.
+
+\paragraph{Evaluation metrics.}
+Given predicted mask $\hat m$ and ground-truth mask $m$, per-class IoU is
+$\IoU_c(\hat m,m)=\frac{|\{\hat m=c\}\cap\{m=c\}|}{|\{\hat m=c\}\cup\{m=c\}|}$
+and mean IoU is $\mIoU=\frac{1}{C+1}\sum_{c=0}^{C}\IoU_c$. We additionally
+report \emph{disease IoU} (the foreground IoU in binary framing), as
+$\mIoU$ in a binary task is dominated by the much larger background
+class and is misleading as a measure of detection quality.
+
+\subsection{Datasets}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Datasets used in this thesis.}
+\label{tab:datasets}
+\begin{tabular}{@{}llrll@{}}
+\toprule
+Dataset & Role & \# Images & Classes & Supervision \\
+\midrule
+PlantSeg v3 \citep{plantseg}   & Primary, WSSS + eval     & 7\,700   & $1\!+\!115$ & pixel + image-level \\
+PlantVillage \citep{plantvillage} & Extra weak labels        & 54\,000  & 38 (mapped) & image-level \\
+PASCAL VOC 2012                 & Sanity-check reproduction & 10\,000  & $1\!+\!20$  & pixel + image-level \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:datasets} summarizes the three datasets used. PlantSeg contains
+$115$ disease classes plus background; PlantVillage contributes
+image-level labels mapped to the same $115$-class space via
+folder-to-class matching. PASCAL VOC 2012 is used only as a sanity check
+that our WSSS pipeline matches published numbers; all reported
+plant-domain results are on PlantSeg. The PlantSeg $7\,700/1\,247$
+train/val split is respected throughout, and the validation set is never
+used at training time, including during refinement stages.
+
+\subsection{Fully-supervised upper bound}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Fully-supervised segmentation on PlantSeg (binary task, 384\,px
+input, 30 epochs, cross-entropy loss). SegNeXt
+establishes the upper bound.}
+\label{tab:upperbound}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Architecture & $\mIoU$ (\%) & Disease IoU (\%) & BG IoU (\%)\\
+\midrule
+DeepLabV3+ (ResNet-50)~\citep{deeplabv3p} & 78.9 & 64.6 & 92.9 \\
+U-Net (ResNet-34)                         & 78.7 & 64.6 & 92.8 \\
+SegFormer (MiT-B3)~\citep{segformer}       & 80.9 & 68.2 & 93.6 \\
+\textbf{SegNeXt (MSCAN-T)}~\citep{segnext} & \textbf{82.1} & \textbf{70.1} & \textbf{94.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:upperbound} reports the supervised baselines. SegNeXt with the
+MSCAN-T backbone reaches $70.1\%$ disease IoU in the binary setting and
+serves as the upper bound against which all WSSS numbers are compared. A
+multiclass 116-way supervised SegNeXt reaches only $44.2\%$ $\mIoU$
+(not tabulated), confirming that the combination of small lesions and
+large class cardinality is intrinsically hard even with pixel-level
+supervision and motivating the \emph{binary} framing for most of the
+WSSS experiments.
+
+% =========================================================
+%  4 — Reproduced WSSS Baselines
+% =========================================================
+\section{Reproduced WSSS Baselines on PlantSeg}
+\label{sec:wsss-baselines}
+
+The WSSS pipeline used here is the classical four-stage recipe
+illustrated in \Cref{fig:pipeline}. Each stage outputs a pseudo-mask
+that serves as the input of the next.
+
+\begin{figure}[t]
+\centering
+\small
+\begin{tabular}{c}
+\fbox{\begin{tabular}{c}
+\textbf{Image-level labels}\\[2pt]
+$\downarrow$ MCTformer classifier\\
+\textbf{CAMs}\\
+$\downarrow$ DenseCRF (la/ha)\\
+\textbf{Refined CAMs}\\
+$\downarrow$ PSA (pixel affinity) $+$ Random Walk\\
+\textbf{Pseudo-masks}\\
+$\downarrow$ WeakCLIP training + CRF\\
+\textbf{Final masks}
+\end{tabular}}
+\end{tabular}
+\caption{The standard WSSS pipeline adapted to PlantSeg. Each block is
+evaluated independently against the pixel-level ground truth to
+diagnose where quality is lost.}
+\label{fig:pipeline}
+\end{figure}
+
+\subsection{Class activation maps from MCTformer}
+
+\paragraph{MCTformer in one paragraph.}
+MCTformer~\citep{mctformer} replaces the single class token of a
+standard DeiT~\citep{deit,vit} with $C$ \emph{class tokens},
+$\texttt{CLS}_1,\dots,\texttt{CLS}_C$, which interact with patch tokens
+through self-attention. For class $c$ and patch $p$, the CAM value is
+\begin{equation}
+A_c(p) \;=\; \sum_{h=1}^{H_{\mathrm{head}}}
+\mathrm{softmax}_p\!\left(\frac{(\texttt{CLS}_c)_h\,(\text{K}_p)_h^{\!\top}}{\sqrt{d_k}}\right),
+\label{eq:mctformer_cam}
+\end{equation}
+averaged over a small set of deep layers. Multi-scale test-time
+augmentation (five scales, horizontal flip) is averaged over scales.
+
+\paragraph{Binary vs.\ multi-class framing.}
+We train MCTformer in two framings:
+\emph{(a)}~\texttt{binary} — a single foreground class ``disease''
+vs.\ background; \emph{(b)}~\texttt{MC115} — $115$ disease classes
+individually, with the binary CAM obtained post-hoc as
+$A_{\mathrm{disease}}(p)=\max_{c=1}^{115} A_c(p)$.
+
+\Cref{tab:wsss_plantseg} summarises the end-to-end disease IoU of the
+two framings at each stage of the pipeline. Four observations are
+important:
+
+\begin{table}[t]
+\centering
+\small
+\caption{End-to-end WSSS pipeline on PlantSeg (binary evaluation). The
+MC115 framing consistently improves disease IoU at every stage. Bold
+marks the best per row.}
+\label{tab:wsss_plantseg}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+Stage & Binary $\mIoU$ & Binary $\IoU_{\mathrm{dis}}$ & MC115 $\mIoU$ & MC115 $\IoU_{\mathrm{dis}}$\\
+\midrule
+LA-CRF         & 45.01 & 12.64 & 51.94 & \textbf{27.77}\\
+HA-CRF         & 45.44 & 14.36 & \textbf{53.49} & \textbf{31.16}\\
+PSA\,+\,RW     & 43.01 & 20.21 & 42.29 & 30.42\\
+WeakCLIP+CRF   & 46.22 & 25.52 & 46.36 & \textbf{33.31}\\
+\bottomrule
+\multicolumn{5}{l}{\footnotesize Supervised SegNeXt upper bound: $\mIoU=82.1$, $\IoU_{\mathrm{dis}}=70.1$.}
+\end{tabular}
+\end{table}
+
+\begin{enumerate}[label=(\arabic*),leftmargin=*,itemsep=2pt]
+\item The binary MCTformer reaches $99.9\%$ classification mAP because
+``is there any disease on this leaf?'' is trivially solvable by
+low-level colour/texture features, and consequently produces diffuse,
+poorly-localized CAMs.
+\item The MC115 framing forces the classifier to distinguish e.g.\
+\emph{apple scab} from \emph{apple rust}, which requires attending to
+lesion-level features. This structural shift \emph{doubles} the
+post-CRF disease IoU ($14.4\%\to31.2\%$).
+\item Every subsequent refinement stage (PSA\,+\,RW, WeakCLIP) only
+recovers a fraction of the supervised ceiling, and the
+WeakCLIP final number is still ${\approx}37$pp below the supervised
+upper bound.
+\item The global $\mIoU$ and disease $\IoU$ move in opposite
+directions across stages: PSA\,+\,RW decreases $\mIoU$ while increasing
+disease IoU because it increases recall at the cost of background
+precision.
+\end{enumerate}
+
+\subsection{Refinement mechanisms tested}
+
+We applied four refinement mechanisms on top of the raw MCTformer CAMs.
+\emph{DenseCRF}~\citep{densecrf} with the parameters of
+\citep{mctformer} is used twice (low-$\alpha$ and high-$\alpha$ variants).
+\emph{PSA\,+\,Random Walk}~\citep{affinitynet} propagates confident
+seed regions across a learned pixel affinity graph. \emph{WeakCLIP}
+\citep{weakclip} trains a CLIP-based segmentation head on the
+pseudo-masks produced above. Finally, we investigated \emph{SAM-1-based
+refinement}~\citep{sam,sam_pseudo} with six prompt configurations,
+ranging from dense mask prompts to box\,+\,point prompts.
+
+\paragraph{SAM is only useful as a geometric prompt consumer.}
+Dense mask prompts (binary or soft) catastrophically collapse to the
+leaf boundary ($<\!1\%$ disease IoU). The single configuration that
+worked is \emph{box\,+\,CAM-derived points} (experiment~J), which
+recovers $33.96\%$ disease IoU — a $+0.65$pp improvement over WeakCLIP
+input plus a substantial $+14.92$pp increase in background IoU,
+i.e.\ SAM acts as a precision filter rather than as a disease detector.
+A point-sampling analysis shows that even at the $99$-th percentile of
+CAM activation only ${\sim}53\%$ of the sampled ``positive'' points
+actually fall on disease pixels, suggesting that CAM localization
+quality itself is the bottleneck rather than the refinement mechanism.
+
+% =========================================================
+%  5 — SPDNet
+% =========================================================
+\section{Siamese Plant-Disease Network (SPDNet)}
+\label{sec:spdnet}
+
+\subsection{Architecture}
+
+The Siamese hypothesis of \citep{spdnet} is that pairing a query image
+$q$ with a same-class reference $r$ should force the network to focus
+on disease-specific features. Our implementation follows the paper's
+description while fixing several omissions in the original description
+(in particular, an asymmetric application of channel attention and an
+unnormalized sum of FPN levels).
+
+Let $\phi$ denote a shared ResNet-50~\citep{resnet} backbone. For input
+$x$, $\phi$ produces four feature maps
+$\{F^{(k)}\}_{k=1}^{4}$ with channels $256,512,1024,2048$ at progressively
+coarser resolutions. An FPN~\citep{fpn} followed by a channel-attention
+(MSE) module produces four $256$-channel maps
+$P^{(k)}_q$ for the query and $P^{(k)}_r$ for the reference. We consider
+two ways of combining them:
+
+\paragraph{Token fusion (ADPL-CAM).}
+Each reference level is reduced to a token by global max-pooling,
+$T^{(k)}\!=\!\mathrm{GMP}(P^{(k)}_r)\in\mathbb{R}^{256}$, and the fused
+query feature is
+\begin{equation}
+Q_{\mathrm{fused}}(p)
+\;=\;\underbrace{\frac{1}{4}\sum_{k=1}^{4}P^{(k)}_q(p)}_{\text{merged query}}
+\;+\;\alpha\cdot\frac{1}{4}\sum_{k=1}^{4}T^{(k)},
+\label{eq:adpl}
+\end{equation}
+where $\alpha$ is a learnable scalar initialised at $0.1$.
+Crucially, the reference signal becomes a \emph{spatially constant}
+bias — the same vector is added at every location.
+
+\paragraph{Spatial cross-attention (SCA).}
+To preserve spatial structure, we introduce a multi-head cross-attention
+module in which the merged query (of shape $256\times H'\!\times\! W'$)
+acts as the query and a $196$-token pooled reference acts as the keys
+and values:
+\begin{equation}
+\mathrm{SCA}(P^{(*)}_q,P^{(*)}_r) \;=\; P^{(*)}_q \;+\;
+g\cdot \mathrm{MHA}\!\left(\mathrm{LN}(P^{(*)}_q), \mathrm{LN}(K), \mathrm{LN}(V)\right),
+\label{eq:sca}
+\end{equation}
+with four heads, hidden dimension $256$, and a learnable gate $g$
+initialised at $0.1$.
+
+Both fusion modes are fed to a classifier
+$\ell(Q_{\mathrm{fused}})=W_{\mathrm{cls}}\cdot\mathrm{GAP}(Q_{\mathrm{fused}})$
+with $W_{\mathrm{cls}}\in\mathbb{R}^{115\times256}$. Training uses
+multi-label soft-margin loss with AdamW and a cosine schedule with five
+warmup epochs at $10^{-4}$ base learning rate.
+
+\subsection{Classification results}
+
+\Cref{tab:spdnet_cls} reports the classification mAP and the post-hoc
+disease IoU of the ADPL-CAM-based seeds. Three salient findings stand
+out.
+
+\begin{table}[t]
+\centering
+\small
+\caption{SPDNet classification and seed-IoU results. $N$ is the number of
+reference images per query. Heavy augmentation = RandAugment + ColorJitter.
+Disease IoU is from raw CAMs (no CRF).}
+\label{tab:spdnet_cls}
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Run & Fusion & $N$ & Aug & val mAP & $\IoU_{\mathrm{dis}}$ (best thr) & Gate $g$\\
+\midrule
+\texttt{spdnet\_448\_42} (buggy)        & token   & 1 & heavy   & 62.1 & --    & n/a\\
+\texttt{spdnet\_fix\_n1\_heavy}          & token   & 1 & heavy   & 85.9 & \textbf{28.1} & n/a\\
+\texttt{spdnet\_fix\_n3\_heavy}          & token   & 3 & heavy   & \textbf{89.8} & 24.6 & n/a\\
+\texttt{spdnet\_fix\_n3\_light}          & token   & 3 & light   & 89.4 & --   & n/a\\
+\texttt{spdnet\_spatial\_n1\_ps}         & spatial & 1 & heavy   & 79.7 & 31.0 & 0.333\\
+\texttt{spdnet\_spatial\_n1\_ps\_pv}     & spatial & 1 & heavy   & 88.8 & 28.5 & 0.499\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Siamese fusion was initially inert.}
+In the original implementation, reference features were discarded during
+training (fusion was only invoked when \texttt{return\_cam=True}), so
+$\alpha$ received zero gradient and the model effectively trained as a
+plain ResNet-50\,+\,FPN classifier. Fixing this bug raised val mAP from
+$0.621$ to $0.859$ and is a prerequisite for any of the localization
+results below.
+
+\paragraph{Higher $N$ helps classification but hurts localization.}
+$N{=}3$ references improves val mAP by $+3.9$pp over $N{=}1$ but
+\emph{reduces} disease IoU from $28.1\%$ to $24.6\%$, consistent with
+the hypothesis that the model over-relies on a global reference bias at
+the expense of query spatial structure.
+
+\paragraph{Spatial cross-attention is exercised but does not localize.}
+The gate in \Cref{eq:sca} grows from $0.1$ to $0.33/0.50$ during
+training, showing that the residual is used. Yet the best disease IoU
+from \emph{spatial} fusion (${\sim}31\%$) is no better than token fusion
+($28\%$), and $2$pp below MCTformer MC115 (${\sim}31.2\%$ after CRF).
+Visualization of attention maps reveals a query-invariant pattern
+concentrated on border tokens, rather than a content-driven correspondence
+to disease regions — the cross-attention acts as a
+\emph{position-conditioned bias} rather than a spatial matcher. This motivates
+\Cref{sec:aux}, where we attempt to explicitly shape the attention through
+auxiliary losses.
+
+\subsection{Feature-based seeds bypass the classifier projection}
+
+A critical diagnostic experiment was to extract the raw merged query
+feature $Q\!=\!\frac14\sum_k P^{(k)}_q$ and turn it into a 1-channel
+seed map by simple channel aggregation
+\emph{before} the classifier projection:
+\begin{align}
+\mathrm{feat\_chmean}(Q)(p) &\;=\; \tfrac{1}{256}\textstyle\sum_{c=1}^{256} Q_c(p),\\
+\mathrm{feat\_chvar}(Q)(p)  &\;=\; \tfrac{1}{256}\textstyle\sum_{c=1}^{256}\!\left(Q_c(p)-\bar Q(p)\right)^2.
+\end{align}
+The resulting maps, thresholded and CRF-refined with a per-distribution
+parameter sweep, yield disease IoU of $36.5\%\to42.1\%$ (feat\_chmean
+$\to$ feat\_chmean+CRF with $\sigma_{\mathrm{rgb}}{=}5$,
+$\tau_{\mathrm{bg}}{=}0.30$). This $+6.5$pp improvement over MCTformer
+and $+14.1$pp over ADPL-CAM is achieved \emph{without retraining} and
+strongly suggests that the classifier-head projection $W_{\mathrm{cls}}$
+destroys useful localization information present in the backbone
+features — an observation that directly motivates the shallow-probe
+methodology of \Cref{sec:probe}.
+
+% =========================================================
+%  6 — Shallow Probe
+% =========================================================
+\section{Localization-Capacity Analysis via Shallow Probes}
+\label{sec:probe}
+
+The previous section showed that \emph{more} localization information
+is present in the backbone than in the classifier-projected CAMs. We now
+quantify this systematically: for any intermediate representation $\phi$
+of the network, we want to know the \emph{upper bound} on the
+localization information that $\phi$ can provide, independent of any
+particular aggregation heuristic.
+
+\subsection{The shallow-probe argument}
+
+Let $\phi_\theta:\mathcal{X}\to\mathbb{R}^{d\times H'\!\times\! W'}$ be
+a layer of a trained network with frozen parameters $\theta$. Let
+$\mathcal{A}$ denote the class of all \emph{unsupervised} aggregations
+from $\mathbb{R}^{d}$ to $[0,1]$ — i.e.\ any hand-designed function
+$a:\mathbb{R}^d\!\to\![0,1]$ applied pointwise, such as channel-mean,
+max, GradCAM, or feat\_chvar. The localization IoU any such aggregator
+can provide on ground-truth mask $m$ is at most
+\begin{equation}
+\sup_{a\in\mathcal{A}}\;\IoU\!\bigl(a(\phi_\theta(x)),\,m\bigr),
+\label{eq:unsup_bound}
+\end{equation}
+which is hard to evaluate because $\mathcal{A}$ is infinite. Instead,
+consider a \emph{shallow supervised probe} $g_\psi$ with a limited
+parameter budget $B$ (e.g.\ two $1{\times}1$ convolutions with 64 hidden
+channels, $\approx\!17{,}000$ parameters). Training $g_\psi$ with frozen
+$\phi_\theta$ on pixel-level supervision gives
+\begin{equation}
+\IoU^{*}_{\mathrm{probe}}(\phi_\theta) \;\coloneqq\;
+\max_{\psi}\;\mathbb{E}_{(x,m)}\!\bigl[\IoU\!\bigl(g_\psi(\phi_\theta(x)),\,m\bigr)\bigr].
+\label{eq:probe_def}
+\end{equation}
+Because the probe has direct access to pixel labels and $g_\psi$ can
+realize any linear (and mild non-linear) combination of feature
+channels, the probe is \emph{at least} as good as any unsupervised
+$a\in\mathcal{A}$ on average — up to the probe's own capacity limits
+and to estimation noise. When the probe capacity is small enough for
+$g_\psi$ to be the bottleneck, the probe's IoU is dominated by the
+informativeness of $\phi_\theta$, which we denote
+$I(\phi_\theta\!\to\! m)$:
+\begin{equation}
+\IoU^{*}_{\mathrm{probe}}(\phi_\theta)
+\;\approx\;\tilde I(\phi_\theta\!\to\! m)
+\;\geq\;\sup_{a\in\mathcal{A}}\IoU\!\bigl(a(\phi_\theta(x)),\,m\bigr).
+\end{equation}
+Thus the probe is a \emph{tractable empirical upper bound} on the
+unsupervised localization capacity of a specific feature map. The
+critical caveats are:
+(i)~$g_\psi$ must be shallow enough that its capacity is not
+itself the bottleneck, otherwise the bound is not tight;
+(ii)~the bound is evaluated on a held-out set and relies on the
+standard generalization-gap argument of empirical risk minimization.
+
+\subsection{Three-phase probe protocol}
+
+\begin{table}[t]
+\centering
+\small
+\caption{Shallow probe capacity analysis on SPDNet. ``S'' is the
+composite score $\max(\text{probe},\text{chmean},\text{chvar},\text{cam\_cls})$
+after CRF. All numbers are CRF-refined disease IoU (\%) on PlantSeg val.
+Ph1 and Ph2 use a deterministic 300-image subset; Ph3 uses the full
+1247 val set.}
+\label{tab:probe}
+\begin{tabular}{@{}llcccccc@{}}
+\toprule
+Phase & Ckpt & Position & Probe & chmean & chvar & cam\_cls & $S$\\
+\midrule
+Ph1 (frozen) & token     & P1 layer4              & 46.2 & 35.1 & 34.6 & --   & 46.2\\
+             & token     & P3 query\_merged       & 43.2 & 36.9 & 37.0 & 32.4 & 43.2\\
+             & spatial   & P3 query\_merged       & 42.6 & 22.0 & 36.9 & 27.6 & 42.6\\
+\midrule
+Ph2 (unfrozen)&token     & P3 query\_merged       & 59.8 & 33.8 & 39.8 & 38.3 & 59.8\\
+             & spatial   & \textbf{P3 query\_merged}&\textbf{59.9}& 22.0 & 40.4 & 37.0 & \textbf{59.9}\\
+             & spatial   & P4 fused               & 59.0 & 21.9 & 37.1 & 29.9 & 59.0\\
+\midrule
+Ph3 (from scratch) & spatial & P3 query\_merged   & \textbf{61.8} & 21.9 & 24.3 & 30.8 & \textbf{61.8}\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We instantiate the argument in three phases of increasing training
+freedom, all with the same probe architecture
+($\mathrm{Conv}_{1\!\times\!1}(d,64)\!\to\!\mathrm{BN}\!\to\!\mathrm{ReLU}\!\to\!\mathrm{Conv}_{1\!\times\!1}(64,1)$)
+and a composite BCE\,+\,Dice segmentation loss:
+
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+\item \textbf{Phase 1 — Frozen.} $\theta$ is frozen; only $\psi$ is
+updated for 20 epochs. This is the cleanest form of the upper bound in
+\Cref{eq:probe_def}: it measures what the current feature map contains
+without letting the backbone adapt.
+\item \textbf{Phase 2 — Unfrozen joint.} $\theta$ and $\psi$ are both
+trained for 15 epochs with a segmentation + classification composite
+loss $\lambda_{\mathrm{seg}}\mathcal{L}_{\mathrm{seg}}
++\lambda_{\mathrm{cls}}\Lcls$, both weights $=1$. This measures the
+capacity of the \emph{architecture}, not just the current features.
+\item \textbf{Phase 3 — From scratch.} The entire backbone plus the
+probe is trained from a random initialization under the same joint loss.
+This is the from-scratch ceiling of the chosen architecture under pixel
+supervision.
+\end{enumerate}
+
+\subsection{Results}
+
+\Cref{tab:probe} reports the three-phase disease-IoU numbers for the
+SPDNet spatial checkpoint trained on PlantSeg\,+\,PlantVillage, plus a
+comparable token-fusion checkpoint. The key findings are:
+
+\begin{enumerate}[label=(\alph*),leftmargin=*,itemsep=2pt]
+\item \textbf{Frozen capacity is high.} Even with a frozen backbone, a
+two-layer probe reaches $46.2\%$ disease IoU at P1\_layer4 and $42.6\%$
+at P3\_query\_merged — $14$pp above the best unsupervised aggregation
+(\texttt{chvar}, $36.9\%$). The localization signal is therefore
+\emph{present} in the feature space; it is not being extracted by any
+hand-crafted aggregation.
+\item \textbf{Fine-tuning narrows probe-position differences.} After
+15 epochs of joint training (Phase 2), the spread between probe
+positions shrinks from $24$pp (Phase 1) to $4$pp (Phase 2): the
+choice of probe position becomes nearly irrelevant because the
+backbone has adapted to the seg objective at all positions.
+\item \textbf{Upper bound $\approx62\%$.} Phase 3 reaches
+$61.8\%$ after CRF and $64.9\%$ with raw thresholding — only
+$8$pp below the fully-supervised SegNeXt benchmark of $70.1\%$ and
+\emph{$29$pp above} the production WSSS pipeline. This defines a
+new, much-higher \emph{empirical upper bound} for WSSS on this
+architecture class.
+\item \textbf{Spatial vs.\ token is a closed question.} In every
+measurement (classification mAP, cross-attention viz, probe IoU),
+spatial fusion and token fusion are indistinguishable after
+fine-tuning. Section~\ref{sec:spdnet}'s conclusion — that a spatial
+cross-attention alone is insufficient — is robustly confirmed.
+\item \textbf{P6\_attn\_map loses to chmean.} When the
+1-channel spatial attention map is used as a seed, the probe reaches
+only $17$--$22\%$ disease IoU, i.e.\ the attention map as produced by a
+classification-only objective is \emph{less} informative than a naive
+channel-mean baseline.
+\end{enumerate}
+
+The practical implication is that the current WSSS pipeline leaves
+${\approx}30$pp of disease IoU on the table. Replacing the
+\texttt{cam\_classifier}+CRF seed source with a probe-generated seed
+source (Phase 2 recipe) is expected to lift the end-to-end pipeline
+accordingly, and constitutes the single highest-leverage planned
+follow-up experiment.
+
+% =========================================================
+%  7 — Auxiliary Spatial Losses
+% =========================================================
+\section{Auxiliary Spatial Losses: Formalization and Null Result}
+\label{sec:aux}
+
+The shallow-probe analysis identifies \emph{what is possible} but the
+best \emph{fully-unsupervised} seed is still the feature-based
+\texttt{chmean}/\texttt{chvar} aggregation at $\approx\!37\%$. To close
+this gap while remaining within the WSSS paradigm, we tested whether
+auxiliary losses applied during SPDNet training can force the network
+to learn a spatially discriminative attention map, without any
+pixel-level labels.
+
+\subsection{Notation}
+
+For a batch of $B$ query/reference pairs $(q_i,r_i)$:
+$F^{P3}_q\!\in\!\mathbb{R}^{B\times 256\times H'\!\times\!W'}$ denotes
+the pre-fusion merged-query feature (``Point P3''), and
+$F^{P4}\!=\!\mathrm{SCA}(F^{P3}_q,F^{P3}_r)$ the post-fusion feature
+(``Point P4''). Let $M(q,r)\!\in\!\mathbb{R}^{B\times H'\!\times W'}$
+be a \emph{single-channel attention-concentration map}, and
+$S\!=\!W_{\mathrm{cls}}F^{P4}\!\in\!\mathbb{R}^{B\times C\times H'\!\times W'}$
+the per-class spatial logits. Let $\mathcal{T}\!=\!\{\mathrm{id},
+\mathrm{hflip},\mathrm{rot90},\mathrm{rot180},\mathrm{rot270}\}$ be
+five discrete, invertible geometric transforms.
+
+\paragraph{Attention-concentration map.}
+A first implementation used $M(q)\!=\!\mathbb{E}_{k}[\mathrm{attn}_{q,k}]$,
+but because post-softmax rows sum to $1$ this equals the constant
+$1/N_{\mathrm{ref}}$ identically, making any equivariance loss vacuous.
+The corrected map is the row-wise normalized negentropy,
+\begin{equation}
+M(q_i) \;=\; 1 + \frac{1}{\log N_{\mathrm{ref}}}
+\sum_{k=1}^{N_{\mathrm{ref}}} p_{i,k}\log p_{i,k}\;\in\;[0,1],
+\label{eq:attn_conc}
+\end{equation}
+where $p_{i,k}$ is the softmax attention weight from query location $q_i$
+to reference key $k$. $M=0$ corresponds to uniform attention,
+$M=1$ to perfect peaking.
+
+\subsection{Equivariance loss $\Leq$}
+
+A model that truly localizes must produce attention that tracks the
+query's spatial content. Given a transform $T\!\in\!\mathcal{T}$ sampled
+uniformly per batch and applied only on the query branch:
+\begin{equation}
+\Leq(q,r) \;=\; \frac{1}{B H'W'}\sum_{i=1}^{B}
+\bigl\|\,T\!\left(M(q_i,r_i)\right)-M\!\left(T(q_i),r_i\right)\bigr\|_{F}^{2}.
+\label{eq:Leq}
+\end{equation}
+
+\subsection{Patch contrastive loss $\Lcon$}
+
+A projection head $g:\mathbb{R}^{256}\!\to\!\mathbb{R}^{128}$ (single
+$1{\times}1$ convolution, $L^2$-normalized) embeds the pre-fusion
+query feature $F^{P3}_q$ into $z_{i,p}\!\in\!S^{127}$. For each image
+$i$ with positive class $y_i$ we compute a bootstrap per-class spatial
+map
+$\tilde S_{i,y_i}\!=\!\mathrm{minmax}(W_{\mathrm{cls},y_i}F^{P4}_i)$
+and define, under \texttt{torch.no\_grad}:
+\begin{align}
+\mathcal{A}_i &= \mathrm{topK}_p\,\tilde S_{i,y_i}(p),\quad K=8, &
+\mathcal{B}_i &= \{p:\tilde S_{i,y_i}(p)<\text{median}\},\,|\mathcal{B}_i|=M=16.
+\end{align}
+Positive peers $\mathcal{P}(a)=\mathcal{A}_i\!\setminus\!\{a\}$ and
+negative peers $\mathcal{N}(a)=\mathcal{B}_i\cup\bigcup_{j:y_j\neq y_i}\mathcal{A}_j$.
+The SupCon-style contrastive loss~\citep{simclr} is
+\begin{equation}
+\Lcon = \frac{1}{\sum_i|\mathcal{A}_i|}
+\sum_{i}\sum_{a\in\mathcal{A}_i}
+\!\!-\frac{1}{|\mathcal{P}(a)|}\!\!\sum_{p\in\mathcal{P}(a)}
+\!\!\log\frac{\exp(z_a^{\!\top} z_p/\tau)}
+{\sum_{x\in\{p\}\cup\mathcal{N}(a)}\exp(z_a^{\!\top} z_x/\tau)},
+\label{eq:Lcon}
+\end{equation}
+with $\tau=0.07$. Anchors are taken from $F^{P3}$ (pre-fusion) so that
+the loss cannot ``cheat'' by aligning the post-fusion residual.
+
+\subsection{Self-distillation $\Ldist$ (DINO-style)}
+
+A teacher $\theta_t$ is an EMA copy of the student $\theta_s$ with
+momentum $\alpha=0.999$ (buffers included). For image $i$ with
+positive class $y_i$, $\tilde S^{(\cdot)}_i\!=\!\mathrm{flatten}(S^{(\cdot)}_{i,y_i})$.
+With centering update $c\leftarrow\beta c+(1-\beta)\frac1B\sum_i\tilde S^{(t)}_i$
+and temperatures $T_t{=}0.04,T_s{=}0.1$:
+\begin{equation}
+P^{(t)}_i\!=\!\mathrm{softmax}\!\left(\!\tfrac{\tilde S^{(t)}_i-c}{T_t}\!\right)\!,\quad
+P^{(s)}_i\!=\!\mathrm{softmax}\!\left(\!\tfrac{\tilde S^{(s)}_i}{T_s}\!\right)\!,\quad
+\Ldist\!=\!\frac{1}{B}\!\sum_i\!\mathrm{KL}(P^{(t)}_i\,\|\,P^{(s)}_i).
+\label{eq:Ldist}
+\end{equation}
+Centering mitigates mode collapse, temperature sharpening mitigates the
+trivial-copy fixed point, and a warm-up of $10$ epochs
+($\lambda_{\mathrm{distill}}{=}0$) avoids cold-start pathologies.
+
+\subsection{Composite objective and experiments}
+
+\begin{equation}
+\Ltotal \;=\; \Lcls \;+\; \lambda_{\mathrm{eq}}\Leq \;+\;
+\lambda_{\mathrm{con}}\Lcon \;+\; \lambda_{\mathrm{distill}}\Ldist.
+\end{equation}
+Launch defaults: $\lambda_{\mathrm{eq}}\!=\!1.0$, $\lambda_{\mathrm{con}}\!=\!0.5$,
+$\lambda_{\mathrm{distill}}\!=\!0$. Three runs were carried out:
+\emph{baseline} (eq-only, $80$\,ep, from scratch); \emph{C} (warmstart
+from the eq-only checkpoint with $\Lcon$ turned on for $40$\,ep);
+\emph{F} (from scratch with $\Lcon$ linearly ramped from
+epoch~$14$ to $21$, reaching $\lambda=0.5$).
+
+\begin{table}[t]
+\centering
+\small
+\caption{Auxiliary-loss experiments on SPDNet (spatial fusion,
+PlantSeg+PlantVillage). Online CAM-IoU is measured on a deterministic
+100-image val subset every two epochs. ``History std'' is the
+epoch-level standard deviation.}
+\label{tab:aux}
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Run & Epochs & Final mAP & Best CAM-IoU & $\Delta$ CAM-IoU & History std & $\Lcon$ change\\
+\midrule
+Baseline ($\Leq$) & 80 & 0.843 & 0.246 & $+0.048$ & 0.016 & --\\
+Warmstart C       & 40 & 0.841 & 0.252 & $+0.002$ & 0.006 & $0.028\!\to\!0.003$\\
+Warmup F          & 62 & 0.768 & 0.234 & $+0.036$ & 0.011 & similar drop\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Null result and root-cause analysis}
+
+\Cref{tab:aux} tells a clean story. Activating $\Lcon$ at strength
+$\lambda{=}0.5$ (run~C) reduces the loss value by a factor of $10$
+while moving the quantity it is supposed to improve
+(\texttt{val/cam\_iou\_best}) by only $+0.002$, less than one standard
+deviation of its own history. Run~F shows the same pattern in reverse:
+during the ramp, the CAM-IoU metric \emph{drops} from $0.246$ to
+$0.219$. Independently, Phase-1 probing on the baseline eq-only
+checkpoint reveals probe-IoUs indistinguishable within $\pm 1$pp from
+the classifier-only checkpoint of \Cref{sec:probe}.
+
+Two structural failure modes explain the result:
+
+\paragraph{(F1) $\Lcon$ anchors are classifier-bootstrapped.}
+Inspection of $\Lcon$ reveals that the top-$K$ anchor set $\mathcal{A}_i$
+in \Cref{eq:Lcon} is defined by the current student classifier's own
+per-class argmax. The loss therefore pulls together embeddings where
+\emph{the current classifier already thinks} the disease lives, and
+pushes apart embeddings where it doesn't. Any classifier with
+internally-consistent (but possibly wrong) spatial beliefs minimizes
+$\Lcon$ — this is a self-distillation of the classifier's current
+beliefs, dressed up as a contrastive loss, and carries no independent
+localization signal. This is precisely what the $10\times$ drop of
+$\Lcon$ with unchanged CAM-IoU demonstrates empirically.
+
+\paragraph{(F2) $\Leq$ has nothing to preserve.}
+The Phase-1 probe of P6\_attn\_map shows that the attention map as
+learned by classification-only training is less informative than
+channel-mean aggregation, i.e.\ it is functionally near-uniform. For
+any transform $T$, $T(\text{const})=\text{const}$, so $\Leq$ is
+trivially minimized by the existing uniform map. $\Leq$ can only
+\emph{preserve} existing spatial structure; it cannot create it. Since
+classification does not need attention structure, classification does
+not create any, and $\Leq$ has nothing to act on.
+
+\paragraph{Redesign priorities.}
+The analysis above suggests that \emph{any} self-referential anchor
+source ($\Lcon$) will fail. A minimum follow-up experiment that breaks
+circularity is to replace the student-argmax anchor by an EMA-teacher
+anchor (the \texttt{EMATeacher} class used for $\Ldist$ is already
+available and tested). Orthogonally, a \emph{concentration regularizer}
+$\mathbb{E}[H(\mathrm{attn})]$ or a $\mathrm{TV}$-smoothness-plus-mass
+term would give $\Leq$ structure to preserve. The strongest proposed
+follow-up, however, is to distill the Phase-2 probe head's prediction
+into the SCA attention map via a masked MSE or KL, providing the
+explicit localization signal that $\Leq/\Lcon$ fail to inject; the
+probe teacher already reaches $60\%$ disease IoU on the same
+architecture family.
+
+% =========================================================
+%  8 — Discussion
+% =========================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why is plant-disease WSSS so much harder than PASCAL VOC?}
+Our pipeline achieves $64.0\%$ $\mIoU$ on PASCAL VOC (WeakCLIP on
+VOC pseudo-masks) and only $46\%$ $\mIoU$ with $33\%$ disease IoU on
+PlantSeg, using the same code and hyperparameters. Three structural
+factors contribute. First, PASCAL VOC's classes are large,
+well-localized objects whose most discriminative regions coincide with
+the object itself; plant-disease lesions are often small, near the
+boundaries of the leaf and low-contrast against healthy tissue, so the
+discriminative region for classification
+(``the image contains an apple leaf'') does not localize the disease.
+Second, PlantVillage is not a drop-in replacement for the PASCAL label
+noise distribution — it is photographed on uniform backgrounds that
+make disease recognition trivial, providing near-perfect
+classification mAP but little useful spatial signal. Third, the
+pretraining objectives of ViT, CLIP and SAM are dominated by natural
+images with much broader semantic distribution than the
+niche plant pathology categories.
+
+\paragraph{Why did SPDNet's Siamese structure fail to help?}
+Three independent diagnostics (classification mAP in \Cref{tab:spdnet_cls},
+cross-attention visualizations, and probe signatures in
+\Cref{tab:probe}) converge on the same conclusion: a classification-only
+training objective does not provide a learning signal that forces the
+attention to be spatially discriminative. This is consistent with the
+classical observation in WSSS~\citep{sec,affinitynet} that
+classification networks focus on most-discriminative parts rather than
+on the full object. The SPDNet paper's $42$-image evaluation
+\citep{spdnet} with bounding-box IoU is not representative of the
+behavior seen at PlantSeg's scale.
+
+\paragraph{How large is the information-theoretic gap that remains?}
+The shallow-probe upper bound of $62\%$ disease IoU versus the
+supervised baseline of $70\%$ suggests that ${\approx}8$pp of the gap is
+\emph{not} a property of the backbone features; it is either the CRF
+over-smoothing of already-strong seeds (empirically measured at
+${\approx}3$pp in \Cref{tab:probe}), the capacity limit of the
+two-layer probe head itself, or an architectural property of ResNet-50.
+The latter would require a bigger head, multi-scale outputs, or a
+different backbone, and is out of scope for the present thesis.
+
+\paragraph{Threats to validity.}
+The results rely on the standard train/val split of PlantSeg,
+without a test set. Reported CRF parameters were each tuned on
+distribution-matched sweep subsets to avoid the optimistic bias of
+reusing VOC-tuned parameters, but the CRF sweep itself consumes val
+supervision and so the reported CRF-refined numbers are mildly
+optimistic. The probe methodology gives an upper bound on
+\emph{unsupervised} localization capacity; WSSS pseudo-mask training
+cannot exploit this directly without an intermediate stage. All
+reported results are preliminary in the sense that additional
+ablations, a probe-seeded end-to-end WSSS pipeline and a
+non-circular-anchor re-run of $\Lcon$ are in progress.
+
+% =========================================================
+%  9 — Conclusion
+% =========================================================
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+This thesis reported an end-to-end experimental study of weakly-supervised
+semantic segmentation for plant-disease localization on the PlantSeg
+dataset. Starting from a supervised upper bound of $70.1\%$ disease
+IoU (SegNeXt), we reproduced three established WSSS baselines
+(MCTformer, PSA/Random Walk, WeakCLIP), reached a best end-to-end
+disease IoU of $33.3\%$, and showed that the Siamese SPDNet architecture
+in two fusion regimes does not close this gap under a
+classification-only objective. Two methodological contributions
+followed: (i)~a shallow-probe protocol that measures an empirical
+upper bound on the localization information contained in any
+intermediate layer, which revealed that $\approx\!62\%$ disease IoU is
+already latent in SPDNet features but is destroyed by the final
+classifier projection; (ii)~a formal specification and clean null
+result for two commonly-proposed auxiliary spatial losses
+($\Leq$, $\Lcon$), traced to structural properties of their
+formulations (self-referential anchors and a near-uniform starting
+attention map, respectively).
+
+\paragraph{Priorities for remaining work.}
+\begin{enumerate}[leftmargin=*,itemsep=1pt]
+\item \textbf{Promote probe seeds to production.} Replace the current
+\texttt{cam\_classifier}+CRF seed source of Steps~1--2 of the WSSS
+pipeline with the Phase-2 probe-head recipe
+(\Cref{sec:probe}); the expected gain is $20$--$25$pp in disease IoU on the
+final WeakCLIP masks.
+\item \textbf{Re-tune CRF on strong seeds.} The current CRF
+parameters, tuned on weaker classifier-only seeds, over-smooth
+Phase-3-quality inputs (\Cref{tab:probe}). A fresh parameter sweep on
+$\geq\!200$ images is low-effort and expected to recover $\approx\!3$pp.
+\item \textbf{Non-circular $\Lcon$.} Re-run the C/F experiments with
+EMA-teacher anchors (\texttt{EMATeacher} class) instead of student-argmax
+anchors. Success is defined as \texttt{val/cam\_iou\_best} moving above
+the eq-only plateau by at least two history standard deviations
+($\geq\!+0.03$).
+\item \textbf{Probe-to-attention distillation.} Train the SCA
+attention map with a masked-MSE or KL distillation from the Phase-2
+probe head's prediction — an explicit localization signal that sits
+outside the WSSS-premise-violating regime of using ground-truth masks at
+training time.
+\end{enumerate}
+
+All source code, DVC-tracked artifacts, MLflow runs and reports are
+publicly available at
+\url{https://github.com/dfbakin/plant-diseases-segmentation}, enabling
+independent reproduction and extension of every experimental number
+reported in this document.
+
+% =========================================================
+%  Bibliography
+% =========================================================
+\bibliographystyle{unsrtnat}
+\bibliography{project_proposal_Bakin}
+
+\end{document}

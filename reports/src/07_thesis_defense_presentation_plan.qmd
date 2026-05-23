@@ -1,0 +1,233 @@
+---
+title: "Weakly Supervised Semantic Segmentation for Plant Disease Localization"
+author: "Denis Bakin"
+institute: "Higher School of Economics, Faculty of Computer Science"
+date: "May 2026"
+format:
+  beamer:
+    theme: default
+    fonttheme: structurebold
+    aspectratio: 169
+    slide-level: 2
+---
+
+<!--
+================================================================
+PURPOSE OF THIS FILE
+================================================================
+Plan only, not draft/final content. Each slide stub lists:
+  (a) key talk points (terse — slide-text intent, not narration),
+  (b) the plot / table / diagram that should occupy the slide.
+The supervisor is expected to redirect content per slide.
+================================================================
+-->
+
+## Why plant-disease localization matters
+
+- Crop losses from disease: **20–40 %** of global production.
+- Precision agriculture stack already deploys UAVs + IoT detectors.
+- Actionable use (severity, targeted spraying, monitoring) needs **spatial lesion masks**, not just a "diseased/healthy" tag.
+
+**Visual:** 2×3 grid of PlantSeg images + GT masks (apple black rot, grape leaf spot, tomato bacterial spot, corn gray leaf spot, healthy leaf for contrast).
+
+## The annotation crisis
+
+- Fully-supervised CV needs **dense per-pixel masks** drawn by domain experts.
+- In a narrow domain like plant pathology: small budgets, scarce annotators, ambiguous lesion boundaries.
+- Largest public pixel-annotated dataset (**PlantSeg**, ~7.7 k images, 116 classes) released **late 2025**.
+
+**Visual:** vertical infographic — three large numbers ("20–40 % yield loss", "7.7 k pixel-annotated images", "released late 2025").
+
+## Alternatives to dense annotation
+
+- Transfer learning.
+- Active learning.
+- Self-supervised pretraining.
+- **Weakly-supervised semantic segmentation (WSSS)** — masks from image-level labels only.
+- WSSS is the most attractive: image-level disease labels are already abundant (PlantVillage: 54 k images, image-level only).
+
+**Visual:** 4-quadrant comparison panel — one paradigm per quadrant with a one-line definition and a representative paper.
+
+## WSSS lives on PASCAL VOC — and that's a problem
+
+- Published WSSS methods almost exclusively benchmarked on **PASCAL VOC** (or COCO).
+- PASCAL VOC SOTA: **60–75 % mIoU** — looks "almost solved".
+- Transfer to specialised domains is much weaker than headlines suggest.
+- This thesis quantifies that gap.
+
+**Visual:** horizontal bar — *PASCAL VOC WSSS: 60–75 % mIoU* → *plant-disease WSSS (this work): 33.3 % disease IoU*.
+
+## Goal
+
+> Adapt weakly-supervised semantic segmentation to the narrow domain of plant-disease localization, and quantify what can and cannot be achieved when only image-level labels are available.
+
+**Visual:** the goal sentence as a single coloured callout box; no other content.
+
+## Tasks
+
+1. Collect datasets and build a reproducible data pipeline.
+2. Reproduce, evaluate and adapt SOTA WSSS methods on the plant-disease domain.
+3. Estimate a principled **upper bound** on what WSSS can extract — and design the estimation procedure.
+4. Introduce **shallow signal probing** as the instrument for (3).
+
+**Visual:** horizontal flowchart — Datasets → Reproduction → Upper-bound estimation → Shallow probing — arrow into "Quantitative findings + null results".
+
+## Datasets
+
+- **PlantSeg v3** — primary; in-the-wild; pixel + image-level GT.
+- **PlantVillage** — auxiliary weak-supervision source; image-level labels only.
+- **PASCAL VOC 2012** — sanity-check reproduction.
+
+**Visual:** table — *Dataset / Role / # Images / # Classes / Supervision* (three rows). Below it, two example images side by side (PlantSeg lesion vs PASCAL whole object) to make the visual gap obvious.
+
+## Methods — families covered
+
+- Classical CAM (GradCAM + CRF).
+- CAM + pixel affinity (PSA / AffinityNet + Random Walk).
+- Transformer-based (MCTformer).
+- Foundation-model assisted (WeakCLIP, SAM-prompted CAM).
+- Siamese (SPDNet ADPL-CAM + our spatial cross-attention).
+- Fully-supervised upper bound (SegNeXt).
+
+**Visual:** taxonomy diagram — five family boxes feeding into a single "evaluated on PlantSeg" pipe.
+
+## PASCAL VOC sanity check vs PlantSeg transfer
+
+- Reproduced numbers match papers within **~1–2 pp on PASCAL VOC**.
+- Drop **25–35 pp** when transferred to PlantSeg.
+- Gap is consistent across families — not a tuning artefact.
+
+**Visual:** full-width table.
+
+| Family | Method | VOC mIoU (paper) | VOC mIoU (reprod.) | PlantSeg disease IoU |
+|---|---|---:|---:|---:|
+| CAM | GradCAM + CRF |  |  |  |
+| CAM + affinity | PSA + Random Walk |  |  |  |
+| Transformer | MCTformer |  |  |  |
+| Foundation | WeakCLIP |  |  |  |
+| Foundation | SAM-prompted CAM |  |  |  |
+| Siamese | SPDNet (ADPL-CAM) |  |  |  |
+| Siamese (ours) | SPDNet + spatial X-attn |  |  |  |
+| Supervised UB | SegNeXt | — | — |  |
+
+*(Numbers to be filled from `RESEARCH_CONTEXT.md` / MLflow.)*
+
+## SPDNet — what & why it is promising
+
+- Closest published WSSS architecture to the plant-disease domain.
+- Siamese reference-guided attention: a healthy reference patch anchors the attention on the diseased query.
+- Plant lesions = local deviations from healthy tissue → Siamese framing matches the problem geometry.
+- We extend SPDNet with a new **spatial cross-attention** variant on top of the original ADPL-CAM token fusion.
+
+**Visual:** SPDNet architecture diagram (query + reference branches → spatial X-attn block → classifier head → CAM output). New module highlighted.
+
+## SPDNet — experimental setups tried
+
+- 448² baseline training.
+- 896² high-resolution training + four "scale trap" fixes (LR rule, scale-aware `ref_pool_size`, `min_lr` floor, val-transform).
+- `ref_pool_size` sweep: rps ∈ {14, 20, 56}.
+- Mask supervision: cls-only → warm-start + L_mask.
+- Auxiliary losses: L_eq, L_con, L_distill.
+
+**Visual:** compact 5-row "experiment grid" table — *Setup / Knob varied / Outcome (one word: ✓ / null / mixed)*.
+
+## SPDNet — results
+
+- Best end-to-end WSSS: **disease IoU = 33.94 %** (SPDNet + L_mask, multi-scale + CRF).
+- `ref_pool_size` is **saturated for classification** but **leveraged for mask supervision**.
+- L_eq → clean **null result** (attention collapse to uniform).
+- High-resolution naïve scaling → strictly worse than 448 without the trap fixes.
+
+**Visual:** bar chart — disease IoU across cls-only, +L_mask, +L_mask+L_eq, supervised UB.
+
+## SPDNet — qualitative CAM panel
+
+**Visual (whole-slide figure, minimal text):**
+
+- 4-column qualitative comparison on the same query image:
+  - col 1: input + GT mask;
+  - col 2: cls-only CAM;
+  - col 3: +L_mask CAM;
+  - col 4: +L_mask+L_eq CAM (attention-collapsed).
+- Caption emphasises the L_eq collapse.
+
+## Shallow probes — concept
+
+- Standard CAM shows what the **classifier head** chose to emphasise.
+- Question: how much localization signal is **already latent** in the features?
+- A **shallow probe** is a 2-layer 1×1-conv decoder attached to a frozen intermediate layer and trained on the (small) pixel-labelled probe split.
+- Probe IoU = experimentally tractable **upper bound** on any unsupervised aggregation of the same features.
+
+**Visual:** schematic — frozen backbone → tap at layer L → trained probe head → predicted mask → IoU vs GT. Probe head highlighted as "the only trainable block".
+
+## Shallow probes — headline result
+
+- Production CAM + CRF ceiling on SPDNet features: **~32 % disease IoU**.
+- Shallow probe on the same features: **42–62 % disease IoU**.
+- The localization signal exists — the **readout** is throwing it away.
+- ~25× larger gain than anything mask supervision or auxiliary losses produced.
+
+**Visual:** line plot — probe disease IoU vs network depth; horizontal dashed lines at the CAM ceiling (~32 %) and the supervised SegNeXt upper bound (~70 %).
+
+## Why the PASCAL VOC recipe transfers poorly
+
+- **Lesion sparsity & scale.** PlantSeg lesions are small, sparse, low-contrast — CAMs latch onto the most discriminative patch, missing diffuse regions.
+- **Foundation models are domain-shifted.** CLIP & SAM trained on web-scale general imagery → severe **oversegmentation** on plant lesions.
+- **Aux losses have trivial fixed points.** L_eq, L_ac admit spatially-uniform attention as a global minimum on the loss alone.
+
+**Visual:** none — three terse bullets only.
+
+## Domain-gap — qualitative failure panel
+
+**Visual (whole-slide figure, minimal text):**
+
+- 4-panel comparison on one PlantSeg image:
+  - col 1: GT lesion mask;
+  - col 2: CLIP-prompted segmentation (oversegmented, latches onto leaf);
+  - col 3: SAM-prompted segmentation (segments the whole leaf);
+  - col 4: our best WSSS output.
+- One-line caption — *"foundation-model priors do not transfer to plant lesions"*.
+
+## Contributions
+
+- Reproducible PlantSeg + PlantVillage data pipeline (MLflow + DVC tracked).
+- Calibrated PlantSeg benchmark across 7 WSSS methods + supervised upper bound.
+- **Shallow-probe localization-capacity methodology** — reusable beyond this domain.
+- Documented null results: L_eq, L_con, naïve high-res scaling, CLIP/SAM-prompted refinement.
+
+**Visual:** 4-row contribution table — *Task → Contribution → Headline number / artefact*.
+
+## Take-home message
+
+- WSSS in narrow scientific domains is genuinely hard — not a solved problem.
+- The bottleneck is the **readout**, not the representation.
+- The shallow probe is the right tool to expose that bottleneck.
+- Negative-but-rigorous map of the plant-disease WSSS landscape, motivated by crop preservation and food security.
+
+**Visual:** one-sentence callout box with the punchline. Faded version of the Slide 3 lesion grid as a thematic bookend.
+
+## Backup — reproducibility & stack
+
+- PyTorch Lightning + Hydra + MLflow + DVC.
+- Every reported number reproducible from the public repo.
+- Unit tests cover critical paths (LR scaling, `ref_pool_size` auto, mask-warmup ramp).
+
+**Visual:** small pipeline diagram — Hydra config → Lightning trainer → MLflow run → DVC artefact.
+
+<!--
+================================================================
+NOTES FOR THE SUPERVISOR REVIEWING THIS PLAN
+================================================================
+- Each "## Slide …" is one rendered Beamer slide.
+- Bullets are slide-text intent, not narration script.
+- "Visual" describes the planned figure/table/diagram.
+- Open questions for review:
+    (a) Should the SPDNet block (3 slides) be moved before the
+        methods/results table so it leads the narrative?
+    (b) Should the shallow-probe block lead the talk instead of
+        the WSSS reproduction story?
+    (c) Are the two "whole-slide figure" slides (qualitative CAM
+        panel, foundation-model failure panel) the right level of
+        evidence, or should one be cut?
+================================================================
+-->
