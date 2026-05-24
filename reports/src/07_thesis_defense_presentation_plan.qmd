@@ -2,7 +2,6 @@
 title: "Weakly Supervised Semantic Segmentation for Plant Disease Localization"
 author: "Denis Bakin"
 institute: "Higher School of Economics, Faculty of Computer Science"
-date: "May 2026"
 format:
   beamer:
     theme: default
@@ -10,17 +9,6 @@ format:
     aspectratio: 169
     slide-level: 2
 ---
-
-<!--
-================================================================
-PURPOSE OF THIS FILE
-================================================================
-Plan only, not draft/final content. Each slide stub lists:
-  (a) key talk points (terse — slide-text intent, not narration),
-  (b) the plot / table / diagram that should occupy the slide.
-The supervisor is expected to redirect content per slide.
-================================================================
--->
 
 ## Why plant-disease localization matters
 
@@ -46,8 +34,6 @@ The supervisor is expected to redirect content per slide.
 - **Weakly-supervised semantic segmentation (WSSS)** — masks from image-level labels only.
 - WSSS is the most attractive: image-level disease labels are already abundant (PlantVillage: 54 k images, image-level only).
 
-**Visual:** 4-quadrant comparison panel — one paradigm per quadrant with a one-line definition and a representative paper.
-
 ## WSSS lives on PASCAL VOC — and that's a problem
 
 - Published WSSS methods almost exclusively benchmarked on **PASCAL VOC** (or COCO).
@@ -60,8 +46,6 @@ The supervisor is expected to redirect content per slide.
 ## Goal
 
 > Adapt weakly-supervised semantic segmentation to the narrow domain of plant-disease localization, and quantify what can and cannot be achieved when only image-level labels are available.
-
-**Visual:** the goal sentence as a single coloured callout box; no other content.
 
 ## Tasks
 
@@ -97,7 +81,7 @@ The supervisor is expected to redirect content per slide.
 - Drop **25–35 pp** when transferred to PlantSeg.
 - Gap is consistent across families — not a tuning artefact.
 
-**Visual:** full-width table.
+---
 
 | Family | Method | VOC mIoU (paper) | VOC mIoU (reprod.) | PlantSeg disease IoU |
 |---|---|---:|---:|---:|
@@ -110,11 +94,9 @@ The supervisor is expected to redirect content per slide.
 | Siamese (ours) | SPDNet + spatial X-attn |  |  |  |
 | Supervised UB | SegNeXt | — | — |  |
 
-*(Numbers to be filled from `RESEARCH_CONTEXT.md` / MLflow.)*
-
 ## SPDNet — what & why it is promising
 
-- Closest published WSSS architecture to the plant-disease domain.
+- Closest published WS architecture to the plant-disease domain (bbox regression).
 - Siamese reference-guided attention: a healthy reference patch anchors the attention on the diseased query.
 - Plant lesions = local deviations from healthy tissue → Siamese framing matches the problem geometry.
 - We extend SPDNet with a new **spatial cross-attention** variant on top of the original ADPL-CAM token fusion.
@@ -193,41 +175,5 @@ The supervisor is expected to redirect content per slide.
 - Reproducible PlantSeg + PlantVillage data pipeline (MLflow + DVC tracked).
 - Calibrated PlantSeg benchmark across 7 WSSS methods + supervised upper bound.
 - **Shallow-probe localization-capacity methodology** — reusable beyond this domain.
-- Documented null results: L_eq, L_con, naïve high-res scaling, CLIP/SAM-prompted refinement.
+- Documented null results: L_eq, L_con, naive high-res scaling, CLIP/SAM-prompted refinement.
 
-**Visual:** 4-row contribution table — *Task → Contribution → Headline number / artefact*.
-
-## Take-home message
-
-- WSSS in narrow scientific domains is genuinely hard — not a solved problem.
-- The bottleneck is the **readout**, not the representation.
-- The shallow probe is the right tool to expose that bottleneck.
-- Negative-but-rigorous map of the plant-disease WSSS landscape, motivated by crop preservation and food security.
-
-**Visual:** one-sentence callout box with the punchline. Faded version of the Slide 3 lesion grid as a thematic bookend.
-
-## Backup — reproducibility & stack
-
-- PyTorch Lightning + Hydra + MLflow + DVC.
-- Every reported number reproducible from the public repo.
-- Unit tests cover critical paths (LR scaling, `ref_pool_size` auto, mask-warmup ramp).
-
-**Visual:** small pipeline diagram — Hydra config → Lightning trainer → MLflow run → DVC artefact.
-
-<!--
-================================================================
-NOTES FOR THE SUPERVISOR REVIEWING THIS PLAN
-================================================================
-- Each "## Slide …" is one rendered Beamer slide.
-- Bullets are slide-text intent, not narration script.
-- "Visual" describes the planned figure/table/diagram.
-- Open questions for review:
-    (a) Should the SPDNet block (3 slides) be moved before the
-        methods/results table so it leads the narrative?
-    (b) Should the shallow-probe block lead the talk instead of
-        the WSSS reproduction story?
-    (c) Are the two "whole-slide figure" slides (qualitative CAM
-        panel, foundation-model failure panel) the right level of
-        evidence, or should one be cut?
-================================================================
--->
